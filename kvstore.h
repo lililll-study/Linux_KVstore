@@ -18,7 +18,8 @@
 
 #define ENABLE_ARRAY         1
 #define ENABLE_RBTREE        1
-#define ENABLE_HASH			1
+#define ENABLE_HASH			 1
+#define ENABLE_SKIPTABLE	 1
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
@@ -144,7 +145,30 @@ int kvs_hash_exist(kvs_hash_t *hash, char *key);
 
 #endif
 
+#if ENABLE_SKIPTABLE
+#define MAX_LEVEL 6
 
+typedef struct Node {
+    int key;
+    int value;
+    struct Node** forward;  // 指向一个指针数组，forward[i]用来表示该节点在第i层的下一个节点
+    // 作为一个二级指针，指向一个node*数组
+} Node;
+
+typedef struct SkipList {
+    int level; // 跳表层数
+    Node* header; // 指向头节点
+} SkipList;
+
+typedef struct SkipList kvs_skiptable_t;
+int kvs_skiptable_create(kvs_skiptable_t *inst)
+void kvs_skiptable_destory(kvs_skiptable_t *inst);
+int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
+char *kvs_skiptable_get(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
+int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
+#endif
 
 
 void kvs_free(void *ptr);
