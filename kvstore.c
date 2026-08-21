@@ -17,6 +17,10 @@ extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
 #endif
 
+#if ENABLE_SKIPTABLE
+extern kvs_skiptable_t global_skiptable;
+#endif
+
 
 void *kvs_malloc (size_t size) {
     return malloc(size);
@@ -30,7 +34,8 @@ void kvs_free(void *ptr) {
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
     "RSET", "RGET", "RDEL", "RMOD", "REXIST",
-    "HSET", "HGET", "HDEL", "HMOD", "HEXIST"
+    "HSET", "HGET", "HDEL", "HMOD", "HEXIST",
+    "SSET", "SGET", "SDEL", "SMOD", "SEXIST",
 
 };
 
@@ -54,7 +59,13 @@ enum {
 	KVS_CMD_HDEL,
 	KVS_CMD_HMOD,
 	KVS_CMD_HEXIST,
-	
+	// skiplist
+	KVS_CMD_SSET,
+	KVS_CMD_SGET,
+	KVS_CMD_SDEL,
+	KVS_CMD_SMOD,
+	KVS_CMD_SEXIST,
+
 	KVS_CMD_COUNT,
 
 };
@@ -257,6 +268,58 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
     #endif
 
+#if ENABLE_SKIPTABLE
+        case KVS_CMD_SSET:
+            ret = kvs_skiptable_set(&global_skiptable, key, value);
+            if (ret < 0) {
+                len = sprintf(response, "set error\r\n");
+            } else if (ret == 0) {
+                len = sprintf(response, "ok\r\n");
+            } else {
+                len = sprintf(response, "exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_SGET:{
+            char *result = kvs_skiptable_get(&global_skiptable, key);
+            if (result == NULL) {
+                len = sprintf(response, "no exist\r\n");
+            } else {
+                len = sprintf(response, "%s\r\n", result);
+            }
+            break;
+        }
+        case KVS_CMD_SDEL:
+            ret = kvs_skiptable_del(&global_skiptable, key);
+            if (ret < 0) {
+                len = sprintf(response, "error\r\n");
+            } else if (ret == 0) {
+                len = sprintf(response, "ok\r\n");
+            } else {
+                len = sprintf(response, "no exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_SMOD:
+            ret = kvs_skiptable_mod(&global_skiptable, key, value);
+            if (ret < 0) {
+                len = sprintf(response, "error\r\n");
+            } else if (ret == 0) {
+                len = sprintf(response, "ok\r\n");
+            } else {
+                len = sprintf(response, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_SEXIST:
+            ret = kvs_skiptable_exist(&global_skiptable, key);
+            if (ret == 0) {
+                len = sprintf(response, "exist\r\n");
+            } else {
+                len = sprintf(response, "no exist\r\n");
+            }
+            break;
+#endif
+
         default:
             assert(0);
     }
@@ -303,6 +366,11 @@ int init_kvengine(void) {
 	kvs_hash_create(&global_hash);
 #endif
 
+#if ENABLE_SKIPTABLE
+	memset(&global_skiptable, 0, sizeof(kvs_skiptable_t));
+	kvs_skiptable_create(&global_skiptable);
+#endif
+
     return 0;
 }
 
@@ -315,6 +383,9 @@ void dest_kvengine(void) {
 #endif
 #if ENABLE_HASH
 	kvs_hash_destory(&global_hash);
+#endif
+#if ENABLE_SKIPTABLE
+	kvs_skiptable_destory(&global_skiptable);
 #endif
 
 }
