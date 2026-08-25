@@ -36,6 +36,7 @@ const char *command[] = {
     "RSET", "RGET", "RDEL", "RMOD", "REXIST",
     "HSET", "HGET", "HDEL", "HMOD", "HEXIST",
     "SSET", "SGET", "SDEL", "SMOD", "SEXIST",
+    "SAVE"
 
 };
 
@@ -66,6 +67,7 @@ enum {
 	KVS_CMD_SMOD,
 	KVS_CMD_SEXIST,
 
+    KVS_CMD_SAVE,
 	KVS_CMD_COUNT,
 
 };
@@ -74,7 +76,14 @@ const char *response[] = {};
 
 
 
-
+int check_datafile_exist() {
+    struct stat st = {0};
+    if (stat("data", &st) == -1) {
+        printf("Error: data directory not exist. Please create it.\n");
+        return -1;
+    }
+    return 0;
+}
 
 
 int kvs_split_token(char *msg, char *tokens[]) {
@@ -320,6 +329,17 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
 #endif
 
+#if ENABLE_PERSIST
+        case KVS_CMD_SAVE:
+            ret = save_snapshot_array(SNAP_ARRAY_FILE);
+            if (ret == 0) {
+                len = sprintf(response, "ok\r\n");
+            } else {
+                len = sprintf(response, "error\r\n");
+            }
+            break;
+#endif
+
         default:
             assert(0);
     }
@@ -371,6 +391,13 @@ int init_kvengine(void) {
 	kvs_skiptable_create(&global_skiptable);
 #endif
 
+#if ENABLE_PERSIST
+    // 加载快照
+    if (load_snapshot_array(SNAP_ARRAY_FILE) != 0) {
+        printf("No snapshot found, starting with empty array\n");
+    }
+#endif
+
     return 0;
 }
 
@@ -396,7 +423,9 @@ void dest_kvengine(void) {
 int main(int argc, char *argv[]) {
 
     if (argc != 2) return -1;
-
+#if ENABLE_PERSIST
+    if (check_datafile_exist()== -1) return -1;
+#endif
     int port = atoi(argv[1]);
 
     // 用于创建kv存储全局单例内存块global_array

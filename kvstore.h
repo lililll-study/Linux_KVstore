@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #define NET_REACTOR 0
 #define NET_NTYCO 1
 #define NET_PROACTOR 2
@@ -21,6 +24,8 @@
 #define ENABLE_HASH			 1
 #define ENABLE_SKIPTABLE	 1
 
+#define ENABLE_PERSIST 		1	// 开启持久化存储
+
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
 extern int reactor_start(unsigned short port, msg_handler handler);
@@ -29,10 +34,39 @@ extern int proactor_start(unsigned short port, msg_handler handler);
 
 
 
-
-
 extern  const char *command[];
 extern const char *response[];
+
+#if ENABLE_PERSIST
+
+// 快照文件路径（放在 data 目录下）
+#define SNAP_ARRAY_FILE     "data/array.snap"
+#define SNAP_RBTREE_FILE    "data/rbtree.snap"
+#define SNAP_HASH_FILE      "data/hash.snap"
+#define SNAP_SKIPTABLE_FILE "data/skiptable.snap"
+
+// AOF文件路径（放在 data 目录下）
+#define AOF_ARRAY_FILE      "data/array.aof"
+#define AOF_RBTREE_FILE     "data/rbtree.aof"
+#define AOF_HASH_FILE       "data/hash.aof"
+#define AOF_SKIPTABLE_FILE  "data/skiptable.aof"
+
+// 快照保存
+int save_snapshot_array(const char *filename);
+int save_snapshot_rbtree(const char *filename);
+int save_snapshot_hash(const char *filename);
+int save_snapshot_skiptable(const char *filename);
+// 快照加载
+int load_snapshot_array(const char *filename);
+int load_snapshot_rbtree(const char *filename);
+int load_snapshot_hash(const char *filename);
+int load_snapshot_skiptable(const char *filename);
+
+// AOF
+int append_aof(const char *filename, const char *cmd, const char *key, const char *value);
+int replay_aof(const char *filename);
+#endif
+
 
 
 
@@ -48,7 +82,6 @@ typedef struct kvs_array_item_s {
 // 定义所有key
 typedef struct kvs_array_s {
     kvs_array_item_t *table;
-    int idx;
     int total;
 } kvs_array_t;
 
@@ -98,7 +131,6 @@ int kvs_rbtree_del(kvs_rbtree_t *inst, char *key) ;
 int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value) ;
 int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key) ;
 #endif
-
 
 #if ENABLE_HASH
 
