@@ -41,7 +41,7 @@ void testcase(int connfd, char *msg, char *pattern, char *casename) {
 
     // 比对result和pattern是否一致
     if (strcmp(result, pattern) == 0) {
-        printf("==> PASS -> %s\n", casename);
+        // printf("==> PASS -> %s\n", casename);
     } else {
         printf("==> FAILED -> %s, '%s' != '%s'\n", casename, result, pattern);
     }
@@ -182,6 +182,53 @@ void rbtree_testcase_3w_0_mix (int connfd) {
     printf("rbtree_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
 }
 
+void skiptable_testcase (int connfd) {
+    
+    testcase(connfd, "SSET Teacher LHY",     "ok\r\n", "SSET-Teacher");
+    testcase(connfd, "SGET Teacher",          "LHY\r\n", "SGET-Teacher");
+    testcase(connfd, "SMOD Teacher Lililihy", "ok\r\n", "SMOD-Teacher");
+    testcase(connfd, "SGET Teacher",          "Lililihy\r\n", "SGET-Teacher");
+    testcase(connfd, "SEXIST Teacher",        "exist\r\n", "SEXIST-Teacher");
+    testcase(connfd, "SDEL Teacher",         "ok\r\n", "SDEL-Teacher");
+    testcase(connfd, "SGET Teacher",          "no exist\r\n", "SGET-Teacher");
+    testcase(connfd, "SMOD Teacher lhy",     "no exist\r\n", "SMOD-Teacher");
+    testcase(connfd, "SEXIST Teacher",        "no exist\r\n", "SEXIST-Teacher");
+
+}
+
+void skiptable_testcase_3w_0_mix (int connfd) {
+    int count = 10000;
+    int i = 0;
+    struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "SSET Teacher%d King%d", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "SSET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "SGET Teacher%d", i);
+
+        char result[128] = {0};
+        snprintf(result, 128, "King%d\r\n", i);
+        testcase(connfd, cmd,     result, "SGET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "SMOD Teacher%d Lililihy%d", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "SMOD-Teacher");
+    }
+
+    struct timeval tv_cur;
+    gettimeofday(&tv_cur, NULL);
+
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin); //ms
+    printf("skiptable_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
+}
+
+
 // testcase 192.168.137.128 2000
 int main(int argc, char *argv[]) {
 
@@ -206,6 +253,10 @@ int main(int argc, char *argv[]) {
         rbtree_testcase_3w_0_mix(connfd);
     } else if (mode == 3) {
         hash_testcase(connfd);
+    } else if (mode == 4) {
+        skiptable_testcase(connfd);
+    } else if (mode == 5) {
+        skiptable_testcase_3w_0_mix(connfd);
     }
 
     

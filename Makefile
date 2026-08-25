@@ -1,7 +1,7 @@
 
 CC = gcc
 TARGET = kvstore
-SRCS = kvstore.c reactor.c kvs_array.c kvs_rbtree.c kvs_hash.c
+SRCS = kvstore.c reactor.c kvs_array.c kvs_rbtree.c kvs_hash.c kvs_skiptable.c
 INC = -I ./NtyCo/core
 LIBS = -L ./NtyCo/lib  -lntyco -lpthread -ldl
 
