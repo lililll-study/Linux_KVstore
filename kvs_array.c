@@ -93,10 +93,6 @@ char *kvs_array_get(kvs_array_t *inst, char *key) {
     return NULL;
 }
 
-
-
-
-
 /*
 @return <0, error;
         =0, success;
