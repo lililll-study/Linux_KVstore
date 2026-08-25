@@ -148,20 +148,20 @@ int kvs_hash_exist(kvs_hash_t *hash, char *key);
 #if ENABLE_SKIPTABLE
 #define MAX_LEVEL 6
 
-typedef struct Node {
-    int key;
-    int value;
-    struct Node** forward;  // 指向一个指针数组，forward[i]用来表示该节点在第i层的下一个节点
+typedef struct kvs_node {
+    char *key;
+    char *value;
+    struct kvs_node** forward;  // 指向一个指针数组，forward[i]用来表示该节点在第i层的下一个节点
     // 作为一个二级指针，指向一个node*数组
-} Node;
+} kvs_node_t;
 
-typedef struct SkipList {
+typedef struct kvs_skiptable {
     int level; // 跳表层数
-    Node* header; // 指向头节点
-} SkipList;
+    kvs_node_t* header; // 指向头节点
+} kvs_skiptable_t;
 
-typedef struct SkipList kvs_skiptable_t;
-int kvs_skiptable_create(kvs_skiptable_t *inst)
+typedef struct kvs_skiptable kvs_skiptable_t;
+int kvs_skiptable_create(kvs_skiptable_t *inst);
 void kvs_skiptable_destory(kvs_skiptable_t *inst);
 int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
 char *kvs_skiptable_get(kvs_skiptable_t *inst, char *key);

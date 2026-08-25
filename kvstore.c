@@ -1,7 +1,7 @@
 
 #include "kvstore.h"
 
-// 启动命令
+// 启动命令 
 // gcc -o kvstore kvstore.c reactor.c ntyco.c  -I ./NtyCo/core  -L ./NtyCo/lib  -lntyco -lpthread -ldl
 // gcc -o kvstore kvstore.c reactor.c
 
