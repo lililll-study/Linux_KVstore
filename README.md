@@ -531,10 +531,10 @@ int kvs_skiptable_del(kvs_skiptable_t *inst, char *key) {
 
 int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
     if (inst == NULL || key == NULL || value == NULL) return -1;
-    
+
     // 先检查key是否存在
     if (search(inst, key) == NULL) return 1; // key不存在
-    
+
     // update表示在第i层，新节点应该插入在哪个节点之后
     // 1. 初始化查找update和current
     kvs_node_t *update[MAX_LEVEL + 1];
@@ -592,3 +592,59 @@ curr = curr->forward[0];
 forward：每个节点通过forward指向各层的下一个节点
 
 update：记录新节点一个插入在哪些节点之后
+
+
+
+# 四、作业
+
+## 1 持久化存储
+
+红黑树遍历：中序遍历
+
+```c
+
+红黑树结构（二叉搜索树）：
+        B
+       / \
+      A   C
+         / \
+        B   D
+
+中序遍历顺序：左子树 → 当前节点 → 右子树
+结果：A, B, C, D（按 key 排序）
+
+递归思路：
+1. 先递归遍历左子树（所有比当前节点小的）
+2. 保存当前节点
+3. 再递归遍历右子树（所有比当前节点大的）
+```
+
+
+
+哈希遍历
+
+```c
+
+哈希表结构：
+nodes[0]: → node1 → node2 → NULL    ← 桶0的链表
+nodes[1]: → NULL                     ← 空桶
+nodes[2]: → node3 → NULL            ← 桶2的链表
+nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
+...
+
+遍历思路：
+外层循环：遍历所有桶（0 到 max_slots-1）
+内层循环：遍历每个桶的链表（处理哈希冲突）
+
+```
+
+
+
+跳表遍历
+
+```c
+只要沿着第0层走一遍就行了
+从头结点的forward[0]开始，依次访问
+```
+
+

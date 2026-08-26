@@ -129,6 +129,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "set error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "SET", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -149,6 +150,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "DEL", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -160,6 +162,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "MOD", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -181,6 +184,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "set error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RSET", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -201,6 +205,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RDEL", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -212,6 +217,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RMOD", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -232,6 +238,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HSET", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -252,6 +259,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HDEL", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -262,6 +270,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HMOD", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -283,6 +292,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "set error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -303,6 +313,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SDEL", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -314,6 +325,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, NULL);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -331,8 +343,18 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
 
 #if ENABLE_PERSIST
         case KVS_CMD_SAVE:
-            ret = save_snapshot_array(SNAP_ARRAY_FILE);
+            ret = save_snapshots();
             if (ret == 0) {
+                // 清空所有 AOF 文件
+                FILE *fp = fopen(AOF_ARRAY_FILE, "w"); // w模式会清空文件内容
+                if (fp) fclose(fp);
+                fp = fopen(AOF_RBTREE_FILE, "w");
+                if (fp) fclose(fp);
+                fp = fopen(AOF_HASH_FILE, "w");
+                if (fp) fclose(fp);
+                fp = fopen(AOF_SKIPTABLE_FILE, "w");
+                if (fp) fclose(fp);
+
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "error\r\n");
@@ -392,10 +414,15 @@ int init_kvengine(void) {
 #endif
 
 #if ENABLE_PERSIST
-    // 加载快照
-    if (load_snapshot_array(SNAP_ARRAY_FILE) != 0) {
-        printf("No snapshot found, starting with empty array\n");
+    // 先加载快照
+    if (load_snapshots() != 0) {
+        printf("No snapshot found\n");
     }
+    // 再重放AOF
+    replay_aof(AOF_ARRAY_FILE);
+    replay_aof(AOF_RBTREE_FILE);
+    replay_aof(AOF_HASH_FILE);
+    replay_aof(AOF_SKIPTABLE_FILE);
 #endif
 
     return 0;
