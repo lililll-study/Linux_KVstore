@@ -12,9 +12,13 @@ int kvs_array_create(kvs_array_t *inst) {
         printf("table has alloc\n");
         return -1;
     }
-
+#if 0
+    inst->table = kvs_mempool_alloc(array_item_pool, KVS_ARRAY_SIZE * sizeof(kvs_array_item_t));
+    if (!inst->table) return -1;
+#else
     inst->table = kvs_malloc(KVS_ARRAY_SIZE * sizeof(kvs_array_item_t));
     if (!inst->table) return -1;
+#endif
 
     inst->total = 0;
 
@@ -25,7 +29,11 @@ void kvs_array_destory(kvs_array_t *inst) {
     if (!inst) return;
 
     if (inst->table) {
+#if ENABLE_MEMPOOL
+        kvs_mempool_free(array_item_pool, inst->table);
+#else
         kvs_free(inst->table);
+#endif
     }
 }
 
@@ -45,7 +53,21 @@ int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
     if (str) {
         return 1; // 已经存在
     }
-
+#if ENABLE_MEMPOOL
+// 使用内存池分配 key
+    // printf("alloc set array\n");
+    char *kcopy = kvs_mempool_alloc(array_string_pool, strlen(key) + 1);
+    if (!kcopy) return -2;
+    strcpy(kcopy, key);
+    
+    // 使用内存池分配 value
+    char *kvalue = kvs_mempool_alloc(array_string_pool, strlen(value) + 1);
+    if (!kvalue) {
+        kvs_mempool_free(array_string_pool, kcopy);
+        return -2;
+    }
+    strcpy(kvalue, value);
+#else
     char *kcopy = kvs_malloc(strlen(key) +1);
     if (kcopy == NULL) return -2;
     memset(kcopy, 0, strlen(key) +1);
@@ -55,7 +77,7 @@ int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
     if (kvalue == NULL) return -2;
     memset(kvalue, 0, strlen(value) +1);
     strncpy(kvalue, value, strlen(value));
-
+#endif
     // 查找我们已经用了多少，去中间找空的
     int i = 0;
     for (i=0; i<inst->total; i++) {
@@ -105,11 +127,15 @@ int kvs_array_del(kvs_array_t *inst, char *key) {
     int i =0;
     for (i=0; i< inst->total; i++) {
         if (strcmp(inst->table[i].key, key) == 0) {
+#if ENABLE_MEMPOOL
+            kvs_mempool_free(array_string_pool, inst->table[i].key);
+            kvs_mempool_free(array_string_pool, inst->table[i].value);
+#else
             kvs_free(inst->table[i].key);
-            inst->table[i].key = NULL;
-
             kvs_free(inst->table[i].value);
+#endif
             inst->table[i].value = NULL;
+            inst->table[i].key = NULL;
  // 关键修复：无论删除哪个位置，total 都应该减
             inst->total--;
             return 0;
@@ -136,12 +162,21 @@ int kvs_array_mod(kvs_array_t *inst, char *key, char *value) {
         }
         // 说明找到了key
         if (strcmp(inst->table[i].key, key) == 0) {
-            // 先释放value
+            #if ENABLE_MEMPOOL
+            // 释放旧 value
+            kvs_mempool_free(array_string_pool, inst->table[i].value);
+            
+            // 从内存池分配新 value
+            char *kvalue = kvs_mempool_alloc(array_string_pool, strlen(value) + 1);
+            if (!kvalue) return -2;
+#else
+            // 释放旧 value
             kvs_free(inst->table[i].value);
-            // 重新分配value
-            char *kvalue = kvs_malloc(strlen(value) +1);
-            if (kvalue == NULL) return -2;
-            memset(kvalue, 0, strlen(value) +1);
+            
+            // 分配新 value
+            char *kvalue = kvs_malloc(strlen(value) + 1);
+            if (!kvalue) return -2;
+#endif
             strncpy(kvalue, value, strlen(value));
             // 插入table
             inst->table[i].value = kvalue;

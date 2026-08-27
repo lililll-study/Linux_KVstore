@@ -662,3 +662,84 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
         外部碎片指的是分配的内存块之间存在空闲内存间隙，这些间隙无法满足新的内存请求，尽管总的空闲内存量看起来可能足够满足40字节的请求，但由于空闲块是零散分布且大小都小于40字节，所以无法满足这一分配需求，从而形成了外部碎片。
 
 
+
+**内存池设计**
+
+
+
+```c
+typedef struct mempool_s{
+    size_t block_size;       // 每个内存块的总大小
+    size_t total_blocks;    // 内存池总块数
+    size_t free_blocks;     // 当前空闲块数量
+    void* free_list;        // 空闲链表头指针
+    char data[];        // 柔性数组
+} mempool_t;
+```
+
+```c
+    size_t actual_block_size = user_block_size + sizeof(void *); // 块大小
+    size_t pool_size = sizeof(mempool_t) + actual_block_size * num_blocks; // 池大小
+
+```
+
+sizeof(void *)：表示内存块在空闲的时候，需要用前8个字节来记录下一个空闲块在哪。
+
+假设要创建5个块，每个块能用100字节：
+
+第一步，计算大小
+
+```c
+actual_block_size = 100 + 8 = 108  // 每个块实际大小
+pool_size = sizeof(mempool_t) + 108 * 5  // 管理结构 + 5个块
+
+malloc 后内存布局：
+┌─────────────┬────────┬────────┬────────┬────────┬────────┐
+│ mempool_t   │ 块0    │ 块1    │ 块2    │ 块3    │ 块4    │
+│ (管理信息)   │ 108B   │ 108B   │ 108B   │ 108B   │ 108B   │
+└─────────────┴────────┴────────┴────────┴────────┴────────┘
+     ↑           ↑
+   pool      pool->data 指向这里
+```
+
+第二步，初始化链表
+
+1 找到 block[i]的起始地址
+
+2 在block[i]的前8字节写入pool->free_list（i=0时写入null）
+
+3 让free->list指向block[i]
+
+```c
+size_t i = 0;
+    for (i=0; i<num_blocks; ++i) {
+        // 找到 block[i]的起始地址
+        void* block = pool->data + i * actual_block_size; 
+        // 得到块起始地址处存储的内容 ,这一段就是把pool->free_list的值（开始为null）写入块起始地址
+        *((void**)block) = pool->free_list; // 此时block0存储null
+        pool->free_list = block;    // free_list = block0
+    }
+```
+
+循环下去，空闲列表如下，每个空闲块的前8字节都存着下一个空闲块的地址:
+
+```c
+块2: [块1的地址] → 块1: [块0的地址] → 块0: [NULL]
+free_list → 块2 → 块1 → 块0 → NULL
+```
+
+
+
+分配块过程：
+
+1 取出链表第一个块
+
+2 读取块的前8字节， 得到下一个空闲块
+
+3 减少空闲块数量
+
+4 返回用户可用的地址（跳过前8字节）
+
+```c
+
+```

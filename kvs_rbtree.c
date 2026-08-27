@@ -435,7 +435,14 @@ kvs_rbtree_t global_rbtree;
 // 5+2
 int kvs_rbtree_create(kvs_rbtree_t *inst) {
 	if (inst == NULL) return -1;
-	inst->nil = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
+
+#if ENABLE_MEMPOOL
+    // 使用内存池分配 nil 节点
+    inst->nil = (rbtree_node*)kvs_mempool_alloc(rbtree_node_pool, sizeof(rbtree_node));
+#else
+    inst->nil = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
+#endif
+	if (!inst->nil) return -1;
 	inst->nil->color = BLACK;
 	inst->root = inst->nil;
 
@@ -450,10 +457,23 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 	while (!(node = inst->root)) {
 		rbtree_node *mini = rbtree_mini(inst, node);// 每次找到最小的节点
 		rbtree_node *cur = rbtree_delete(inst, mini); // 然后删除它，并free
-		kvs_free(cur);
+#if ENABLE_MEMPOOL
+        if (cur->key) kvs_mempool_free(rbtree_string_pool, cur->key);
+        if (cur->value) kvs_mempool_free(rbtree_string_pool, cur->value);
+        kvs_mempool_free(rbtree_node_pool, cur);
+#else
+        if (cur->key) kvs_free(cur->key);
+        if (cur->value) kvs_free(cur->value);
+        kvs_free(cur);
+#endif
 
 	} 
-	free(inst->nil);
+    // 释放 nil 节点
+#if ENABLE_MEMPOOL
+    kvs_mempool_free(rbtree_node_pool, inst->nil);
+#else
+    kvs_free(inst->nil);
+#endif
 	return;
 }
 
@@ -461,26 +481,70 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) {
 
 	if (inst == NULL || key == NULL || value == NULL) return -1;
-	rbtree_node *node = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
-
+	// printf("alloc set rbtree\n");
+	// printf("  rbtree_string_pool: free_blocks=%zu, total_blocks=%zu\n",  rbtree_string_pool->free_blocks, rbtree_string_pool->total_blocks);
 	rbtree_node *exist = rbtree_search(inst, key);
 	if (exist != inst->nil) {
+		printf("node exist\n");
         return 1;  // 已存在
     }
 
-	node->key = kvs_malloc(strlen(key) + 1);
-	if (!node->key) return -2;
-	memset(node->key, 0, strlen(key) + 1);
-	strcpy(node->key, key);
-
-	node->value = kvs_malloc(strlen(value) + 1);
-	if (!node->value) return -2;
-	memset(node->value, 0, strlen(value) + 1);
-	strcpy(node->value, value);
-
-	rbtree_insert(inst, node);
-
-	return 0;
+#if ENABLE_MEMPOOL
+    // 使用内存池分配节点	
+    rbtree_node *node = (rbtree_node*)kvs_mempool_alloc(rbtree_node_pool, sizeof(rbtree_node));
+    if (!node) {
+		// printf("Failed to allocate rbtree node from pool\n");
+		return -1;
+	}
+	// 关键：完全初始化节点
+    node->left = inst->nil;
+    node->right = inst->nil;
+    node->parent = inst->nil;
+    node->color = RED;
+    node->key = NULL;
+    node->value = NULL;
+    // printf("  allocating key (len=%zu)...\n", strlen(key) + 1);
+    // 使用内存池分配 key
+    node->key = kvs_mempool_alloc(rbtree_string_pool, strlen(key) + 1);
+    if (!node->key) {
+		// printf("  ERROR: Failed to allocate key\n");
+        kvs_mempool_free(rbtree_node_pool, node);
+        return -2;
+    }
+    // printf("  key allocated at %p\n", node->key);
+    // 使用内存池分配 value
+    node->value = kvs_mempool_alloc(rbtree_string_pool, strlen(value) + 1);
+    if (!node->value) {
+		// printf("  ERROR: Failed to allocate value\n");
+        kvs_mempool_free(rbtree_string_pool, node->key);
+        kvs_mempool_free(rbtree_node_pool, node);
+        return -2;
+    }
+	// printf("  value allocated at %p\n", node->value);
+#else
+    rbtree_node *node = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
+    if (!node) return -1;
+    
+    node->key = kvs_malloc(strlen(key) + 1);
+    if (!node->key) {
+        kvs_free(node);
+        return -2;
+    }
+    
+    node->value = kvs_malloc(strlen(value) + 1);
+    if (!node->value) {
+        kvs_free(node->key);
+        kvs_free(node);
+        return -2;
+    }
+#endif
+    
+    strcpy(node->key, key);
+    strcpy(node->value, value);
+    
+    rbtree_insert(inst, node);
+	// printf("  insert done\n");
+    return 0;
 }
 
 char *kvs_rbtree_get(kvs_rbtree_t *inst, char *key) {
@@ -502,6 +566,17 @@ int kvs_rbtree_del(kvs_rbtree_t *inst, char *key) {
 	if (node == inst->nil) return 1;
 
 	rbtree_node *cur = rbtree_delete(inst, node);
+#if ENABLE_MEMPOOL
+    // 释放 key 和 value
+    if (cur->key) kvs_mempool_free(rbtree_string_pool, cur->key);
+    if (cur->value) kvs_mempool_free(rbtree_string_pool, cur->value);
+    // 释放节点
+    kvs_mempool_free(rbtree_node_pool, cur);
+#else
+    if (cur->key) kvs_free(cur->key);
+    if (cur->value) kvs_free(cur->value);
+    kvs_free(cur);
+#endif
 	kvs_free(cur);
 	return 0;
 }
@@ -513,15 +588,21 @@ int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value) {
 	rbtree_node *node = rbtree_search(inst, key);
 	if (node == inst->nil) return 1;
 
-	kvs_free(node->value);
+#if ENABLE_MEMPOOL
+    // 释放旧 value
+    kvs_mempool_free(rbtree_string_pool, node->value);
+    
+    // 从内存池分配新 value
+    node->value = kvs_mempool_alloc(rbtree_string_pool, strlen(value) + 1);
+    if (!node->value) return -2;
+#else
+    kvs_free(node->value);
+    
+    node->value = kvs_malloc(strlen(value) + 1);
+    if (!node->value) return -2;
+#endif
 
-	node->value = kvs_malloc(strlen(value) + 1);
-	if (!node->value) return -2;
-
-	memset(node->value, 0, strlen(value) + 1);
 	strcpy(node->value, value);
-
-
 	return 0;
 }
 
