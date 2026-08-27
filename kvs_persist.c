@@ -139,7 +139,6 @@ static int load_snap_func(const char *filename, void *inst, kv_set_fn set_fn) {
     value = (char *)malloc(value_cap);
 
     int read_status = READ_KEY;
-
     while ((ch = fgetc(fp)) != EOF) {
         if (ch == ' ') {
             // key读结束，开始读value
@@ -233,12 +232,12 @@ int replay_aof(const char *filename) {
 
         // 解析命令
         int count = sscanf(line, "%s %s %s", cmd, key, value);
-        printf("%d\n", count);
+        // printf("%d\n", count);
         if (count >= 2) {
-            printf("count start\n");
+            // printf("count start\n");
             // 根据命令前缀分发
             if (cmd[0] == 'S' && cmd[1] == 'S') {
-                printf("set start S\n");
+                // printf("set start S\n");
                 // 跳表命令
                 if (strcmp(cmd, "SSET") == 0 && count == 3) {
                     kvs_skiptable_set(&global_skiptable, key, value);
@@ -248,7 +247,7 @@ int replay_aof(const char *filename) {
                     kvs_skiptable_del(&global_skiptable, key);
                 }
             } else if (cmd[0] == 'R' && cmd[1] == 'S') {
-                printf("set start R\n");
+                // printf("set start R\n");
                 // 红黑树命令
                 if (strcmp(cmd, "RSET") == 0 && count == 3) {
                     kvs_rbtree_set(&global_rbtree, key, value);
@@ -258,7 +257,7 @@ int replay_aof(const char *filename) {
                     kvs_rbtree_del(&global_rbtree, key);
                 }
             } else if (cmd[0] == 'H' && cmd[1] == 'S') {
-                printf("set start H\n");
+                // printf("set start H\n");
                 // 哈希命令
                 if (strcmp(cmd, "HSET") == 0 && count == 3) {
                     kvs_hash_set(&global_hash, key, value);
@@ -269,11 +268,11 @@ int replay_aof(const char *filename) {
                 }
             } else {
                 // 数组命令
-                printf("set start A\n");
+                // printf("set start A\n");
                 if (strcmp(cmd, "SET") == 0 && count == 3) {
-                    printf("set start\n");
+                    // printf("set start\n");
                     int ret = kvs_array_set(&global_array, key, value);
-                    printf("kvs_array_set returned: %d\n", ret);
+                    // printf("kvs_array_set returned: %d\n", ret);
                 } else if (strcmp(cmd, "MOD") == 0 && count == 3) {
                     kvs_array_mod(&global_array, key, value);
                 } else if (strcmp(cmd, "DEL") == 0) {

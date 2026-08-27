@@ -25,6 +25,8 @@
 #define ENABLE_SKIPTABLE	 1
 
 #define ENABLE_PERSIST 		1	// 开启持久化存储
+#define ENABLE_MEMPOOL		1
+#define ENABLE_LEVEL_MEMPOOL 1
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
@@ -32,7 +34,40 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 
+#if ENABLE_MEMPOOL
+// 内存池结构
+typedef struct mempool_s{
+    size_t block_size;       // 每个内存块的总大小
+    size_t total_blocks;    // 内存池总块数
+    size_t free_blocks;     // 当前空闲块数量
+    void* free_list;        // 空闲链表头指针
+    char data[];        // 柔性数组
+// data[] 不占结构体空间，但可以通过 pool->data 访问结构体后面的内存：
+} mempool_t;
 
+extern mempool_t *array_item_pool;
+extern mempool_t *array_string_pool;
+extern mempool_t *rbtree_node_pool;
+extern mempool_t *rbtree_string_pool;
+extern mempool_t *hash_node_pool;
+extern mempool_t *hash_string_pool;
+extern mempool_t *skiptable_node_pool;
+extern mempool_t *skiptable_string_pool;
+
+#define SMALL_STRING_THRESHOLD 128  // 小字符串阈值
+
+// 指定块大小和块数量 
+mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks);
+// 分配块
+void* kvs_mempool_alloc(mempool_t *pool, size_t size);
+// 释放块
+void kvs_mempool_free(mempool_t *pool, void *ptr);
+// 重置块
+void kvs_mempool_reset(mempool_t *pool);
+// 销毁内存池
+void kvs_mempool_destroy(mempool_t *pool);
+
+#endif
 
 extern  const char *command[];
 extern const char *response[];

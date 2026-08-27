@@ -8,22 +8,71 @@
 kvs_skiptable_t global_skiptable;
 
 kvs_node_t* createNode(int level, char *key, char *value) {
+#if ENABLE_MEMPOOL
+    // 使用内存池分配节点（包含 forward 数组）
+    kvs_node_t* newNode = (kvs_node_t*)kvs_mempool_alloc(
+        skiptable_node_pool, 
+        sizeof(kvs_node_t) + (level + 1) * sizeof(kvs_node_t*)
+    );
+#else
     kvs_node_t* newNode = (kvs_node_t*)malloc(sizeof(kvs_node_t));
+#endif
+    if (!newNode) return NULL;
+#if ENABLE_MEMPOOL
+    // 使用内存池分配 key
+    if (key) {
+        newNode->key = kvs_mempool_alloc(skiptable_string_pool, strlen(key) + 1);
+        if (!newNode->key) {
+            kvs_mempool_free(skiptable_node_pool, newNode);
+            return NULL;
+        }
+        strcpy(newNode->key, key);
+    } else {
+        newNode->key = NULL;
+    }
+    
+    // 使用内存池分配 value
+    if (value) {
+        newNode->value = kvs_mempool_alloc(skiptable_string_pool, strlen(value) + 1);
+        if (!newNode->value) {
+            if (newNode->key) kvs_mempool_free(skiptable_string_pool, newNode->key);
+            kvs_mempool_free(skiptable_node_pool, newNode);
+            return NULL;
+        }
+        strcpy(newNode->value, value);
+    } else {
+        newNode->value = NULL;
+    }
+#else
     newNode->key = key ? strdup(key) : NULL;
     newNode->value = value ? strdup(value) : NULL;
+#endif
     // 指针数组，指向每个元素对应层的下一个节点
     // forward[0] 指向第 0 层的下一个节点，forward[1] 指向第 1 层的下一个节点
+#if ENABLE_MEMPOOL
+    newNode->forward = (kvs_node_t**)((char*)newNode + sizeof(kvs_node_t));
+#else
     newNode->forward = (kvs_node_t**)malloc((level + 1) * sizeof(kvs_node_t*));
+#endif
     return newNode;
 }
 
 void free_node(kvs_node_t *node) {
     if (node == NULL) return;
     
+#if ENABLE_MEMPOOL
+    // 释放 key 和 value
+    if (node->key) kvs_mempool_free(skiptable_string_pool, node->key);
+    if (node->value) kvs_mempool_free(skiptable_string_pool, node->value);
+    
+    // 释放节点（包含 forward 数组）
+    kvs_mempool_free(skiptable_node_pool, node);
+#else
     if (node->key) kvs_free(node->key);
     if (node->value) kvs_free(node->value);
     if (node->forward) kvs_free(node->forward);
     kvs_free(node);
+#endif
 }
 
 // 生成随机层数
@@ -95,7 +144,7 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
 
     if (search(inst, key) != NULL) return 1; // key已经存在了
 
-
+    // printf("alloc set skiptable\n");
     // update表示在第i层，新节点应该插入在哪个节点之后
     // 1. 初始化查找update和current
     kvs_node_t *update[MAX_LEVEL + 1];
@@ -196,8 +245,19 @@ int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
     if (inst == NULL || key == NULL || value == NULL) return -1;
     
     // 先检查key是否存在
-    if (search(inst, key) == NULL) return 1; // key不存在
+    kvs_node_t *node = search(inst, key);
+    if (node == NULL) return 1;  // key不存在
     
+
+#if ENABLE_MEMPOOL
+    // 释放旧 value
+    kvs_mempool_free(skiptable_string_pool, node->value);
+    
+    // 从内存池分配新 value
+    node->value = kvs_mempool_alloc(skiptable_string_pool, strlen(value) + 1);
+    if (!node->value) return -2;
+    strcpy(node->value, value);
+#else
     // update表示在第i层，新节点应该插入在哪个节点之后
     // 1. 初始化查找update和current
     kvs_node_t *update[MAX_LEVEL + 1];
@@ -223,6 +283,7 @@ int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
     }
     kvs_free(current->value);
     current->value = strdup(value);
+#endif
     return 0;
 }
 int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key) {

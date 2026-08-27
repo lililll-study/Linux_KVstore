@@ -37,26 +37,41 @@ static int _hash(char *key, int size) {
 }
 
 hashnode_t *_create_node(char *key, char *value) {
-
+#if ENABLE_MEMPOOL
+	hashnode_t *node = (hashnode_t*)kvs_mempool_alloc(hash_node_pool, sizeof(hashnode_t));
+#else
 	hashnode_t *node = (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
+#endif
 	if (!node) return NULL;
 	
 #if ENABLE_KEY_POINTER
+
+#if ENABLE_MEMPOOL
+	char *kcopy = kvs_mempool_alloc(hash_string_pool,  strlen(key) + 1);
+	if (kcopy == NULL) return NULL;
+
+	char *kvalue = kvs_mempool_alloc(hash_string_pool, strlen(value) + 1);
+	if (kvalue == NULL) { 
+		kvs_mempool_free(hash_string_pool, kvalue);
+		return NULL;
+	}
+#else
 	char *kcopy = kvs_malloc(strlen(key) + 1);
 	if (kcopy == NULL) return NULL;
-	memset(kcopy, 0, strlen(key) + 1);
-	strncpy(kcopy, key, strlen(key));
-
-	node->key = kcopy;
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) { 
 		kvs_free(kvalue);
 		return NULL;
 	}
+
+#endif
+	memset(kcopy, 0, strlen(key) + 1);
+	strncpy(kcopy, key, strlen(key));
+	node->key = kcopy;
+
 	memset(kvalue, 0, strlen(value) + 1);
 	strncpy(kvalue, value, strlen(value));
-
 	node->value = kvalue;
 	
 #else
@@ -97,9 +112,14 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 			hashnode_t *tmp = node;
 			node = node->next;
 			hash->nodes[i] = node;
-			
+#if ENABLE_MEMPOOL
+			kvs_mempool_free(hash_string_pool, tmp->key);
+			kvs_mempool_free(hash_string_pool, tmp->value);
+#else
+			kvs_free(tmp->key);
+            kvs_free(tmp->value);
+#endif
 			kvs_free(tmp);
-			
 		}
 	}
 
@@ -117,6 +137,7 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	int idx = _hash(key, MAX_TABLE_SIZE);
 
 	hashnode_t *node = hash->nodes[idx];
+	// printf("alloc set hash\n");
 #if 1
 	while (node != NULL) {
 		if (strcmp(node->key, key) == 0) { // exist
@@ -180,13 +201,22 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 	}
 
 	// node --> 
+#if ENABLE_MEMPOOL
+    // 释放旧 value
+    kvs_mempool_free(hash_string_pool, node->value);
+    
+    // 从内存池分配新 value
+    char *kvalue = kvs_mempool_alloc(hash_string_pool, strlen(value) + 1);
+    if (kvalue == NULL) return -2;
+	memset(kvalue, 0, strlen(value) + 1);
+#else
 	kvs_free(node->value);
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) return -2;
 	memset(kvalue, 0, strlen(value) + 1);
+#endif
 	strncpy(kvalue, value, strlen(value));
-
 	node->value = kvalue;
 	
 	return 0;
@@ -207,7 +237,14 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	if (strcmp(head->key, key) == 0) {
 		hashnode_t *tmp = head->next;
 		hash->nodes[idx] = tmp;
-		
+
+#if ENABLE_MEMPOOL
+        kvs_mempool_free(hash_string_pool, head->key);
+        kvs_mempool_free(hash_string_pool, head->value);
+#else
+        kvs_free(head->key);
+        kvs_free(head->value);
+#endif
 		kvs_free(head);
 		hash->count --;
 		
@@ -229,8 +266,13 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	hashnode_t *tmp = cur->next;
 	cur->next = tmp->next;
 #if ENABLE_KEY_POINTER
-	kvs_free(tmp->key);
-	kvs_free(tmp->value);
+#if ENABLE_MEMPOOL
+    kvs_mempool_free(hash_string_pool, tmp->key);
+    kvs_mempool_free(hash_string_pool, tmp->value);
+#else
+    kvs_free(tmp->key);
+    kvs_free(tmp->value);
+#endif
 #endif
 	kvs_free(tmp);
 	
