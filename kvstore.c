@@ -369,7 +369,6 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             }
             break;
 #endif
-        // rbtree
 #if ENABLE_RBTREE
         case KVS_CMD_RSET:
             ret = kvs_rbtree_set(&global_rbtree, key, value);
@@ -476,8 +475,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
                 len = sprintf(response, "no exist\r\n");
             }
             break;
-    #endif
-
+#endif
 #if ENABLE_SKIPTABLE
         case KVS_CMD_SSET:
             ret = kvs_skiptable_set(&global_skiptable, key, value);
@@ -554,6 +552,12 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
 #endif
 
+#if ENABLE_SYNC
+        case KVS_CMD_SYNC:
+            printf("sync now\n");
+            break;
+
+#endif
         default:
             assert(0);
     }

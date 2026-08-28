@@ -24,9 +24,11 @@
 #define ENABLE_HASH			 1
 #define ENABLE_SKIPTABLE	 1
 
-#define ENABLE_PERSIST 		1	// 开启持久化存储
-#define ENABLE_MEMPOOL		1
+#define ENABLE_PERSIST 		 1	// 开启持久化存储
+#define ENABLE_MEMPOOL		 1
 #define ENABLE_LEVEL_MEMPOOL 1
+
+#define ENABLE_SYNC			 1
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
 
@@ -103,7 +105,18 @@ int replay_aof(const char *filename);
 #endif
 
 
+#if ENABLE_SYNC
+#define SYNC_PORT  6666
+#define SYNC_BUFFER_SIZE 8192
 
+// 同步-单线程-阻塞
+int start_sync_server(void);		// 主节点启动
+int sync_from_master(const char *master_ip);	// 从节点同步
+// 传输备份数据
+int send_file(int fd, const char *filepath);
+int send_all_files(int fd);
+
+#endif
 
 #if ENABLE_ARRAY
 // 单个key
