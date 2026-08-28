@@ -230,7 +230,7 @@ const char *command[] = {
     "RSET", "RGET", "RDEL", "RMOD", "REXIST",
     "HSET", "HGET", "HDEL", "HMOD", "HEXIST",
     "SSET", "SGET", "SDEL", "SMOD", "SEXIST",
-    "SAVE"
+    "SAVE", "SYNC"
 
 };
 
@@ -262,12 +262,12 @@ enum {
 	KVS_CMD_SEXIST,
 
     KVS_CMD_SAVE,
+    KVS_CMD_SYNC,
 	KVS_CMD_COUNT,
 
 };
 
 const char *response[] = {};
-
 
 
 int check_datafile_exist() {
@@ -278,7 +278,6 @@ int check_datafile_exist() {
     }
     return 0;
 }
-
 
 int kvs_split_token(char *msg, char *tokens[]) {
 
@@ -296,11 +295,10 @@ int kvs_split_token(char *msg, char *tokens[]) {
 
 }
 
+int kvs_filter_protocol(char **tokens, int count, char *response) {
 // SET KEY VALUE
 // tokens[0]: SET ; tokens[1]: KEY; tokens[0]: VALUE
 // 进行协议数据过滤
-int kvs_filter_protocol(char **tokens, int count, char *response) {
-
     if (tokens == NULL || count == 0 || response == NULL) return -1;
 
     int cmd = KVS_CMD_START;
@@ -564,6 +562,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
 
 }
 
+int kvs_protocol(char *msg, int length, char *response) {
 /*
 msg: request message
 length:length of request msg
@@ -571,8 +570,6 @@ response: need to send
 @return : len of response
 协议解析：拆分命令 + 协议处理 = 返回响应
 */
-int kvs_protocol(char *msg, int length, char *response) {
-
     if (msg == NULL || length <= 0 || response == NULL) return -1;
     // printf("kvstore.c recv %d: %s\n", length, msg);
 
