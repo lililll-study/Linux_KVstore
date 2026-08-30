@@ -18,6 +18,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
+#include <fcntl.h>
 /* 
 连接大小：读缓存1K，写缓存1K，2K* = 2M
 */
@@ -30,14 +31,14 @@
 
 #if ENABLE_KVS
 
-typedef int (*msg_handler)(char *msg, int length, char *response);
+typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 
 static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c) {
 
     // printf("recv %d: %s\n", c->rlength, c->rbuffer);
-    c-> wlength = kvs_handler(c->rbuffer, c->rlength, c->wbuffer);
+    c-> wlength = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer);
     return 0;
 
 }
@@ -68,7 +69,7 @@ struct timeval begin;
 
 // struct conn conn_list[CONNECTION_SIZE] = {0};
 // 优化为动态分配内存
-struct conn conn_list[CONNECTION_SIZE] = {0};
+struct conn conn_list[CONNECTION_SIZE];
 
 
 int set_event(int fd, int event, int flag) {
@@ -101,8 +102,11 @@ int event_register(int fd, int event) {
 
     memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
     conn_list[fd].wlength = 0;
-
+#if ENABLE_NOBLOCK
     set_event(fd, event, 1);
+#else
+    set_event(fd, event, 1);
+#endif
 }
 
 
@@ -120,7 +124,10 @@ int accept_cb(int fd) {
         printf("accept error: %d --> %s\n", errno, strerror(errno));
         return -1;
     }
-
+#if ENABLE_NOBLOCK
+    // 设置非阻塞
+    fcntl(clientfd, F_SETFL, fcntl(clientfd, F_GETFL) | O_NONBLOCK);
+#endif
     event_register(clientfd, EPOLLIN);
 
     if ((clientfd % 1000) == 0) {
@@ -140,9 +147,32 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
 
-    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
-    int data_len = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
 
+    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
+#if ENABLE_NOBLOCK // 非阻塞
+    int data_len;
+
+    data_len = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
+    if (data_len < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 没有数据，等待epoll通知
+            return 0;
+        }
+        printf("recv error: %s\n", strerror(errno));
+        close(fd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        return -1;
+    }
+
+    if (data_len == 0) {
+        printf("client disconnect: %d\n", fd);
+        close(fd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        return 0;
+    }
+
+#else // 阻塞写法
+    int data_len = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
     if (data_len == 0) { // 断开连接了
         // close(clientfd);
         printf("client disconnect: %d\n", fd);
@@ -157,6 +187,9 @@ int recv_cb(int fd) {
 
         return 0;
     }
+
+#endif
+
 
     conn_list[fd].rlength = data_len;
     // printf("recv buffer: %s\n", conn_list[fd].rbuffer);
@@ -187,12 +220,7 @@ int recv_cb(int fd) {
 //2 rbuffer, wbuffer
 
 
-
-
-
 int send_cb(int fd) {
-
-
 
 #if ENABLE_HTTP
 // 发送数据之前做response响应
@@ -224,7 +252,35 @@ int send_cb(int fd) {
 #else
 
 	if (conn_list[fd].wlength != 0) {
+#if ENABLE_NOBLOCK
+        send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+        if (send_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 发送缓冲区还有数据，保持 EPOLLOUT，下次接着发
+                set_event(fd, EPOLLOUT, 0);
+                return 0;
+            }
+            perror("send");
+            close(fd);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            return -1;
+        }
+        // 如果没发完，保持 EPOLLOUT
+        if (send_len < conn_list[fd].wlength) {
+            // 把剩下的数据移动到缓冲区头部
+            memmove(conn_list[fd].wbuffer, 
+                    conn_list[fd].wbuffer + send_len, 
+                    conn_list[fd].wlength - send_len);
+            conn_list[fd].wlength -= send_len;
+            // 保持 EPOLLOUT，下次循环继续发剩下的
+            set_event(fd, EPOLLOUT, 0);
+            return send_len;
+        }
+        // 数据全部发送完毕，把长度设为 0
+        conn_list[fd].wlength = 0;
+#else
 		send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+#endif
 	}
 	
 	set_event(fd, EPOLLIN, 0);
@@ -238,7 +294,11 @@ int send_cb(int fd) {
 int init_server(unsigned short port) {
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-
+// 设置端口复用，允许立即重用端口
+    int reuse = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        printf("setsockopt SO_REUSEADDR failed: %s\n", strerror(errno));
+    }
     struct sockaddr_in servaddr;
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(port);//0-1023不能用，要大于1024
@@ -268,19 +328,35 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     */
     kvs_handler = handler;
-
     epfd = epoll_create(1);
 
-    // conn_list = (struct conn *)malloc(CONNECTION_SIZE * sizeof(struct conn));
-    if (!conn_list) {
-        printf("malloc conn_list failed\n");
+
+    int i = 0;
+// =============
+    // 初始化所有连接
+    for (i = 0; i < CONNECTION_SIZE; i++) {
+        memset(&conn_list[i], 0, sizeof(struct conn));
+        conn_list[i].fd = -1;
+    }
+    
+    // 注意：fd 可能大于 CONNECTION_SIZE，所以还需要检查
+    int sockfd = init_server(port);
+    if (sockfd < 0) {
+        printf("Failed to initialize server on port %d\n", port);
+        return -1;
+    }
+    if (sockfd >= CONNECTION_SIZE) {
+        printf("fd %d >= CONNECTION_SIZE %d\n", sockfd, CONNECTION_SIZE);
         return -1;
     }
 
-    int i = 0;
+    // conn_list = (struct conn *)malloc(CONNECTION_SIZE * sizeof(struct conn));
+// =============
+
+
 
     for (i = 0; i < MAX_PORTs; i++){
-        int sockfd = init_server(port + i); 
+        // int sockfd = init_server(port + i); 
         conn_list[sockfd].fd = sockfd;
         conn_list[sockfd].r_action.recv_callback = accept_cb;
 
