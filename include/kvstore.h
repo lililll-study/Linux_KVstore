@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+
 #define NET_REACTOR 0
 #define NET_NTYCO 1
 #define NET_PROACTOR 2
@@ -29,8 +30,9 @@
 #define ENABLE_LEVEL_MEMPOOL 1
 
 #define ENABLE_SYNC			 1
+#define ENABLE_SYNC_CLI		0	// 主机不开启命令行
 
-typedef int (*msg_handler)(char *msg, int length, char *response);
+typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 
 extern int reactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
@@ -88,6 +90,8 @@ extern const char *response[];
 #define AOF_HASH_FILE       "data/hash.aof"
 #define AOF_SKIPTABLE_FILE  "data/skiptable.aof"
 
+int save_snapshots();
+int load_snapshots();
 // 快照保存
 int save_snapshot_array(const char *filename);
 int save_snapshot_rbtree(const char *filename);
@@ -106,15 +110,16 @@ int replay_aof(const char *filename);
 
 
 #if ENABLE_SYNC
-#define SYNC_PORT  6666
 #define SYNC_BUFFER_SIZE 8192
 
-// 同步-单线程-阻塞
-int start_sync_server(void);		// 主节点启动
-int sync_from_master(const char *master_ip);	// 从节点同步
-// 传输备份数据
+extern int g_is_master;
+
+// 同步函数
+int handle_sync_request(int fd);          // 主节点：处理同步
+int sync_from_master(const char *master_ip, int port);	// 由从节点发起同步
+// 主节点传输和从节点接收
 int send_file(int fd, const char *filepath);
-int send_all_files(int fd);
+int recv_file(int fd, const char *save_dir);
 
 #endif
 
