@@ -9,7 +9,7 @@ typedef int (*RCALLBACK)(int fd);
 #define ENABLE_HTTP     0
 #define ENABLE_WS       0
 #define ENABLE_KVS      1
-
+#define ENABLE_NOBLOCK	1
 
 
 // 封装IO，读数据写数据内存，以及相应的回调函数

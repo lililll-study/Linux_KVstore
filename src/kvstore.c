@@ -216,6 +216,10 @@ void dest_mempools(void) {
 }
 #endif
 
+#if ENABLE_SYNC
+int g_is_master = 1;  // 1: 主节点, 0: 从节点
+#endif
+
 void *kvs_malloc (size_t size) {
     return malloc(size);
 }
@@ -295,7 +299,7 @@ int kvs_split_token(char *msg, char *tokens[]) {
 
 }
 
-int kvs_filter_protocol(char **tokens, int count, char *response) {
+int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 // SET KEY VALUE
 // tokens[0]: SET ; tokens[1]: KEY; tokens[0]: VALUE
 // 进行协议数据过滤
@@ -555,8 +559,30 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
 #if ENABLE_SYNC
         case KVS_CMD_SYNC:
             printf("sync now\n");
+            if (g_is_master) {
+                // 主节点：则处理同步请求
+                ret = handle_sync_request(fd);
+                if (ret < 0) {
+                    len = sprintf(response, "error\r\n");
+                } else if (ret == 0) {
+                    len = sprintf(response, "ok\r\n");
+                }
+            } else {
+                // 从节点：发起同步
+                if (count < 3) {
+                    len = sprintf(response, "error: need master_ip, port\r\n");
+                    break;
+                }
+                char *maser_ip = tokens[1];
+                int port = atoi(tokens[2]);
+                ret = sync_from_master(maser_ip, port);
+                if (ret < 0) {
+                    len = sprintf(response, "error\r\n");
+                } else if (ret == 0) {
+                    len = sprintf(response, "ok\r\n");
+                }
+            }
             break;
-
 #endif
         default:
             assert(0);
@@ -566,7 +592,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
 
 }
 
-int kvs_protocol(char *msg, int length, char *response) {
+int kvs_protocol(int fd, char *msg, int length, char *response) {
 /*
 msg: request message
 length:length of request msg
@@ -583,7 +609,7 @@ response: need to send
     if (count == -1)return -1;
 
     // memcpy(response, msg, length);
-    return kvs_filter_protocol(tokens, count, response);
+    return kvs_filter_protocol(fd, tokens, count, response);
 
 }
 
@@ -662,16 +688,158 @@ void dest_kvengine(void) {
 }
 
 
+#if ENABLE_SYNC_CLI
+// 命令行线程函数
+void* cli_thread(void* arg) {
+    char input[256];
+    int is_master = *(int*)arg;
+    
+    printf("\n=== KVS CLI ===\n");
+    if (is_master) {
+        printf("Mode: MASTER\n");
+    } else {
+        printf("Mode: SLAVE\n");
+        printf("  sync <ip> <port>  - Sync from master\n");
+    }
+    printf("  help              - Show this help\n");
+    printf("  exit              - Exit\n");
+    printf("================\n\n");
+    
+    while (1) {
+        printf("kvs> ");
+        fflush(stdout);
+        
+        if (!fgets(input, sizeof(input), stdin)) {
+            break;
+        }
+        
+        // 去除换行
+        input[strcspn(input, "\n")] = '\0';
+        
+        // 跳过空行
+        if (strlen(input) == 0) continue;
+        
+        // 分割命令
+        char *cmd = strtok(input, " ");
+        
+        if (strcmp(cmd, "sync") == 0) {
+            if (!is_master) {
+                char *ip = strtok(NULL, " ");
+                char *port_str = strtok(NULL, " ");
+                if (ip && port_str) {
+                    int master_port = atoi(port_str);
+                    printf("\n>>> Syncing from %s:%d...\n", ip, master_port);
+                    fflush(stdout);
+                    
+                    // 执行同步
+                    int ret = sync_from_master(ip, master_port);
+                    if (ret == 0) {
+                        printf(">>> Sync completed successfully!\n");
+                    } else {
+                        printf(">>> Sync failed!\n");
+                    }
+                    fflush(stdout);
+                } else {
+                    printf("Usage: sync <master_ip> <port>\n");
+                }
+            } else {
+                printf("Master node doesn't need to sync\n");
+            }
+        }
+        else if (strcmp(cmd, "help") == 0) {
+            printf("Commands:\n");
+            if (!is_master) {
+                printf("  sync <ip> <port>  - Sync data from master\n");
+            }
+            printf("  help              - Show this help\n");
+            printf("  exit              - Exit program\n");
+        }
+        else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+            printf("Exiting...\n");
+            exit(0);
+        }
+        else {
+            printf("Unknown command: %s. Type 'help' for available commands.\n", cmd);
+        }
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    // 禁用缓冲
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    
+    if (argc < 2) {
+        printf("Usage: ./kvstore <port> [--master|--slave]\n");
+        return -1;
+    }
+    
+    int port = atoi(argv[1]);
+    
+    // 判断角色
+    g_is_master = 1;
+    if (argc >= 3) {
+        if (strcmp(argv[2], "--slave") == 0) {
+            g_is_master = 0;
+            printf("Running as SLAVE node\n");
+        } else if (strcmp(argv[2], "--master") == 0) {
+            g_is_master = 1;
+            printf("Running as MASTER node\n");
+        }
+    }
+    
+    init_kvengine();
+    
+    // ===== 创建 CLI 线程 =====
+    pthread_t cli_tid;
+    pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
+    // =========================
+    
+    // 启动网络服务
+#if (NET_SELECT == NET_REACTOR)
+    reactor_start(port, kvs_protocol);
+#elif (NET_SELECT == NET_NTYCO)
+    ntyco_start(port, kvs_protocol);
+#elif (NET_SELECT == NET_PROACTOR)
+    proactor_start(port, kvs_protocol);
+#endif
+    
+    dest_kvengine();
+    return 0;
+}
+
+#else
+
 // 对于一个服务而言，传入一个port，以及kvs_protocol就行了
 // 底层网络完全抽象隔离，剩下就是改造网络框架成想要的
 int main(int argc, char *argv[]) {
 
-    if (argc != 2) return -1;
+    if (argc < 2) {
+        printf("Usage: ./kvstore <port> [--master|--slave]\n");
+        return -1;
+    }
 #if ENABLE_PERSIST
     if (check_datafile_exist()== -1) return -1;
 #endif
     int port = atoi(argv[1]);
 
+    // 判断备份角色
+    g_is_master = 1;  // 默认主节点
+    if (argc >= 3) {
+        if (strcmp(argv[2], "--slave") == 0) {
+            g_is_master = 0;
+            printf("Running as SLAVE node\n");
+        } else if (strcmp(argv[2], "--master") == 0) {
+            g_is_master = 1;
+            printf("Running as MASTER node\n");
+        } else {
+            printf("Unknown option: %s\n", argv[2]);
+            return -1;
+        }
+    } else {
+        printf("Running as MASTER node (default)\n");
+    }
     // 用于创建kv存储全局单例内存块global_array
     init_kvengine();
 
@@ -688,6 +856,7 @@ int main(int argc, char *argv[]) {
     dest_kvengine();
 }
 
+#endif
 
 
 
