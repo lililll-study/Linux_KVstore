@@ -593,6 +593,11 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 }
 
 int kvs_protocol(int fd, char *msg, int length, char *response) {
+
+#if ENABLE_CMD_BATCH
+
+    while ()
+#else
 /*
 msg: request message
 length:length of request msg
@@ -610,7 +615,7 @@ response: need to send
 
     // memcpy(response, msg, length);
     return kvs_filter_protocol(fd, tokens, count, response);
-
+#endif
 }
 
 
