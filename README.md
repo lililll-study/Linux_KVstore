@@ -41,7 +41,7 @@ make run-slave
 
 
 从机执行：sync  <IP>  <2000>
-
+从机需要修改宏定义ENABLE_SYNC_CLI为1开启cli
 连接主机，并向主机发送SYNC命令备份主机数据，此时主机会保存快照并清空aof，并将所有snap数据发送到从机。从机保存至data目录下。
 
 
