@@ -745,7 +745,8 @@ void dest_kvengine(void) {
 }
 
 
-#if ENABLE_SYNC_CLI
+
+
 // 命令行线程函数
 void* cli_thread(void* arg) {
     char input[256];
@@ -822,72 +823,27 @@ void* cli_thread(void* arg) {
     return NULL;
 }
 
+
 int main(int argc, char *argv[]) {
+
     // 禁用缓冲
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    
+
+ //   ./kvstore 2000 --master 
     if (argc < 2) {
         printf("Usage: ./kvstore <port> [--master|--slave]\n");
         return -1;
     }
-    
     int port = atoi(argv[1]);
-    
-    // 判断角色
-    g_is_master = 1;
-    if (argc >= 3) {
-        if (strcmp(argv[2], "--slave") == 0) {
-            g_is_master = 0;
-            printf("Running as SLAVE node\n");
-        } else if (strcmp(argv[2], "--master") == 0) {
-            g_is_master = 1;
-            printf("Running as MASTER node\n");
-        }
-    }
-    
-    init_kvengine();
-    
-    // ===== 创建 CLI 线程 =====
-    pthread_t cli_tid;
-    pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
-    // =========================
-    
-    // 启动网络服务
-#if (NET_SELECT == NET_REACTOR)
-    reactor_start(port, kvs_protocol);
-#elif (NET_SELECT == NET_NTYCO)
-    ntyco_start(port, kvs_protocol);
-#elif (NET_SELECT == NET_PROACTOR)
-    proactor_start(port, kvs_protocol);
-#endif
-    
-    dest_kvengine();
-    return 0;
-}
-
-#else
-
-// 对于一个服务而言，传入一个port，以及kvs_protocol就行了
-// 底层网络完全抽象隔离，剩下就是改造网络框架成想要的
-int main(int argc, char *argv[]) {
-
-    if (argc < 2) {
-        printf("Usage: ./kvstore <port> [--master|--slave]\n");
-        return -1;
-    }
-#if ENABLE_PERSIST
-    if (check_datafile_exist()== -1) return -1;
-#endif
-    int port = atoi(argv[1]);
+    g_is_master = 1;  // 默认主节点
 
     // 判断备份角色
-    g_is_master = 1;  // 默认主节点
     if (argc >= 3) {
-        if (strcmp(argv[2], "--slave") == 0) {
+        if (strcmp(argv[2], "--slave") == 0) { // 从节点
             g_is_master = 0;
             printf("Running as SLAVE node\n");
-        } else if (strcmp(argv[2], "--master") == 0) {
+        } else if (strcmp(argv[2], "--master") == 0) { // 主节点
             g_is_master = 1;
             printf("Running as MASTER node\n");
         } else {
@@ -897,23 +853,31 @@ int main(int argc, char *argv[]) {
     } else {
         printf("Running as MASTER node (default)\n");
     }
+
+#if ENABLE_PERSIST // 检查data目录是否存在
+    if (check_datafile_exist()== -1) return -1;
+#endif
+
     // 用于创建kv存储全局单例内存块global_array
     init_kvengine();
 
-    // 功能入口函数，第二个参数为函数指针msg_handler，把kvs_protocol传入作为函数
-    // 间接
+    // 如果是从节点
+    if (g_is_master == 0) {
+    // ===== 创建 CLI 线程 =====
+        pthread_t cli_tid;
+        pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
+    // =========================    
+    }
+
+// 功能入口函数，第二个参数为函数指针msg_handler，把kvs_protocol传入作为函数
+// 间接
 #if (NET_SELECT == NET_REACTOR)
     reactor_start(port, kvs_protocol);
 #elif (NET_SELECT == NET_NTYCO)
     ntyco_start(port, kvs_protocol);
 #elif (NET_SELECT == NET_PROACTOR)
     proactor_start(port, kvs_protocol);
-
 #endif
     dest_kvengine();
+    return 0;
 }
-
-#endif
-
-
-
