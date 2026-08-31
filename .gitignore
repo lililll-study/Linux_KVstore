@@ -1,0 +1,26 @@
+# 编译生成的可执行文件
+kvstore
+
+# 编译中间文件
+*.o
+*.obj
+*.dylib
+*.dll
+*.lib
+
+# build 目录
+build/
+
+# data 目录（数据文件）
+data/
+*.snap
+*.aof
+
+# IDE 配置文件
+.idea/
+.vscode/
+
+
+# 备份文件
+*.bak
+*.backup
