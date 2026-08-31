@@ -35,7 +35,7 @@ int send_file(int fd, const char *filepath) {
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 retry_count++;
-                printf("  [DEBUG] send EAGAIN, retry #%d\n", retry_count);  // ← 加这行
+                // printf("  [DEBUG] send EAGAIN, retry #%d\n", retry_count);  // ← 加这行
                 continue;  // 重试
             }
             return -1;
@@ -43,7 +43,7 @@ int send_file(int fd, const char *filepath) {
         sent += n;
     }
     if (retry_count > 0) {
-        printf("  [DEBUG] header sent with %d retries\n", retry_count);
+        // printf("  [DEBUG] header sent with %d retries\n", retry_count);
     }
 #else
     send(fd, header, strlen(header), 0);
