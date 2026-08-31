@@ -32,7 +32,6 @@
 #define ENABLE_CMD_BATCH	 1
 
 #define ENABLE_SYNC			 1
-#define ENABLE_SYNC_CLI		0	// 主机不开启命令行
 
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 
