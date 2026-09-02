@@ -769,3 +769,15 @@ free_list → 块2 → 块1 → 块0 → NULL
 1. **每次写操作**（SET/MOD/DEL）→ 写入 AOF
 
 2. **同时发送命令**到从节点 → 从节点执行相同操作
+
+
+
+
+
+## 5 分包的问题
+
+        发现，当进行cmd批处理的时候，服务端由于recv_cb设置的是非阻塞IO，会把数据截断读取。这就导致传入kvs_protocol处理的wbuffer内的数据，不完整，无法处理边界数据。
+
+        为了解决这个问题，参考redis的设计方案，在底层reactor处当clientfd有数据可读的时候，事件循环调用read回调，非阻塞的读取IO数据，存入querybuf中。
+
+        紧接着调用processinputbufer回调，尝试从querybuf中解析出一个完整命令。如果数据不完整，解析会返回错误，但数据继续留在querybuf，等待下次更多数据到达时再
