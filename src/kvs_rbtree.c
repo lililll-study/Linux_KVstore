@@ -454,8 +454,8 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 
 	rbtree_node *node = NULL;
 
-	while (!(node = inst->root)) {
-		rbtree_node *mini = rbtree_mini(inst, node);// 每次找到最小的节点
+	while (inst->root != inst->nil) {
+		rbtree_node *mini = rbtree_mini(inst, inst->root);// 每次找到最小的节点
 		rbtree_node *cur = rbtree_delete(inst, mini); // 然后删除它，并free
 #if ENABLE_MEMPOOL
         if (cur->key) kvs_mempool_free(rbtree_string_pool, cur->key);
@@ -474,7 +474,6 @@ void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 #else
     kvs_free(inst->nil);
 #endif
-	return;
 }
 
 
@@ -577,7 +576,7 @@ int kvs_rbtree_del(kvs_rbtree_t *inst, char *key) {
     if (cur->value) kvs_free(cur->value);
     kvs_free(cur);
 #endif
-	kvs_free(cur);
+	// kvs_free(cur);
 	return 0;
 }
 

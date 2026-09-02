@@ -1,6 +1,6 @@
 
-#include "kvstore.h"
 #include "server.h"
+#include "kvstore.h"
 // 启动命令 
 // gcc -o kvstore kvstore.c reactor.c ntyco.c  -I ./NtyCo/core  -L ./NtyCo/lib  -lntyco -lpthread -ldl
 // gcc -o kvstore kvstore.c reactor.c
@@ -22,6 +22,9 @@ extern kvs_skiptable_t global_skiptable;
 #endif
 
 #if ENABLE_MEMPOOL
+#define KVS_POOL_NODE_COUNT   100000
+#define KVS_POOL_STRING_COUNT 200000
+
 // 定义内存池
  mempool_t *array_item_pool = NULL;     // 数组节点池
  mempool_t *array_string_pool = NULL;   // 数组字符串池
@@ -86,7 +89,7 @@ void* kvs_mempool_alloc(mempool_t *pool, size_t size) {
     
     // 如果请求大小超过块容量，直接用 malloc
     if (size > user_capacity) {
-        printf("  WARN: size %zu > block capacity %zu, using malloc\n", size, user_capacity);
+        // printf("  WARN: size %zu > block capacity %zu, using malloc\n", size, user_capacity);
         return kvs_malloc(size);
     }
 #endif
@@ -164,40 +167,40 @@ void kvs_mempool_destroy(mempool_t *pool) {
 
 // 大字符串分配函数
 
-
+// 
 int init_mempools(void) {
     // 数组：1024个item，2048个字符串（key+value）
-    array_item_pool = kvs_mempool_create(sizeof(kvs_array_item_t), KVS_ARRAY_SIZE);
-    array_string_pool = kvs_mempool_create(256, KVS_ARRAY_SIZE * 2);
+    array_item_pool = kvs_mempool_create(sizeof(kvs_array_item_t), KVS_POOL_NODE_COUNT);
+    array_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
     if (!array_item_pool || !array_string_pool){
-        printf("Failed to create array_item_pool\n");
+        // printf("Failed to create array_item_pool\n");
         return -1;
     }
     
     // 红黑树：1024个节点，2048个字符串
-    rbtree_node_pool = kvs_mempool_create(sizeof(rbtree_node), 1024);
-    rbtree_string_pool = kvs_mempool_create(256, 2048);
+    rbtree_node_pool = kvs_mempool_create(sizeof(rbtree_node), KVS_POOL_NODE_COUNT);
+    rbtree_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
     if (!rbtree_node_pool || !rbtree_string_pool){
-        printf("Failed to create rbtree_node_pool\n");
+        // printf("Failed to create rbtree_node_pool\n");
         return -1;
     }
     
     // 哈希：1024个节点，2048个字符串
-    hash_node_pool = kvs_mempool_create(sizeof(hashnode_t), 1024);
-    hash_string_pool = kvs_mempool_create(256, 2048);
+    hash_node_pool = kvs_mempool_create(sizeof(hashnode_t), KVS_POOL_NODE_COUNT);
+    hash_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
     if (!hash_node_pool || !hash_string_pool){
-        printf("Failed to create hash_node_pool\n");
+        // printf("Failed to create hash_node_pool\n");
         return -1;
     }
     
     // 跳表：1024个节点（包含forward数组），2048个字符串
     skiptable_node_pool = kvs_mempool_create(
         sizeof(kvs_node_t) + (MAX_LEVEL + 1) * sizeof(kvs_node_t*),
-        1024
+        KVS_POOL_NODE_COUNT
     );
-    skiptable_string_pool = kvs_mempool_create(256, 2048);
+    skiptable_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
     if (!skiptable_node_pool || !skiptable_string_pool){
-        printf("Failed to create skiptable_node_pool\n");
+        // printf("Failed to create skiptable_node_pool\n");
         return -1;
     }
     
@@ -359,7 +362,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "MOD", key, NULL);  // 追加AOF
+                append_aof(AOF_ARRAY_FILE, "MOD", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -380,7 +383,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "set error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RSET", key, NULL);  // 追加AOF
+                append_aof(AOF_RBTREE_FILE, "RSET", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -413,7 +416,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RMOD", key, NULL);  // 追加AOF
+                append_aof(AOF_RBTREE_FILE, "RMOD", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -434,7 +437,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HSET", key, NULL);  // 追加AOF
+                append_aof(AOF_HASH_FILE, "HSET", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -466,7 +469,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HMOD", key, NULL);  // 追加AOF
+                append_aof(AOF_HASH_FILE, "HMOD", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -487,7 +490,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "set error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, NULL);  // 追加AOF
+                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "exist\r\n");
@@ -520,7 +523,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 len = sprintf(response, "error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, NULL);  // 追加AOF
+                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, value);  // 追加AOF
                 len = sprintf(response, "ok\r\n");
             } else {
                 len = sprintf(response, "no exist\r\n");
@@ -602,9 +605,10 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
     char *next;      // 下一行的起始位置
 
     msg[length] = '\0'; // 确保字符串以\0结束
-
+    // printf("DEBUG: kvs_protocol length=%d\n", length);
+    // printf("DEBUG: msg=%.200s\n", msg);
 // 循环处理每一行，按照换行符分割
-    while (line && *line) {
+    while (line && *line) {//line 指针是否为 NULL,line 指向的字符是否为 \0
         //查找换行符的位置，返回指针next，指向当前行的结尾位置
         next = strchr(line, '\n');  
         if (next) { 

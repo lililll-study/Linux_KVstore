@@ -4,12 +4,12 @@
 
 
 typedef int (*RCALLBACK)(int fd);
-#define BUFFER_LENGTH       1024
+#define BUFFER_LENGTH       1024   // 大约可支持700条request和4096条response批量发
 
 #define ENABLE_HTTP     0
 #define ENABLE_WS       0
 #define ENABLE_KVS      1
-#define ENABLE_NOBLOCK	1
+#define ENABLE_NOBLOCK	0
 
 
 // 封装IO，读数据写数据内存，以及相应的回调函数
@@ -21,6 +21,11 @@ struct conn {
 
     char wbuffer[BUFFER_LENGTH];
     int wlength;
+
+    // 查询缓冲区
+    char *querybuf; // 动态分配缓冲区
+    int querybuf_len; // 当前有效的数据长度
+    int querybuf_cap; // 缓冲区容量
 
     char *payload;  // 解码后的数据
     char mask[4];   // 掩码

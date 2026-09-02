@@ -48,20 +48,28 @@ hashnode_t *_create_node(char *key, char *value) {
 
 #if ENABLE_MEMPOOL
 	char *kcopy = kvs_mempool_alloc(hash_string_pool,  strlen(key) + 1);
-	if (kcopy == NULL) return NULL;
+	if (kcopy == NULL) {
+		kvs_mempool_free(hash_node_pool, node);
+		return NULL;
+	}
 
 	char *kvalue = kvs_mempool_alloc(hash_string_pool, strlen(value) + 1);
 	if (kvalue == NULL) { 
-		kvs_mempool_free(hash_string_pool, kvalue);
+		kvs_mempool_free(hash_string_pool, kcopy);
+		kvs_mempool_free(hash_node_pool, node);     // 释放 node
 		return NULL;
 	}
 #else
 	char *kcopy = kvs_malloc(strlen(key) + 1);
-	if (kcopy == NULL) return NULL;
+	if (kcopy == NULL) {
+		kvs_free(node);
+		return NULL;
+	}
 
 	char *kvalue = kvs_malloc(strlen(value) + 1);
 	if (kvalue == NULL) { 
-		kvs_free(kvalue);
+		kvs_free(kcopy);
+		kvs_free(node);
 		return NULL;
 	}
 
@@ -83,7 +91,17 @@ hashnode_t *_create_node(char *key, char *value) {
 	return node;
 }
 
-
+static void _free_node(hashnode_t *node) {
+#if ENABLE_MEMPOOL
+    kvs_mempool_free(hash_string_pool, node->key);
+    kvs_mempool_free(hash_string_pool, node->value);
+    kvs_mempool_free(hash_node_pool, node);
+#else
+    kvs_free(node->key);
+    kvs_free(node->value);
+    kvs_free(node);
+#endif
+}
 //
 int kvs_hash_create(kvs_hash_t *hash) {
 
@@ -102,7 +120,7 @@ int kvs_hash_create(kvs_hash_t *hash) {
 void kvs_hash_destory(kvs_hash_t *hash) {
 
 	if (!hash) return;
-
+	printf("Destroying hash table, count=%d\n", hash->count);
 	int i = 0;
 	for (i = 0;i < hash->max_slots;i ++) {
 		hashnode_t *node = hash->nodes[i];
@@ -111,20 +129,24 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 
 			hashnode_t *tmp = node;
 			node = node->next;
-			hash->nodes[i] = node;
-#if ENABLE_MEMPOOL
-			kvs_mempool_free(hash_string_pool, tmp->key);
-			kvs_mempool_free(hash_string_pool, tmp->value);
-#else
-			kvs_free(tmp->key);
-            kvs_free(tmp->value);
-#endif
-			kvs_free(tmp);
+			_free_node(tmp);
+// 			hash->nodes[i] = node;
+// #if ENABLE_KEY_POINTER
+// #if ENABLE_MEMPOOL
+// 			kvs_mempool_free(hash_node_pool, tmp);
+// #else
+// 			kvs_free(tmp->key);
+//             kvs_free(tmp->value);
+// #endif
+// #endif
+// 			kvs_free(tmp);
 		}
+		hash->nodes[i] = NULL;
 	}
 
 	kvs_free(hash->nodes);
-	
+	hash->nodes = NULL;
+	printf("Hash destroyed\n");
 }
 
 // 5 + 2
@@ -227,30 +249,33 @@ int kvs_hash_count(kvs_hash_t *hash) {
 }
 
 int kvs_hash_del(kvs_hash_t *hash, char *key) {
-	if (!hash || !key) return -2;
-
+	if (!hash || !key) return -1;	// 参数错误
+	if (!hash->nodes) return 1;  // key不存在
 	int idx = _hash(key, MAX_TABLE_SIZE);
 
 	hashnode_t *head = hash->nodes[idx];
-	if (head == NULL) return -1; // noexist
-	// head node
+
+
+	if (head == NULL) return 1; // noexist
+	// 删除head node
 	if (strcmp(head->key, key) == 0) {
-		hashnode_t *tmp = head->next;
-		hash->nodes[idx] = tmp;
-
-#if ENABLE_MEMPOOL
-        kvs_mempool_free(hash_string_pool, head->key);
-        kvs_mempool_free(hash_string_pool, head->value);
-#else
-        kvs_free(head->key);
-        kvs_free(head->value);
-#endif
-		kvs_free(head);
+		hash->nodes[idx] = head->next;   // 关键：先摘链
+		_free_node(head);
+// 		hash->nodes[idx] = tmp;
+// #if ENABLE_KEY_POINTER
+// #if ENABLE_MEMPOOL
+//         kvs_mempool_free(hash_node_pool, head);
+// 		kvs_mempool_free(hash_node_pool, tmp);
+// #else
+//         kvs_free(head->key);
+//         kvs_free(head->value);
+// #endif
+// #endif
+// 		kvs_free(head);
 		hash->count --;
-		
-		return 0;
+		return 0;	// 删除成功
 	}
-
+	// 遍历查找
 	hashnode_t *cur = head;
 	while (cur->next != NULL) {
 		if (strcmp(cur->next->key, key) == 0) break; // search node
@@ -259,23 +284,22 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	}
 
 	if (cur->next == NULL) {
-		
-		return -1;
+		return 1;
 	}
 
 	hashnode_t *tmp = cur->next;
 	cur->next = tmp->next;
-#if ENABLE_KEY_POINTER
-#if ENABLE_MEMPOOL
-    kvs_mempool_free(hash_string_pool, tmp->key);
-    kvs_mempool_free(hash_string_pool, tmp->value);
-#else
-    kvs_free(tmp->key);
-    kvs_free(tmp->value);
-#endif
-#endif
-	kvs_free(tmp);
-	
+// #if ENABLE_KEY_POINTER
+// #if ENABLE_MEMPOOL
+//     kvs_mempool_free(hash_string_pool, tmp->key);
+//     kvs_mempool_free(hash_string_pool, tmp->value);
+// #else
+//     kvs_free(tmp->key);
+//     kvs_free(tmp->value);
+// #endif
+// #endif
+// 	kvs_free(tmp);
+	_free_node(tmp);
 	hash->count --;
 
 	return 0;
