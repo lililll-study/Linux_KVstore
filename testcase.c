@@ -167,16 +167,6 @@ void rbtree_testcase_3w_0_mix (int connfd) {
         testcase(connfd, cmd,     "ok\r\n", "RMOD-Teacher");
     }
 
-        // testcase(connfd, "RMOD Teacher Lililihy", "ok\r\n", "RMOD-Teacher");
-        // testcase(connfd, "RGET Teacher",          "Lililihy\r\n", "RGET-Teacher");
-        // testcase(connfd, "REXIST Teacher",        "exist\r\n", "REXIST-Teacher");
-        // testcase(connfd, "RDEL Teacher",         "ok\r\n", "RDEL-Teacher");
-        // testcase(connfd, "RGET Teacher",          "no exist\r\n", "RGET-Teacher");
-        // testcase(connfd, "RMOD Teacher lhy",     "no exist\r\n", "RMOD-Teacher");
-        // testcase(connfd, "REXIST Teacher",        "no exist\r\n", "REXIST-Teacher");
-
-
-
     struct timeval tv_cur;
     gettimeofday(&tv_cur, NULL);
 
