@@ -33,6 +33,27 @@
 
 #define ENABLE_SYNC			 1
 
+#if ENABLE_CMD_BATCH
+typedef struct kvs_conn_ctx {
+	char *cmd_buffer;      // 命令积累缓冲区
+    int cmd_buffer_len;    // 当前有效数据长度
+    int cmd_buffer_cap;    // 缓冲区容量
+} kvs_conn_ctx_t;
+#define MAX_CONN 1024
+extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
+int kvs_ctx_init(kvs_conn_ctx_t *ctx);
+void kvs_ctx_free(kvs_conn_ctx_t *ctx);
+int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len);
+void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed);
+int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap);
+// 清理连接上下文（在连接关闭时调用）
+void cleanup_connection(int fd);
+
+
+#endif
+
+
+
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 
 extern int reactor_start(unsigned short port, msg_handler handler);

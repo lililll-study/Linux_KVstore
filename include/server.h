@@ -16,16 +16,16 @@ typedef int (*RCALLBACK)(int fd);
 struct conn {
     int fd;
 
-    char rbuffer[BUFFER_LENGTH];
+    char rbuffer[BUFFER_LENGTH*2];
     int rlength;
 
-    char wbuffer[BUFFER_LENGTH];
+    char wbuffer[BUFFER_LENGTH*2];
     int wlength;
 
-    // 查询缓冲区
-    char *querybuf; // 动态分配缓冲区
-    int querybuf_len; // 当前有效的数据长度
-    int querybuf_cap; // 缓冲区容量
+    // // 查询缓冲区
+    // char *querybuf; // 动态分配缓冲区
+    // int querybuf_len; // 当前有效的数据长度
+    // int querybuf_cap; // 缓冲区容量
 
     char *payload;  // 解码后的数据
     char mask[4];   // 掩码

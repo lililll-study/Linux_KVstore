@@ -220,6 +220,167 @@ void dest_mempools(void) {
 }
 #endif
 
+
+#if ENABLE_CMD_BATCH
+
+
+kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
+
+// 初始化
+int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
+    if (!ctx) return -1;
+    ctx->cmd_buffer_cap = 4096;
+    ctx->cmd_buffer = (char *)malloc(ctx->cmd_buffer_cap);
+    if (!ctx->cmd_buffer) return -1;
+    ctx->cmd_buffer_len = 0;
+    ctx->cmd_buffer[0] = '\0';
+    return 0;
+}
+
+// 释放
+void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->cmd_buffer) {
+        free(ctx->cmd_buffer);
+        ctx->cmd_buffer = NULL;
+    }
+    ctx->cmd_buffer_len = 0;
+    ctx->cmd_buffer_cap = 0;
+}
+
+// 动态扩展缓冲区
+int kvs_ctx_expand(kvs_conn_ctx_t *ctx, int need) {
+    if (ctx->cmd_buffer_cap >= need) return 0;
+    
+    int new_cap = ctx->cmd_buffer_cap;
+    while (new_cap < need) new_cap *= 2;        // 以两倍的形式逐次递增
+    
+    char *new_buf = (char *)realloc(ctx->cmd_buffer, new_cap);
+    if (!new_buf) return -1;
+    ctx->cmd_buffer = new_buf;
+    ctx->cmd_buffer_cap = new_cap;
+    return 0;
+}
+
+// 追加数据到缓冲区
+int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len) {
+    if (!ctx || !data || len <= 0) return -1;
+    
+    // 预留 \0 空间
+    if (kvs_ctx_expand(ctx, ctx->cmd_buffer_len + len + 1) < 0) {
+        return -1;
+    }
+    
+    memcpy(ctx->cmd_buffer + ctx->cmd_buffer_len, data, len);   // 添加数据
+    ctx->cmd_buffer_len += len;                                 // 添加长度
+    ctx->cmd_buffer[ctx->cmd_buffer_len] = '\0';                // 添加结束符
+    return 0;
+}
+
+// 移除已处理的数据
+void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
+    if (!ctx || consumed <= 0) return;
+    if (consumed >= ctx->cmd_buffer_len) {
+        ctx->cmd_buffer_len = 0;
+        ctx->cmd_buffer[0] = '\0';
+        return;
+    }
+    memmove(ctx->cmd_buffer, ctx->cmd_buffer + consumed, 
+            ctx->cmd_buffer_len - consumed);
+    ctx->cmd_buffer_len -= consumed;
+    ctx->cmd_buffer[ctx->cmd_buffer_len] = '\0';
+}
+
+
+// 单条命令响应的最大预留空间（GET 类响应可能较长）
+#define KVS_MAX_RESP_PER_CMD 512
+int p_cmd_count = 0;
+
+// ===== 处理缓冲区中的完整命令 =====
+int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
+    if (!ctx || !response) return -1;
+    
+    int total_len = 0;
+    char *line_start = ctx->cmd_buffer; // 当前行的起始位置
+    int processed_bytes = 0;                  // 已处理的字节数
+    
+    while (processed_bytes < ctx->cmd_buffer_len) {   // 只要已经处理的字数小于缓冲区数量，就循环处理
+        
+        // 1. 查找换行符 
+        // 从行开始到缓冲区末尾剩余的字节数，查找\n
+        char *line_end = memchr(line_start, '\n', ctx->cmd_buffer_len - processed_bytes);
+        // 边界条件
+        if (!line_end) break;// 没找到说明无完整命令，直接跳出
+        // 找到了，命令长度
+        int cmd_len = line_end - line_start + 1;
+
+        // 2. 分配本次命令空间，并把cmd复制到cmd_buf缓存
+        char *cmd_temp_buf = (char *)malloc(cmd_len + 1);    // 分配本次命令的空间
+        if (!cmd_temp_buf) break;
+        memcpy(cmd_temp_buf, line_start, cmd_len);
+        
+
+        // 3. 去掉末尾的 \n 和 \r
+        char *p = cmd_temp_buf + cmd_len - 1;
+        while (p >= cmd_temp_buf && (*p == '\n' || *p == '\r')) {
+            *p = '\0';
+            p--;
+        }
+
+
+        // 4. 当响应缓冲区数据不足，本条命令不执行@@@
+        if (total_len + KVS_MAX_RESP_PER_CMD > resp_cap) {
+            free(cmd_temp_buf); // 释放本次临时空间
+            break;
+        }
+
+        // 5. 如果有完整命令，处理命令
+        char *tokens[KVS_MAX_TOKENS] = {0};
+        int count = kvs_split_token(cmd_temp_buf, tokens);
+        if (count > 0) {
+            
+            int len = kvs_filter_protocol(fd, tokens, count, response + total_len);
+            // 若 len 使总长度超过 resp_cap，说明单条响应超限（或 #4 预留偏小）
+            // 不扩容、不丢弃：break 后该命令仍留在 cmd_buffer，
+            // 等 send 之后由 reactor 的 send_cb 再次调 kvs_ctx_process 处理
+            // if (len > 0 && total_len + len > resp_cap) {
+            //     free(cmd_temp_buf);
+            //     break;
+            // }
+            if (len > 0) {
+                total_len += len;
+            }
+        }
+        p_cmd_count++;
+        // 6. 处理完了数据，释放内存，前进line_start和processed_bytes
+        free(cmd_temp_buf);
+        line_start += cmd_len;
+        processed_bytes += cmd_len;
+    }
+    // 7. 如果有字符被用了，就将字符从缓冲区移除
+    if (processed_bytes > 0) {
+        kvs_ctx_consume(ctx, processed_bytes);
+        if (ctx->cmd_buffer_len > 0) {
+            printf("DEBUG: After consume, remaining in buffer: %d bytes\n", ctx->cmd_buffer_len);
+            printf("DEBUG: remaining content: %s\n", ctx->cmd_buffer);
+        } else {
+            printf("DEBUG: Buffer is empty after consume\n");
+        }
+    }
+    
+    return total_len;
+}
+
+void cleanup_connection(int fd) {
+    if (fd >= 0 && fd < MAX_CONN) {
+        kvs_ctx_free(&kvs_conn_ctxs[fd]);
+    }
+}
+
+#endif
+
+
+
 #if ENABLE_SYNC
 int g_is_master = 1;  // 1: 主节点, 0: 从节点
 #endif
@@ -599,6 +760,8 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 int kvs_protocol(int fd, char *msg, int length, char *response) {
 
 #if ENABLE_CMD_BATCH
+
+#if 0
     char *tokens[KVS_MAX_TOKENS] = {0};
     int total_len = 0;  // 所有响应总长度
     char *line = msg; // 当前处理的行
@@ -654,6 +817,26 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
     }
     return total_len;
 #else
+    if (fd < 0 || fd >= MAX_CONN) return -1;
+    if (msg == NULL || length <= 0 || response == NULL) return -1;
+    
+    // ===== 获取或初始化连接上下文 =====
+    kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[fd];
+    if (!ctx->cmd_buffer) {
+        kvs_ctx_init(ctx);
+    }
+    
+    // ===== 追加新数据到缓冲区 =====
+    kvs_ctx_append(ctx, msg, length);
+
+    p_cmd_count = 0;
+    int ret =  kvs_ctx_process(fd, ctx, response, BUFFER_LENGTH);
+    printf("has pd cmd conts: %d\n", p_cmd_count);
+
+    // ===== 处理缓冲区中的完整命令 =====
+    return ret;
+#endif
+#else
 /*
 msg: request message
 length:length of request msg
@@ -676,6 +859,12 @@ response: need to send
 
 
 int init_kvengine(void) {
+    // ===== 初始化所有连接上下文 =====
+    int i = 0;
+    for (i = 0; i < MAX_CONN; i++) {
+        memset(&kvs_conn_ctxs[i], 0, sizeof(kvs_conn_ctx_t));
+    }
+
 #if ENABLE_MEMPOOL
     // 先初始化内存池
     // printf("Initializing memory pools...\n");
