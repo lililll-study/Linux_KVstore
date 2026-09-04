@@ -769,15 +769,32 @@ free_list → 块2 → 块1 → 块0 → NULL
 1. **每次写操作**（SET/MOD/DEL）→ 写入 AOF
 
 2. **同时发送命令**到从节点 → 从节点执行相同操作
+   
+   
+   
+   
 
+## 5 批处理问题（📌）
 
+9-4号流程2点解决该问题，因为服务端和客户端的LINUX内核wmem都是1024到2048，所以当客户端一次send大批量数据到server会出现分包发送的情况，大量数据还没到达服务端，在客户端的内核发送缓冲区等待。服务端处理完数据并把响应回发，由于客户端send是阻塞的，所以还没到接收流程。服务端的回发响应就卡在发送缓冲区。当发送缓冲区满了，就无法继续消费客户端发来的数据了，因为阻塞窗口长度变为0，会停止接收数据。
 
+解决方法：修改客户端为分块发送，一个chunk大小为1024，每次发送1024到服务端后立即recv，这样窗口就不会堵塞了，使得双方不会死锁。
 
+测试得到各类数据类型的qps如下，大约在2w到5w之间，差距较大，分析原因应该是网络连接建立导致的。但这依然大幅超过了单条发送的4kpqs
 
-## 5 分包的问题
+属于大幅提升了写入性能
 
-        发现，当进行cmd批处理的时候，服务端由于recv_cb设置的是非阻塞IO，会把数据截断读取。这就导致传入kvs_protocol处理的wbuffer内的数据，不完整，无法处理边界数据。
+```bash
+lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 21
+skiptable_batch_1500 -- > time used: 58, qps: 51724
+PASS
+lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 22
+skiptable_batch_1500 -- > time used: 101, qps: 29702
+PASS
+lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 23
+skiptable_batch_1500 -- > time used: 149, qps: 20134
+PASS
+lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 24
+skiptable_batch_1500 -- > time used: 65, qps: 46153
 
-        为了解决这个问题，参考redis的设计方案，在底层reactor处当clientfd有数据可读的时候，事件循环调用read回调，非阻塞的读取IO数据，存入querybuf中。
-
-        紧接着调用processinputbufer回调，尝试从querybuf中解析出一个完整命令。如果数据不完整，解析会返回错误，但数据继续留在querybuf，等待下次更多数据到达时再
+```
