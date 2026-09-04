@@ -9,7 +9,7 @@
 
 #define MAX_MSG_LEN 4096
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
-
+int mode = 0;
 
 int send_msg(int connfd, char *msg, int length) {
     printf("send: %s\n", msg);
@@ -230,74 +230,237 @@ void skiptable_testcase_3w_0_mix (int connfd) {
     printf("skiptable_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
 }
 
+/**
+ * 统计响应缓冲区中的响应条数
+ * 每条响应以 \r\n 结尾
+ */
+static int count_responses(const char *buffer, int length) {
+    if (!buffer || length <= 0) return 0;
+    
+    int count = 0;
+    int i = 0;
+    for (i = 0; i < length - 1; i++) {
+        if (buffer[i] == '\r' && buffer[i+1] == '\n') {
+            count++;
+            i++;  // 跳过 \n
+        }
+    }
+    return count;
+}
+/**
+ * 发送批量命令并接收所有响应
+ * @param fd          socket 文件描述符
+ * @param batch       批量命令数据
+ * @param batch_size  命令总长度
+ * @param result      输出：接收到的响应数据
+ * @param expected_count 期望收到的响应条数（用于判断是否收完）
+ * @return 0: 成功, -1: 失败
+ */
+int send_recv_batch_msg(int fd, const char *batch, int batch_size,
+    char *result, int expected_count) {
+    if (!batch || !result) return -1;
+    int total = 0;
+    int sent = 0;
+    int MAX_RESP_SIZE = 65535;  // 响应缓冲区大小
+    // ===== 阶段1：边发边收 =====
+    while (sent < batch_size) {
+        int chunk = batch_size - sent;
+        if (chunk > 1024) chunk = 1024;
+        
+        int n = send(fd, batch + sent, chunk, 0);
+        if (n <= 0) {
+            perror("send");
+            return -1;
+        }
+        sent += n;
+        
+        // 立即接收一次，腾出接收窗口
+        int n2 = recv(fd, result + total, MAX_RESP_SIZE - total - 1, 0);
+        if (n2 > 0) {
+            total += n2;
+        } else if (n2 < 0) {
+            perror("recv");
+            return -1;
+        }
+    }
 
-void skiptable_batch_1500(int connfd) {
+    // ===== 阶段2：收完剩余响应 =====
+    while (1) {
+        int resp_count = count_responses(result, total);
+        if (resp_count >= expected_count) break;
+        
+        int n = recv(fd, result + total, MAX_RESP_SIZE - total - 1, 0);
+        if (n <= 0) {
+            if (n < 0) perror("recv");
+            break;
+        }
+        total += n;
+    }
+    
+    result[total] = '\0';
+    return 0;
+}
+
+void batch_test(int connfd) {
     int count = 1000;
     int i;
     struct timeval tv_begin, tv_cur;
-    // 组装批量命令
-    // 估算：每条命令最多 64 字节，500 条 × 3 个循环 = 1500 条 最多96KB
     char batch[500 * 1024] = {0};  // 100KB，足够 500 条
-
-    for (i = 0; i < count; i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "SSET Teacher%d King%d\n", i, i);
-        strcat(batch, cmd);
-    }
-    for (i = 0; i < count; i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "SGET Teacher%d\n", i);
-        strcat(batch, cmd);
-    }
-    for (i = 0; i < count; i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "SMOD Teacher%d Lililihy%d\n", i, i);
-        strcat(batch, cmd);
-    }
-
-    
+    int batch_size = 0;
     // 预期响应 1500条 22500字节
     char expected[65536] = {0};
-    for (i = 0; i < count; i++) {
-        strcat(expected, "ok\r\n");
+    if (mode == 21) {
+        // 组装批量命令
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "SSET Teacher%d King%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "SGET Teacher%d\n", i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "SMOD Teacher%d Lililihy%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        batch_size = strlen(batch);
+
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+        for (i = 0; i < count; i++) {
+            char resp[256];
+            snprintf(resp, sizeof(resp), "King%d\r\n", i);
+            strcat(expected, resp);
+        }
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+    } else if (mode == 22) {
+        // 组装批量命令
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "RSET Teacher%d King%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "RGET Teacher%d\n", i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "RMOD Teacher%d Lililihy%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        batch_size = strlen(batch);
+
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+        for (i = 0; i < count; i++) {
+            char resp[256];
+            snprintf(resp, sizeof(resp), "King%d\r\n", i);
+            strcat(expected, resp);
+        }
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+    } else if (mode == 23) {
+        // 组装批量命令
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "HSET Teacher%d King%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "HGET Teacher%d\n", i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "HMOD Teacher%d Lililihy%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        batch_size = strlen(batch);
+
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+        for (i = 0; i < count; i++) {
+            char resp[256];
+            snprintf(resp, sizeof(resp), "King%d\r\n", i);
+            strcat(expected, resp);
+        }
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+    } else if (mode == 24) {
+        // 组装批量命令
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "SET Teacher%d King%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "GET Teacher%d\n", i);
+            strcat(batch, cmd);
+        }
+        for (i = 0; i < count; i++) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "MOD Teacher%d Lililihy%d\n", i, i);
+            strcat(batch, cmd);
+        }
+        batch_size = strlen(batch);
+
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
+        for (i = 0; i < count; i++) {
+            char resp[256];
+            snprintf(resp, sizeof(resp), "King%d\r\n", i);
+            strcat(expected, resp);
+        }
+        for (i = 0; i < count; i++) {
+            strcat(expected, "ok\r\n");
+        }
     }
-    for (i = 0; i < count; i++) {
-        char resp[256];
-        snprintf(resp, sizeof(resp), "King%d\r\n", i);
-        strcat(expected, resp);
-    }
-    for (i = 0; i < count; i++) {
-        strcat(expected, "ok\r\n");
-    }
-    
+    int expected_count = count * 3;  // 期待的响应数量
+
     // 发送批量命令并接收响应
-    gettimeofday(&tv_begin, NULL);
-
-#if 1
     char result[65536] = {0};
-    int total = 0;
-    int expected_count = count * 3;  // 1500条响应
+    int result_size = 0;
 
-    // 仿 echo_test 的边发边收：分块发送命令，每发一块就非阻塞收走已到达的响应，
+    gettimeofday(&tv_begin, NULL);
+#if 1
+    int ret = send_recv_batch_msg(connfd, batch, batch_size,
+                                         result, expected_count);
+#else
+    // 仿 echo_test 的边发边收：分块发送命令，每发一块就收走已到达的响应，
     // 让客户端接收窗口持续腾空，避免与服务端形成双向阻塞死锁
-    int cmd_total = strlen(batch);
+    int cmd_total = strlen(batch);  //计算批次数据总长度
     int sent = 0;
-    while (sent < cmd_total) {
-        int chunk = cmd_total - sent;
-        if (chunk > 1024) chunk = 1024;      // 和服务端 rbuffer 对齐
-        int n = send(connfd, batch + sent, chunk, 0);
+    while (sent < cmd_total) {  // 如果batch数据没发完就一直发
+        int chunk = cmd_total - sent;   // 一个块的大小是还没发的数据总量，如果还没发的数据大于rbuffer长度
+        if (chunk > 1024) chunk = 1024;      // 客户端的发送块大小，防止内核wmem满
+        int n = send(connfd, batch + sent, chunk, 0); // 待发送数据起始地址，发送一个块的数据过去
         if (n <= 0) { perror("send"); break; }
         sent += n;
 
-        // 阻塞收一次：刚发的这块合服务端已处理的命令，必有待收响应，不会死等。
-        // 收一次即可腾出接收窗口，剩余响应由收尾循环收满
+        // 发完一个chunk，立即接收，收一次即可腾出接收窗口，剩余响应由收尾循环收满 （缓冲区剩余空间）
         int n2 = recv(connfd, result + total, sizeof(result) - total - 1, 0);
         if (n2 > 0) total += n2;
         else if (n2 < 0) perror("recv");
     }
 
+    // 接收并统计所有响应直到收满预期的响应条数。
     while (1) {
-        // 统计当前已收到的响应条数（每条以 \r\n 结尾）
+        // 统计 result 缓冲区中有多少个 \r\n 结尾的响应。
         int resp_count = 0;
         int j;
         for (j = 0; j < total - 1; j++) {
@@ -308,6 +471,9 @@ void skiptable_batch_1500(int connfd) {
         }
         if (resp_count >= expected_count) break;  // 收满了
 
+        //此处还需要接收的原因是，第一阶段接受不完所有响应
+        // 第一阶段只负责发完，在发完的时段内把缓冲区的数据接收
+        // 但是发完后，可能因为客户端拥塞窗口原因，导致还有数据积攒在服务端发送缓冲区，所以还要继续接收
         int n = recv(connfd, result + total, sizeof(result) - total - 1, 0);
         if (n <= 0) {
             if (n < 0) perror("recv");
@@ -317,29 +483,27 @@ void skiptable_batch_1500(int connfd) {
     }
     result[total] = '\0';
 
-#else
+#if 0
     char result[65536] = {0};
     recv_msg(connfd, result, sizeof(result));
-
-
 #endif
 
+#endif
     gettimeofday(&tv_cur, NULL);
+    if (ret < 0) {
+        printf("send_recv_batch failed\n");
+        return;
+    }
+
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
     printf("skiptable_batch_1500 -- > time used: %d, qps: %d\n", 
            time_used, count * 3 * 1000 / time_used);
-    // printf("\n--- result ---\n");
-    // printf("%s", result);
-    // printf("\n--- expected ---\n");
-    // printf("%s", expected);
     // 验证结果
     if (strcmp(result, expected) == 0) {
         printf("PASS\n");
     } else {
         printf("FAILED\n");
     }
-    
-
 }
 
 
@@ -410,12 +574,12 @@ int main(int argc, char *argv[]) {
 
     char *ip = argv[1];
     int port = atoi(argv[2]);
-    int mode = atoi(argv[3]);
+    mode = atoi(argv[3]);
     int connfd = connect_tcpserver(ip, port);
 
     // rbtree_testcase(connfd);
     
-    // 普通功能测试
+    // 基本插入测试
     if (mode == 1) {
         array_testcase_1w(connfd);  // 正常
     } else if (mode ==2) {
@@ -431,12 +595,12 @@ int main(int argc, char *argv[]) {
     } else if (mode == 12) {
         skiptable_testcase_3w_0_mix(connfd);    // 正常 QPS:4700
     
-    // 批数据测试    
-    } else if (mode == 21) {
-        skiptable_batch_1500(connfd); 
-
-    // echo 收发完整性测试
-    } else if (mode == 31) {
+// 批数据测试      跳表         红黑树          哈希        数组
+    } else if (mode == 21 || mode == 22 || mode == 23 || mode == 24) {    
+        batch_test(connfd); 
+    }
+    
+    else if (mode == 31) {    // echo 收发完整性测试
         echo_test(connfd);
     }
 
