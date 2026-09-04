@@ -1,9 +1,6 @@
 
 #include "server.h"
 #include "kvstore.h"
-// 启动命令 
-// gcc -o kvstore kvstore.c reactor.c ntyco.c  -I ./NtyCo/core  -L ./NtyCo/lib  -lntyco -lpthread -ldl
-// gcc -o kvstore kvstore.c reactor.c
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -79,7 +76,6 @@ mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks) {
 // 分配块
 void* kvs_mempool_alloc(mempool_t *pool, size_t size) {
     if (!pool || !pool->free_list || pool->free_blocks == 0) {
-        // printf("ERROR: alloc failed - pool=%p, free_list=%p, free_blocks=%zu\n", pool, pool->free_list, pool->free_blocks);
         return NULL;
     }
 #if ENABLE_LEVEL_MEMPOOL
@@ -223,7 +219,6 @@ void dest_mempools(void) {
 
 #if ENABLE_CMD_BATCH
 
-
 kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
 
 // 初始化
@@ -340,13 +335,6 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
         if (count > 0) {
             
             int len = kvs_filter_protocol(fd, tokens, count, response + total_len);
-            // 若 len 使总长度超过 resp_cap，说明单条响应超限（或 #4 预留偏小）
-            // 不扩容、不丢弃：break 后该命令仍留在 cmd_buffer，
-            // 等 send 之后由 reactor 的 send_cb 再次调 kvs_ctx_process 处理
-            // if (len > 0 && total_len + len > resp_cap) {
-            //     free(cmd_temp_buf);
-            //     break;
-            // }
             if (len > 0) {
                 total_len += len;
             }
@@ -360,12 +348,12 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
     // 7. 如果有字符被用了，就将字符从缓冲区移除
     if (processed_bytes > 0) {
         kvs_ctx_consume(ctx, processed_bytes);
-        if (ctx->cmd_buffer_len > 0) {
-            printf("DEBUG: After consume, remaining in buffer: %d bytes\n", ctx->cmd_buffer_len);
-            printf("DEBUG: remaining content: %s\n", ctx->cmd_buffer);
-        } else {
-            printf("DEBUG: Buffer is empty after consume\n");
-        }
+        // if (ctx->cmd_buffer_len > 0) {
+        //     printf("DEBUG: After consume, remaining in buffer: %d bytes\n", ctx->cmd_buffer_len);
+        //     printf("DEBUG: remaining content: %s\n", ctx->cmd_buffer);
+        // } else {
+        //     printf("DEBUG: Buffer is empty after consume\n");
+        // }
     }
     
     return total_len;
@@ -761,62 +749,6 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
 
 #if ENABLE_CMD_BATCH
 
-#if 0
-    char *tokens[KVS_MAX_TOKENS] = {0};
-    int total_len = 0;  // 所有响应总长度
-    char *line = msg; // 当前处理的行
-    char *next;      // 下一行的起始位置
-
-    msg[length] = '\0'; // 确保字符串以\0结束
-    // printf("DEBUG: kvs_protocol length=%d\n", length);
-    // printf("DEBUG: msg=%.200s\n", msg);
-// 循环处理每一行，按照换行符分割
-    while (line && *line) {//line 指针是否为 NULL,line 指向的字符是否为 \0
-        //查找换行符的位置，返回指针next，指向当前行的结尾位置
-        next = strchr(line, '\n');  
-        if (next) { 
-            // 如果找到了换行符，就用结束符替换换行符
-            *next = '\0'; 
-            next++; // 指向下一行
-        }
-
-        // 去除行尾可能存在的\r和多余的\n
-        char *p = line + strlen(line) -1; // p指向line的最后一个有效字符（不含\0）
-        while (p >= line && (*p == '\r'|| *p == '\n')) {
-            *p = '\0';
-            p--;
-        }
-        // 跳过空行
-        if (strlen(line) == 0) {
-            line = next;
-            continue;
-        }
-
-        // 动态复制命令
-        size_t cmd_len = strlen(line) + 1;
-        char *cmd_buf = (char *)kvs_mempool_alloc(array_string_pool, cmd_len);
-        if (!cmd_buf) return -2;
-        strcpy(cmd_buf, line);
-
-        // 重新解析命令
-        int count = kvs_split_token(cmd_buf, tokens);
-        if (count > 0) {
-            // // 存储单条命令响应的临时缓冲区
-            // char single_resp[256] = {0};
-            // 处理单条命令，把响应直接叠加到
-            int len = kvs_filter_protocol(fd, tokens, count, response + total_len);
-            if (len > 0) {
-                // 把每条命令的响应拼在一起
-                total_len += len;
-            }
-        }
-        kvs_mempool_free(array_string_pool, cmd_buf);
-
-        // 处理下一行
-        line = next;
-    }
-    return total_len;
-#else
     if (fd < 0 || fd >= MAX_CONN) return -1;
     if (msg == NULL || length <= 0 || response == NULL) return -1;
     
@@ -831,11 +763,11 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
 
     p_cmd_count = 0;
     int ret =  kvs_ctx_process(fd, ctx, response, BUFFER_LENGTH);
-    printf("has pd cmd conts: %d\n", p_cmd_count);
+    // printf("has pd cmd conts: %d\n", p_cmd_count);
 
     // ===== 处理缓冲区中的完整命令 =====
     return ret;
-#endif
+
 #else
 /*
 msg: request message
