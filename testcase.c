@@ -12,8 +12,9 @@
 
 
 int send_msg(int connfd, char *msg, int length) {
-    
+    printf("send: %s\n", msg);
     int res = send(connfd, msg, length, 0);
+
     if (res < 0) {
         perror("send");
         exit(1);
@@ -231,7 +232,7 @@ void skiptable_testcase_3w_0_mix (int connfd) {
 
 
 void skiptable_batch_1500(int connfd) {
-    int count = 80;
+    int count = 1000;
     int i;
     struct timeval tv_begin, tv_cur;
     // 组装批量命令
@@ -271,12 +272,29 @@ void skiptable_batch_1500(int connfd) {
     
     // 发送批量命令并接收响应
     gettimeofday(&tv_begin, NULL);
-    send_msg(connfd, batch, strlen(batch));
 
 #if 1
     char result[65536] = {0};
     int total = 0;
-    int expected_count = count * 3;  // 150条响应
+    int expected_count = count * 3;  // 1500条响应
+
+    // 仿 echo_test 的边发边收：分块发送命令，每发一块就非阻塞收走已到达的响应，
+    // 让客户端接收窗口持续腾空，避免与服务端形成双向阻塞死锁
+    int cmd_total = strlen(batch);
+    int sent = 0;
+    while (sent < cmd_total) {
+        int chunk = cmd_total - sent;
+        if (chunk > 1024) chunk = 1024;      // 和服务端 rbuffer 对齐
+        int n = send(connfd, batch + sent, chunk, 0);
+        if (n <= 0) { perror("send"); break; }
+        sent += n;
+
+        // 阻塞收一次：刚发的这块合服务端已处理的命令，必有待收响应，不会死等。
+        // 收一次即可腾出接收窗口，剩余响应由收尾循环收满
+        int n2 = recv(connfd, result + total, sizeof(result) - total - 1, 0);
+        if (n2 > 0) total += n2;
+        else if (n2 < 0) perror("recv");
+    }
 
     while (1) {
         // 统计当前已收到的响应条数（每条以 \r\n 结尾）
@@ -307,11 +325,13 @@ void skiptable_batch_1500(int connfd) {
 #endif
 
     gettimeofday(&tv_cur, NULL);
-    
-    printf("\n--- result ---\n");
-    printf("%s", result);
-    printf("\n--- expected ---\n");
-    printf("%s", expected);
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+    printf("skiptable_batch_1500 -- > time used: %d, qps: %d\n", 
+           time_used, count * 3 * 1000 / time_used);
+    // printf("\n--- result ---\n");
+    // printf("%s", result);
+    // printf("\n--- expected ---\n");
+    // printf("%s", expected);
     // 验证结果
     if (strcmp(result, expected) == 0) {
         printf("PASS\n");
@@ -319,9 +339,64 @@ void skiptable_batch_1500(int connfd) {
         printf("FAILED\n");
     }
     
+
+}
+
+
+// 纯 echo 测试：一次性发送 1..2048 个数字（模拟批量大数据），
+// 服务端不做命令解析、原样返回，客户端收全后校验一致性。
+void echo_test(int connfd) {
+    int count = 10000;
+    int cap = 256 * 1024;
+    char *sendbuf = (char *)malloc(cap);
+    char *recvbuf = (char *)malloc(cap);
+    if (!sendbuf || !recvbuf) {
+        printf("echo_test: malloc failed\n");
+        if (sendbuf) free(sendbuf);
+        if (recvbuf) free(recvbuf);
+        return;
+    }
+
+    // 构造 "1\n2\n3\n...\n2048\n"
+    int len = 0;
+    int i;
+    for (i = 1; i <= count; i++) {
+        len += snprintf(sendbuf + len, cap - len, "%d\n", i);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+
+    int sent = 0, total = 0;
+    while (sent < len) {
+        int chunk = len - sent;
+        if (chunk > 1024) chunk = 1024;      // 和服务端 rbuffer 对齐
+        int n = send(connfd, sendbuf + sent, chunk, 0);
+        if (n <= 0) { perror("send"); break; }
+        sent += n;
+        // 发多少就收多少回显
+        int got = 0;
+        while (got < n) {
+            int r = recv(connfd, recvbuf + total + got, n - got, 0);
+            if (r <= 0) break;
+            got += r;
+        }
+        total += got;
+    }
+
+    gettimeofday(&tv_cur, NULL);
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
-    printf("skiptable_batch_1500 -- > time used: %d, qps: %d\n", 
-           time_used, count * 3 * 1000 / time_used);
+    printf("echo_test -- > sent: %d bytes, recv: %d bytes, time used: %d ms\n",
+           len, total, time_used);
+
+    if (total == len && memcmp(sendbuf, recvbuf, len) == 0) {
+        printf("echo_test -- > PASS\n");
+    } else {
+        printf("echo_test -- > FAILED (recv %d / %d)\n", total, len);
+    }
+
+    free(sendbuf);
+    free(recvbuf);
 }
 
 
@@ -359,6 +434,10 @@ int main(int argc, char *argv[]) {
     // 批数据测试    
     } else if (mode == 21) {
         skiptable_batch_1500(connfd); 
+
+    // echo 收发完整性测试
+    } else if (mode == 31) {
+        echo_test(connfd);
     }
 
     

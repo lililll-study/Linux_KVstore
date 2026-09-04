@@ -22,39 +22,27 @@
 /* 
 连接大小：读缓存1K，写缓存1K，2K* = 2M
 */
-
-
 #define CONNECTION_SIZE     1024 // 1024^2
 #define MAX_PORTs           1
+#define ENABLE_NETWORK_TEST 0
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
 #if ENABLE_KVS
 
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
-
 static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c) {
-
-#if 0   // debug
-
-    // 每次响应追加写到wbuffer末尾，绝不覆盖未发送的数据
-    int len = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer + c->wlength);
-    if (len > 0) c->wlength += len;
-#else
-    printf("recv %d: %s\n", c->rlength, c->rbuffer);
+    // printf("recv %d: %s\n", c->rlength, c->rbuffer);
+    printf("===============recved=======================\n");
     c-> wlength = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer);
     return 0;
-#endif
 }
-
 
 int kvs_response(struct conn *c) {
-
     return 0;
 }
-
 
 #endif
 
@@ -66,12 +54,8 @@ int send_cb(int fd);
 int event_register(int fd, int event);
 
 
-
 int epfd = 0;
 struct timeval begin;
-
-
-
 
 // struct conn conn_list[CONNECTION_SIZE] = {0};
 // 优化为动态分配内存
@@ -95,9 +79,9 @@ int set_event(int fd, int event, int flag) {
 }
 
 
-#if ENABLE_CMD_BATCH
-// ===仿照redis设计的查询缓冲区===
-// 初始化查询缓冲区
+#if 0
+===仿照redis设计的查询缓冲区===
+初始化查询缓冲区
 int init_querybuf(struct conn *c) {
     c->querybuf_cap = BUFFER_LENGTH * 2;    // 初始化为128kb
     c->querybuf = (char *)malloc(c->querybuf_cap);
@@ -282,14 +266,9 @@ int event_register(int fd, int event) {
     memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
     conn_list[fd].wlength = 0;
 
-    // ===== 初始化查询缓冲区 =====
-    init_querybuf(&conn_list[fd]);
 
-#if ENABLE_NOBLOCK
     set_event(fd, event, 1);
-#else
-    set_event(fd, event, 1);
-#endif
+
 }
 
 
@@ -320,7 +299,7 @@ int accept_cb(int fd) {
         int time_used = TIME_SUB_MS(current, begin);
         memcpy(&begin, &current, sizeof(struct timeval));
 
-        printf("accept finished clientfd: %d, time_used: %d\n", clientfd, time_used);
+        // printf("accept finished clientfd: %d, time_used: %d\n", clientfd, time_used);
 
     }
     return 0;
@@ -329,7 +308,7 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
     struct conn *c = &conn_list[fd];
-    
+    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
 #if ENABLE_NOBLOCK // 非阻塞
     int total_read = 0;
     int data_len;
@@ -408,7 +387,7 @@ int recv_cb(int fd) {
         printf("client disconnect: %d\n", fd);
         close(fd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);   // unfinished 
-
+        cleanup_connection(fd);
         return 0;
     } else if (data_len < 0) {
         printf("count: %d, errno: %d, %s\n", data_len, errno, strerror(errno));
@@ -417,90 +396,49 @@ int recv_cb(int fd) {
 
         return 0;
     }
-
-
-   // ===== 使用 querybuf（和阻塞写法结合） =====
-#if ENABLE_CMD_BATCH
-    // 1. 把数据追加到 querybuf
-    if (expand_querybuf(c, c->querybuf_len + data_len + 1) < 0) {
-        printf("ERROR: expand querybuf failed\n");
-        return -1;
+    if (data_len > 0) {// 确保字符以\0结尾
+        conn_list[fd].rbuffer[data_len] = '\0';
     }
-    memcpy(c->querybuf + c->querybuf_len, c->rbuffer, data_len);
-    c->querybuf_len += data_len;
-
-    // 2. 处理完整命令
-    if (c->querybuf_len > 0) {
-        process_buffer(fd);
-    }
-#else
-
     conn_list[fd].rlength = data_len;
-    // printf("recv buffer: %s\n", conn_list[fd].rbuffer);
+    printf("recv buffer: %s\n", conn_list[fd].rbuffer);
 
 #if 0 // echo
     conn_list[fd].wlength = conn_list[fd].rlength;
     memcpy(conn_list[fd].wbuffer, conn_list[fd].rbuffer, conn_list[fd].wlength);
     printf("[%d]recv: %s\n", conn_list[fd].rlength, conn_list[fd].rbuffer);
-
-#elif ENABLE_HTTP
-// 接受完数据后做request请求
-    http_requset(&conn_list[fd]);
-
-#elif ENABLE_WS
-    ws_request(&conn_list[fd]);
-
-#elif ENABLE_KVS
-
-    kvs_request(&conn_list[fd]);
 #endif
+
+
+
+#if ENABLE_KVS
+
+#if ENABLE_NETWORK_TEST
+    // echo 模式：不做命令解析，把收到的数据原样返回
+    conn_list[fd].wlength = conn_list[fd].rlength;
+    memcpy(conn_list[fd].wbuffer, conn_list[fd].rbuffer, conn_list[fd].wlength);
+    conn_list[fd].wbuffer[conn_list[fd].wlength] = '\0';
+#else
+    kvs_request(&conn_list[fd]);
+    printf("============waiting for send\n");
+    printf("content: %s\n", conn_list[fd].wbuffer);
+#endif
+
+
 #endif
     set_event(fd, EPOLLOUT, 0);
-
+    printf("HELLO IAM DEBUGING======1\n");
     return data_len;
 #endif
 }
 
-//1 不同事件触发不同回调
-//2 rbuffer, wbuffer
 
 
 int send_cb(int fd) {
-    // struct conn *c = &conn_list[fd];
-    // // ===== 添加调试 =====
-    // printf("DEBUG: send_cb fd=%d, wlength=%d\n", fd, c->wlength);
-    // if (c->wlength > 0) {
-    //     printf("DEBUG: wbuffer first 100 bytes: %.100s\n", c->wbuffer);
-    // }
-#if ENABLE_HTTP
-// 发送数据之前做response响应
-    http_response(&conn_list[fd]);
-
-#elif ENABLE_WS
-    ws_response(&conn_list[fd]);
-
-#elif ENABLE_KVS
-
+    printf("HELLO IAM DEBUGING======2\n");
+#if ENABLE_KVS
     kvs_response(&conn_list[fd]);
-
 #endif
-
     int send_len = 0;
-
-#if 0
-
-    if (conn_list[fd].status == 1) {
-        // printf("send buffer: %s\n", conn_list[fd].wbuffer);
-        send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-        set_event(fd, EPOLLOUT, 0);
-    } else if (conn_list[fd].status == 2) {
-        set_event(fd, EPOLLOUT, 0);
-    } else if (conn_list[fd].status == 0) {
-        set_event(fd, EPOLLIN, 0);
-    }
-
-#else
-
 	if (conn_list[fd].wlength != 0) {
 #if ENABLE_NOBLOCK
         send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
@@ -529,25 +467,26 @@ int send_cb(int fd) {
         // 数据全部发送完毕，把长度设为 0
         conn_list[fd].wlength = 0;
 #else
+
         printf("wbuffer : %s\n", conn_list[fd].wbuffer);
+        printf("==============end===================\n");
 		send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-#if 1
-        if (send_len < 0) {
-            perror("send");
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-            return -1;
-        }
-#endif
-    
-#endif
+        conn_list[fd].wlength = 0;
+        
+        // // 发送完毕后，续消费 cmd_buffer 中残留的完整命令（背压后半段）
+        // // 直接调用业务层 kvs_ctx_process，无需回调指针
+        // kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[fd];
+        // int n;
+        // while (ENABLE_CMD_BATCH && ctx->cmd_buffer_len > 0) {
+        //     n = kvs_ctx_process(fd, ctx, conn_list[fd].wbuffer, BUFFER_LENGTH);
+        //     if (n <= 0) break;           // 无残留完整命令可续产
+        //     send(fd, conn_list[fd].wbuffer, n, 0);   // 同步发出本轮续产响应
+        //     conn_list[fd].wlength = 0;
+        // }
 	}
-    // printf("querybuf_len : %d\n", conn_list[fd].querybuf_len);
-	
 	set_event(fd, EPOLLIN, 0);
 
 #endif
-
     return send_len;
 }
 
