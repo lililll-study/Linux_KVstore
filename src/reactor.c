@@ -28,38 +28,81 @@
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
-#if ENABLE_KVS
-
-typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
-static msg_handler kvs_handler;
-
-int kvs_request(struct conn *c) {
-    // printf("recv %d: %s\n", c->rlength, c->rbuffer);
-    // printf("===============recved=======================\n");
-    c-> wlength = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer);
-    return 0;
-}
-
-int kvs_response(struct conn *c) {
-    return 0;
-}
-
-#endif
-
-
-
-int accept_cb(int fd);
-int recv_cb(int fd);
-int send_cb(int fd);
-int event_register(int fd, int event);
-
-
 int epfd = 0;
 struct timeval begin;
 
 // struct conn conn_list[CONNECTION_SIZE] = {0};
 // 优化为动态分配内存
 struct conn conn_list[CONNECTION_SIZE];
+
+
+int accept_cb(int fd);
+int recv_cb(int fd);
+int send_cb(int fd);
+int event_register(int fd, int event);
+int set_event(int fd, int event, int flag);
+
+#if ENABLE_KVS
+
+typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
+static msg_handler kvs_handler;
+
+int kvs_request(struct conn *c) {
+
+    c-> wlength = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer);
+    // printf("%d\n", c->wlength);
+    return 0;
+}
+
+#if ENABLE_REPBUF
+
+int kvs_response(struct conn *c) {
+    kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[c->fd];
+    // printf("debug 3: 准备回发响应\n");
+    
+    // 检查是否有数据待发送
+    if (resp_buf_has_data(ctx)) {
+        int data_len = 0;
+        // printf("debug 4: 检测到回发数据\n");
+        char *data = resp_buf_get_data(ctx, &data_len);
+        
+        if (data && data_len > 0) {
+            int chunk = data_len > 2000 ? 2000 : data_len;
+            int n = send(c->fd, data, chunk, 0);
+            // printf("debug 5: 回发成功, 发送了 %d 字节\n", n);
+            if (n < 0) {
+                perror("send");
+                close(c->fd);
+                epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                cleanup_connection(c->fd);
+                return -1;
+            }
+            // 标记数据已发送
+            resp_buf_advance(ctx, n);
+            
+            // 如果还有数据未发送，保持 EPOLLOUT 事件
+            if (resp_buf_has_data(ctx)) {
+                // printf("debug 6: 还有数据未发完，保持EPOLLOUT\n");
+                set_event(c->fd, EPOLLOUT, 0);
+            } else {
+                // 数据全部发送完成，重置状态，切换回 EPOLLIN
+                ctx->send_pending = 0;
+                set_event(c->fd, EPOLLIN, 0);
+            }
+            return n;
+        }
+    }
+    
+    // 没有数据待发送，重置状态并切换回 EPOLLIN
+    ctx->send_pending = 0;
+    set_event(c->fd, EPOLLIN, 0);
+    return 0;
+}
+
+#endif
+#endif
+
+
 
 
 int set_event(int fd, int event, int flag) {
@@ -89,12 +132,16 @@ int event_register(int fd, int event) {
     memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
     conn_list[fd].rlength = 0;
 
+#if ENABLE_REPBUF
+     // 不用wbuffer，用resp缓冲区替代wbuffer
+#else
     memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
     conn_list[fd].wlength = 0;
+    return 0;
 
-
+#endif
     set_event(fd, event, 1);
-
+    return 0;
 }
 
 
@@ -122,7 +169,7 @@ int accept_cb(int fd) {
         struct timeval current;
         gettimeofday(&current, NULL);
 
-        int time_used = TIME_SUB_MS(current, begin);
+        // int time_used = TIME_SUB_MS(current, begin);
         memcpy(&begin, &current, sizeof(struct timeval));
 
         // printf("accept finished clientfd: %d, time_used: %d\n", clientfd, time_used);
@@ -133,7 +180,7 @@ int accept_cb(int fd) {
 
 
 int recv_cb(int fd) {
-    struct conn *c = &conn_list[fd];
+    // struct conn *c = &conn_list[fd];
     memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
 
     // 阻塞写法
@@ -185,24 +232,26 @@ int recv_cb(int fd) {
     return data_len;
 }
 
-
-
 int send_cb(int fd) {
+
+#if ENABLE_REPBUF
+    return kvs_response(&conn_list[fd]);
+#else
+
 #if ENABLE_KVS
-    kvs_response(&conn_list[fd]);
 #endif
     int send_len = 0;
 	if (conn_list[fd].wlength != 0) {
 
-        // printf("wbuffer : %s\n", conn_list[fd].wbuffer);
+        printf("wbuffer : %s\n", conn_list[fd].wbuffer);
         // printf("==============end===================\n");
 		send_len = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
         conn_list[fd].wlength = 0;
         
 	}
-	set_event(fd, EPOLLIN, 0);
 
     return send_len;
+#endif
 }
 
 
@@ -282,7 +331,8 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     while(1) { // mainloop
 
-        struct epoll_event events[1024] = {0};
+        struct epoll_event events[1024];
+        memset(events, 0, sizeof(events));
         int nready = epoll_wait(epfd, events, 1024, -1);
 
         int i = 0;
