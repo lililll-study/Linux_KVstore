@@ -32,12 +32,27 @@
 #define ENABLE_CMD_BATCH	 1
 
 #define ENABLE_SYNC			 1
+#define ENABLE_REPBUF   1           // 启动响应缓冲区，避免响应过大溢出
+
 
 #if ENABLE_CMD_BATCH
 typedef struct kvs_conn_ctx {
 	char *cmd_buffer;      // 命令积累缓冲区
     int cmd_buffer_len;    // 当前有效数据长度
     int cmd_buffer_cap;    // 缓冲区容量
+    
+#if ENABLE_REPBUF
+    // ===== 响应缓冲区 =====
+    char *resp_buffer;
+    int resp_len;
+    int resp_cap;
+    int resp_sent;          // 已发送位置
+    
+    // ===== 发送标志 =====
+    int send_pending;       // 1: 有待发送数据, 0: 无
+
+#endif
+
 } kvs_conn_ctx_t;
 #define MAX_CONN 1024
 extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
@@ -52,6 +67,12 @@ void cleanup_connection(int fd);
 
 #endif
 
+#if ENABLE_REPBUF
+int resp_buf_append(kvs_conn_ctx_t *ctx, const char *data, int len);
+char* resp_buf_get_data(kvs_conn_ctx_t *ctx, int *out_len);
+void resp_buf_advance(kvs_conn_ctx_t *ctx, int sent_len);
+int resp_buf_has_data(kvs_conn_ctx_t *ctx);
+#endif
 
 
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
@@ -81,6 +102,9 @@ extern mempool_t *skiptable_node_pool;
 extern mempool_t *skiptable_string_pool;
 
 #define SMALL_STRING_THRESHOLD 128  // 小字符串阈值
+
+
+
 
 // 指定块大小和块数量 
 mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks);

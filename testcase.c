@@ -554,6 +554,77 @@ void echo_test(int connfd) {
 }
 
 
+void large_value_test(int connfd) {
+    struct timeval tv_begin, tv_cur;
+    char key[] = "lhy";
+    
+    // ===== 1. 构建 2048 字节的 value =====
+    const int value_len = 40000;
+    char *value = (char *)malloc(value_len + 1);
+    if (!value) {
+        printf("malloc failed\n");
+        return;
+    }
+    memset(value, 'A', value_len);
+    value[value_len] = '\0';
+    printf("Value size: %d bytes (%.2f KB)\n", value_len, value_len / 1024.0);
+    
+    // ===== 2. SET =====
+    char *cmd = (char *)malloc(value_len + 64);
+    int cmd_len = snprintf(cmd, value_len + 64, "SET %s ", key);
+    memcpy(cmd + cmd_len, value, value_len);
+    cmd_len += value_len;
+    cmd[cmd_len++] = '\n';
+    cmd[cmd_len] = '\0';
+    
+    char result[1024] = {0};
+    
+    send(connfd, cmd, cmd_len, 0);
+    recv(connfd, result, sizeof(result), 0);
+    printf("SET response: %s", result);
+    
+    // ===== 3. GET =====
+    char get_cmd[32];
+    snprintf(get_cmd, sizeof(get_cmd), "GET %s\n", key);
+    
+    char *get_result = (char *)malloc(value_len + 256);
+    memset(get_result, 0, value_len + 256);
+    send(connfd, get_cmd, strlen(get_cmd), 0);
+    
+    int total_recv = 0;
+    while (1) {
+        int ret = recv(connfd, get_result + total_recv, value_len + 256 - total_recv - 1, 0);
+        if (ret <= 0) break;
+        total_recv += ret;
+        if (total_recv >= 2 && get_result[total_recv-2] == '\r' && get_result[total_recv-1] == '\n') {
+            break;
+        }
+    }
+    get_result[total_recv] = '\0';
+    
+    printf("Total received: %d bytes\n", total_recv);
+    printf("Full response:\n%s\n", get_result);
+    
+    // ===== 4. 验证 =====
+    // 去掉末尾的 \r\n
+    int len = strlen(get_result);
+    if (len >= 2 && get_result[len-2] == '\r' && get_result[len-1] == '\n') {
+        get_result[len-2] = '\0';
+    }
+
+    if (strcmp(get_result, value) == 0) {
+        printf("PASS\n");
+    } else {
+        printf("FAILED\n");
+
+    }
+    printf("Expected len: %d, Received len: %d\n", 
+        (int)strlen(value), (int)strlen(get_result));
+    free(value);
+    free(cmd);
+    free(get_result);
+}
+
 // testcase 192.168.137.128 2000
 int main(int argc, char *argv[]) {
 
@@ -592,6 +663,9 @@ int main(int argc, char *argv[]) {
     
     else if (mode == 31) {    // echo 收发完整性测试
         echo_test(connfd);
+    }
+    else if (mode == 41) {    // 测试大长度kv通过性
+        large_value_test(connfd);
     }
 
     

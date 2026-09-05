@@ -22,11 +22,6 @@ struct conn {
     char wbuffer[BUFFER_LENGTH*2];
     int wlength;
 
-    // // 查询缓冲区
-    // char *querybuf; // 动态分配缓冲区
-    // int querybuf_len; // 当前有效的数据长度
-    // int querybuf_cap; // 缓冲区容量
-
     char *payload;  // 解码后的数据
     char mask[4];   // 掩码
 

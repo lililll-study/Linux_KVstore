@@ -2,6 +2,9 @@
 #include "server.h"
 #include "kvstore.h"
 
+
+
+
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
 #endif
@@ -21,6 +24,11 @@ extern kvs_skiptable_t global_skiptable;
 #if ENABLE_MEMPOOL
 #define KVS_POOL_NODE_COUNT   100000
 #define KVS_POOL_STRING_COUNT 200000
+
+// 响应缓冲池
+mempool_t *resp_pool = NULL;
+#define RESP_POOL_BLOCK_SIZE 4096   // 每个响应块 4KB
+#define RESP_POOL_BLOCK_COUNT 1024  // 总共 1024 个块
 
 // 定义内存池
  mempool_t *array_item_pool = NULL;     // 数组节点池
@@ -199,6 +207,12 @@ int init_mempools(void) {
         // printf("Failed to create skiptable_node_pool\n");
         return -1;
     }
+    // 创建响应缓冲池
+    resp_pool = kvs_mempool_create(RESP_POOL_BLOCK_SIZE, RESP_POOL_BLOCK_COUNT);
+    if (!resp_pool) {
+        printf("Failed to create response pool\n");
+        return -1;
+    }
     
     return 0;
 }
@@ -213,6 +227,7 @@ void dest_mempools(void) {
     if (hash_string_pool) kvs_mempool_destroy(hash_string_pool);
     if (skiptable_node_pool) kvs_mempool_destroy(skiptable_node_pool);
     if (skiptable_string_pool) kvs_mempool_destroy(skiptable_string_pool);
+    if (resp_pool) kvs_mempool_destroy(resp_pool);
 }
 #endif
 
@@ -229,6 +244,22 @@ int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     if (!ctx->cmd_buffer) return -1;
     ctx->cmd_buffer_len = 0;
     ctx->cmd_buffer[0] = '\0';
+
+
+#if ENABLE_REPBUF
+    // 响应缓冲区初始 4KB
+    ctx->resp_cap = 4096;
+    ctx->resp_buffer = (char *)malloc(ctx->resp_cap);
+    if (!ctx->resp_buffer) {
+        free(ctx->cmd_buffer);
+        return -1;
+    }
+    ctx->resp_len = 0;
+    ctx->resp_sent = 0;
+    ctx->send_pending = 0;
+    ctx->resp_buffer[0] = '\0';
+#endif
+
     return 0;
 }
 
@@ -241,6 +272,17 @@ void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
     }
     ctx->cmd_buffer_len = 0;
     ctx->cmd_buffer_cap = 0;
+
+#if ENABLE_REPBUF
+    if (ctx->resp_buffer) {
+        free(ctx->resp_buffer);
+        ctx->resp_buffer = NULL;
+    }
+    ctx->resp_len = 0;
+    ctx->resp_cap = 0;
+    ctx->resp_sent = 0;
+    ctx->send_pending = 0;
+#endif
 }
 
 // 动态扩展缓冲区
@@ -293,7 +335,7 @@ int p_cmd_count = 0;
 
 // ===== 处理缓冲区中的完整命令 =====
 int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
-    if (!ctx || !response) return -1;
+    if (!ctx) return -1;
     
     int total_len = 0;
     char *line_start = ctx->cmd_buffer; // 当前行的起始位置
@@ -313,7 +355,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
         char *cmd_temp_buf = (char *)malloc(cmd_len + 1);    // 分配本次命令的空间
         if (!cmd_temp_buf) break;
         memcpy(cmd_temp_buf, line_start, cmd_len);
-        
+        // printf("debug: cmd_temp_buf = '%s'\n", cmd_temp_buf);
 
         // 3. 去掉末尾的 \n 和 \r
         char *p = cmd_temp_buf + cmd_len - 1;
@@ -323,15 +365,36 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
         }
 
 
-        // 4. 当响应缓冲区数据不足，本条命令不执行@@@
-        if (total_len + KVS_MAX_RESP_PER_CMD > resp_cap) {
-            free(cmd_temp_buf); // 释放本次临时空间
-            break;
-        }
+        #if ENABLE_REPBUF
+            // 响应写入 ctx->resp_buffer，自动扩容，无需容量检查
+        #else
+            if (total_len + KVS_MAX_RESP_PER_CMD > resp_cap) {
+                free(cmd_temp_buf);
+                break;
+            }
+        #endif
 
         // 5. 如果有完整命令，处理命令
         char *tokens[KVS_MAX_TOKENS] = {0};
         int count = kvs_split_token(cmd_temp_buf, tokens);
+        // printf("debug 0。5:\n");
+#if ENABLE_REPBUF
+        if (count > 0) {
+            // printf("debug 0。3:\n");
+            // 传入 NULL，不使用 response
+            kvs_filter_protocol(fd, tokens, count, NULL);
+            // printf("debug 0。4:\n");
+        }
+        free(cmd_temp_buf);
+        line_start += cmd_len;
+        processed_bytes += cmd_len;
+    }
+    if (processed_bytes > 0) {
+        kvs_ctx_consume(ctx, processed_bytes);
+    }
+    
+    return processed_bytes;
+#else
         if (count > 0) {
             
             int len = kvs_filter_protocol(fd, tokens, count, response + total_len);
@@ -357,6 +420,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
     }
     
     return total_len;
+#endif
 }
 
 void cleanup_connection(int fd) {
@@ -366,6 +430,56 @@ void cleanup_connection(int fd) {
 }
 
 #endif
+
+
+#if ENABLE_REPBUF
+//往缓冲区写入数据
+// 计算需要的大小 need = resp_len + len + 1
+int resp_buf_append(kvs_conn_ctx_t *ctx, const char *data, int len) {
+    if (!ctx || !data || len <= 0) return -1;
+    
+    int need = ctx->resp_len + len + 1;
+    if (need > ctx->resp_cap) {
+        int new_cap = ctx->resp_cap;
+        if (new_cap == 0) new_cap = 4096;
+        while (new_cap < need) new_cap *= 2;
+        char *new_buf = (char *)realloc(ctx->resp_buffer, new_cap);
+        if (!new_buf) return -1;
+        ctx->resp_buffer = new_buf;
+        ctx->resp_cap = new_cap;
+    }
+    
+    memcpy(ctx->resp_buffer + ctx->resp_len, data, len);
+    ctx->resp_len += len;
+    ctx->resp_buffer[ctx->resp_len] = '\0';
+    return 0;
+}
+
+//从缓冲区取出数据，out_len告诉调用者数据长度
+char* resp_buf_get_data(kvs_conn_ctx_t *ctx, int *out_len) {
+    if (!ctx || !out_len) return NULL;
+    if (ctx->resp_sent >= ctx->resp_len) {
+        *out_len = 0;
+        return NULL;
+    }
+    *out_len = ctx->resp_len - ctx->resp_sent;
+    return ctx->resp_buffer + ctx->resp_sent;
+}
+// 标记数据已发送
+void resp_buf_advance(kvs_conn_ctx_t *ctx, int sent_len) {
+    if (!ctx || sent_len <= 0) return;
+    ctx->resp_sent += sent_len;
+    if (ctx->resp_sent >= ctx->resp_len) {
+        ctx->resp_len = 0;
+        ctx->resp_sent = 0;
+    }
+}
+// 判断是否还有数据
+int resp_buf_has_data(kvs_conn_ctx_t *ctx) {
+    return ctx && ctx->resp_sent < ctx->resp_len;
+}
+#endif
+
 
 
 
@@ -441,13 +555,13 @@ int kvs_split_token(char *msg, char *tokens[]) {
     if (msg == NULL || tokens == NULL)return -1;
     int idx = 0;
     char *token = strtok(msg, " ");
-
+    printf("debug start\n");
     while (token != NULL) {
-        // printf("idx: %d, %s\n", idx, token);
+        printf("idx: %d, %s\n", idx, token);
         tokens[idx ++] = token;
         token = strtok(NULL, " ");
     }
-
+    printf("debug done\n");
     return idx;
 
 }
@@ -456,7 +570,27 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 // SET KEY VALUE
 // tokens[0]: SET ; tokens[1]: KEY; tokens[0]: VALUE
 // 进行协议数据过滤
-    if (tokens == NULL || count == 0 || response == NULL) return -1;
+    if (tokens == NULL || count == 0) return -1;
+    // 移除 response == NULL 的检查
+
+#if ENABLE_REPBUF &&  ENABLE_MEMPOOL
+    // 获取连接上下文
+    kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[fd];
+    // 从内存池分配响应缓冲区
+    char *single_resp = (char*)kvs_mempool_alloc(resp_pool, RESP_POOL_BLOCK_SIZE);
+    if (!single_resp) {
+        // 池分配失败，使用 malloc
+        printf("kvs_alloc_resp_pool_failed\n");
+        // single_resp = (char*)kvs_malloc(RESP_POOL_BLOCK_SIZE);
+        if (!single_resp) return -1;
+    }
+    single_resp[0] = '\0';
+    int resp_cap = RESP_POOL_BLOCK_SIZE;
+    // char single_resp[15100] = {0};
+#else
+    if (response == NULL) return -1;
+    char *single_resp = response;  // 兼容旧逻辑
+#endif
 
     int cmd = KVS_CMD_START;
     for (cmd = KVS_CMD_START; cmd < KVS_CMD_COUNT; cmd++) {
@@ -467,62 +601,96 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
     int len = 0;
     int ret = 0;
-    char *key = tokens[1];
-    char *value = tokens[2];
-    char *result = 0;
+    char *key = NULL;
+    char *value = NULL;
+    char *result = NULL;
 
+    // ===== 关键：根据 count 判断是否有 key 和 value =====
+    if (count > 1) key = tokens[1];
+    if (count > 2) value = tokens[2];
+
+
+     // 安全的追加宏 - 修复了 new_size 的问题
+    #define SAFE_APPEND(fmt, ...) do { \
+        int need = snprintf(NULL, 0, fmt, ##__VA_ARGS__) + 1; \
+        if (len + need >= resp_cap) { \
+            int new_cap = resp_cap; \
+            while (new_cap < len + need + 1024) new_cap *= 2; \
+            char *new_buf = NULL; \
+            \
+            /* 尝试从内存池分配更大的块 */ \
+            new_buf = (char*)kvs_mempool_alloc(resp_pool, new_cap); \
+            if (!new_buf) { \
+                new_buf = (char*)kvs_malloc(new_cap); \
+            } \
+            if (new_buf) { \
+                memcpy(new_buf, single_resp, len); \
+                /* 释放旧缓冲区 */ \
+                if (single_resp) { \
+                    kvs_mempool_free(resp_pool, single_resp); \
+                } \
+                single_resp = new_buf; \
+                resp_cap = new_cap; \
+            } else { \
+                break; \
+            } \
+        } \
+        len += snprintf(single_resp + len, resp_cap - len, fmt, ##__VA_ARGS__); \
+    } while(0)
+
+#if 1
     switch (cmd) {
 #if ENABLE_ARRAY
         case KVS_CMD_SET:
             ret = kvs_array_set(&global_array, key, value);
             if (ret < 0) {
-                len = sprintf(response, "set error\r\n");
+                SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_ARRAY_FILE, "SET", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             }
             break;
 
         case KVS_CMD_GET:{
             result = kvs_array_get(&global_array, key);
             if (result == NULL) {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             } else {
-                len = sprintf(response, "%s\r\n", result);
+                SAFE_APPEND("%s\r\n", result);
             }
             break;
         }
         case KVS_CMD_DEL:
             ret = kvs_array_del(&global_array, key);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_ARRAY_FILE, "DEL", key, NULL);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 
         case KVS_CMD_MOD:
             ret = kvs_array_mod(&global_array, key, value);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_ARRAY_FILE, "MOD", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
         case KVS_CMD_EXIST:
             ret = kvs_array_exist(&global_array, key);
             if (ret == 0) {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 #endif
@@ -530,53 +698,53 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         case KVS_CMD_RSET:
             ret = kvs_rbtree_set(&global_rbtree, key, value);
             if (ret < 0) {
-                len = sprintf(response, "set error\r\n");
+                SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_RBTREE_FILE, "RSET", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             }
             break;
 
         case KVS_CMD_RGET:{
             char *result = kvs_rbtree_get(&global_rbtree, key);
             if (result == NULL) {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             } else {
-                len = sprintf(response, "%s\r\n", result);
+                SAFE_APPEND("%s\r\n", result);
             }
             break;
         }
         case KVS_CMD_RDEL:
             ret = kvs_rbtree_del(&global_rbtree, key);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_RBTREE_FILE, "RDEL", key, NULL);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 
         case KVS_CMD_RMOD:
             ret = kvs_rbtree_mod(&global_rbtree, key, value);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_RBTREE_FILE, "RMOD", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
         case KVS_CMD_REXIST:
             ret = kvs_rbtree_exist(&global_rbtree, key);
             if (ret == 0) {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 #endif
@@ -584,52 +752,52 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         case KVS_CMD_HSET:
             ret = kvs_hash_set(&global_hash ,key, value);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_HASH_FILE, "HSET", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             } 
             
             break;
         case KVS_CMD_HGET: {
             char *result = kvs_hash_get(&global_hash, key);
             if (result == NULL) {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             } else {
-                len = sprintf(response, "%s\r\n", result);
+                SAFE_APPEND("%s\r\n", result);
             }
             break;
         }
         case KVS_CMD_HDEL:
             ret = kvs_hash_del(&global_hash ,key);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_HASH_FILE, "HDEL", key, NULL);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
         case KVS_CMD_HMOD:
             ret = kvs_hash_mod(&global_hash ,key, value);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_HASH_FILE, "HMOD", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
         case KVS_CMD_HEXIST:
             ret = kvs_hash_exist(&global_hash ,key);
             if (ret == 0) {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 #endif
@@ -637,53 +805,53 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         case KVS_CMD_SSET:
             ret = kvs_skiptable_set(&global_skiptable, key, value);
             if (ret < 0) {
-                len = sprintf(response, "set error\r\n");
+                SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_SKIPTABLE_FILE, "SSET", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             }
             break;
 
         case KVS_CMD_SGET:{
             char *result = kvs_skiptable_get(&global_skiptable, key);
             if (result == NULL) {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             } else {
-                len = sprintf(response, "%s\r\n", result);
+                SAFE_APPEND("%s\r\n", result);
             }
             break;
         }
         case KVS_CMD_SDEL:
             ret = kvs_skiptable_del(&global_skiptable, key);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_SKIPTABLE_FILE, "SDEL", key, NULL);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 
         case KVS_CMD_SMOD:
             ret = kvs_skiptable_mod(&global_skiptable, key, value);
             if (ret < 0) {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, value);  // 追加AOF
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
         case KVS_CMD_SEXIST:
             ret = kvs_skiptable_exist(&global_skiptable, key);
             if (ret == 0) {
-                len = sprintf(response, "exist\r\n");
+                SAFE_APPEND("exist\r\n");
             } else {
-                len = sprintf(response, "no exist\r\n");
+                SAFE_APPEND("no exist\r\n");
             }
             break;
 #endif
@@ -702,9 +870,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 fp = fopen(AOF_SKIPTABLE_FILE, "w");
                 if (fp) fclose(fp);
 
-                len = sprintf(response, "ok\r\n");
+                SAFE_APPEND("ok\r\n");
             } else {
-                len = sprintf(response, "error\r\n");
+                SAFE_APPEND("error\r\n");
             }
             break;
 #endif
@@ -716,23 +884,293 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
                 if (ret < 0) {
-                    len = sprintf(response, "error\r\n");
+                    SAFE_APPEND("error\r\n");
                 } else if (ret == 0) {
-                    len = sprintf(response, "ok\r\n");
+                    SAFE_APPEND("ok\r\n");
                 }
             } else {
                 // 从节点：发起同步
                 if (count < 3) {
-                    len = sprintf(response, "error: need master_ip, port\r\n");
+                    SAFE_APPEND("error: need master_ip, port\r\n");
                     break;
                 }
                 char *maser_ip = tokens[1];
                 int port = atoi(tokens[2]);
                 ret = sync_from_master(maser_ip, port);
                 if (ret < 0) {
-                    len = sprintf(response, "error\r\n");
+                    SAFE_APPEND("error\r\n");
                 } else if (ret == 0) {
-                    len = sprintf(response, "ok\r\n");
+                    SAFE_APPEND("ok\r\n");
+                }
+            }
+            break;
+#endif
+        default:
+            assert(0);
+    }
+#else
+    switch (cmd) {
+#if ENABLE_ARRAY
+        case KVS_CMD_SET:
+            ret = kvs_array_set(&global_array, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "set error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "SET", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_GET:{
+            result = kvs_array_get(&global_array, key);
+            if (result == NULL) {
+                len = sprintf(single_resp, "no exist\r\n");
+            } else {
+                len = sprintf(single_resp, "%s\r\n", result);
+            }
+            break;
+        }
+        case KVS_CMD_DEL:
+            ret = kvs_array_del(&global_array, key);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "DEL", key, NULL);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_MOD:
+            ret = kvs_array_mod(&global_array, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_ARRAY_FILE, "MOD", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_EXIST:
+            ret = kvs_array_exist(&global_array, key);
+            if (ret == 0) {
+                len = sprintf(single_resp, "exist\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+#endif
+#if ENABLE_RBTREE
+        case KVS_CMD_RSET:
+            ret = kvs_rbtree_set(&global_rbtree, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "set error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RSET", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_RGET:{
+            char *result = kvs_rbtree_get(&global_rbtree, key);
+            if (result == NULL) {
+                len = sprintf(single_resp, "no exist\r\n");
+            } else {
+                len = sprintf(single_resp, "%s\r\n", result);
+            }
+            break;
+        }
+        case KVS_CMD_RDEL:
+            ret = kvs_rbtree_del(&global_rbtree, key);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RDEL", key, NULL);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_RMOD:
+            ret = kvs_rbtree_mod(&global_rbtree, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_RBTREE_FILE, "RMOD", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_REXIST:
+            ret = kvs_rbtree_exist(&global_rbtree, key);
+            if (ret == 0) {
+                len = sprintf(single_resp, "exist\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+#endif
+#if ENABLE_HASH
+        case KVS_CMD_HSET:
+            ret = kvs_hash_set(&global_hash ,key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HSET", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "exist\r\n");
+            } 
+            
+            break;
+        case KVS_CMD_HGET: {
+            char *result = kvs_hash_get(&global_hash, key);
+            if (result == NULL) {
+                len = sprintf(single_resp, "no exist\r\n");
+            } else {
+                len = sprintf(single_resp, "%s\r\n", result);
+            }
+            break;
+        }
+        case KVS_CMD_HDEL:
+            ret = kvs_hash_del(&global_hash ,key);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HDEL", key, NULL);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_HMOD:
+            ret = kvs_hash_mod(&global_hash ,key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_HASH_FILE, "HMOD", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_HEXIST:
+            ret = kvs_hash_exist(&global_hash ,key);
+            if (ret == 0) {
+                len = sprintf(single_resp, "exist\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+#endif
+#if ENABLE_SKIPTABLE
+        case KVS_CMD_SSET:
+            ret = kvs_skiptable_set(&global_skiptable, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "set error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_SGET:{
+            char *result = kvs_skiptable_get(&global_skiptable, key);
+            if (result == NULL) {
+                len = sprintf(single_resp, "no exist\r\n");
+            } else {
+                len = sprintf(single_resp, "%s\r\n", result);
+            }
+            break;
+        }
+        case KVS_CMD_SDEL:
+            ret = kvs_skiptable_del(&global_skiptable, key);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SDEL", key, NULL);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+
+        case KVS_CMD_SMOD:
+            ret = kvs_skiptable_mod(&global_skiptable, key, value);
+            if (ret < 0) {
+                len = sprintf(single_resp, "error\r\n");
+            } else if (ret == 0) {
+                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, value);  // 追加AOF
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+        case KVS_CMD_SEXIST:
+            ret = kvs_skiptable_exist(&global_skiptable, key);
+            if (ret == 0) {
+                len = sprintf(single_resp, "exist\r\n");
+            } else {
+                len = sprintf(single_resp, "no exist\r\n");
+            }
+            break;
+#endif
+
+#if ENABLE_PERSIST
+        case KVS_CMD_SAVE:
+            ret = save_snapshots();
+            if (ret == 0) {
+                // 清空所有 AOF 文件
+                FILE *fp = fopen(AOF_ARRAY_FILE, "w"); // w模式会清空文件内容
+                if (fp) fclose(fp);
+                fp = fopen(AOF_RBTREE_FILE, "w");
+                if (fp) fclose(fp);
+                fp = fopen(AOF_HASH_FILE, "w");
+                if (fp) fclose(fp);
+                fp = fopen(AOF_SKIPTABLE_FILE, "w");
+                if (fp) fclose(fp);
+
+                len = sprintf(single_resp, "ok\r\n");
+            } else {
+                len = sprintf(single_resp, "error\r\n");
+            }
+            break;
+#endif
+
+#if ENABLE_SYNC
+        case KVS_CMD_SYNC:
+            printf("sync now\n");
+            if (g_is_master) {
+                // 主节点：则处理同步请求
+                ret = handle_sync_request(fd);
+                if (ret < 0) {
+                    len = sprintf(single_resp, "error\r\n");
+                } else if (ret == 0) {
+                    len = sprintf(single_resp, "ok\r\n");
+                }
+            } else {
+                // 从节点：发起同步
+                if (count < 3) {
+                    len = sprintf(single_resp, "error: need master_ip, port\r\n");
+                    break;
+                }
+                char *maser_ip = tokens[1];
+                int port = atoi(tokens[2]);
+                ret = sync_from_master(maser_ip, port);
+                if (ret < 0) {
+                    len = sprintf(single_resp, "error\r\n");
+                } else if (ret == 0) {
+                    len = sprintf(single_resp, "ok\r\n");
                 }
             }
             break;
@@ -741,16 +1179,34 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             assert(0);
     }
 
-    return len;
+#endif
 
+
+    // printf("debug 0: 解析完成\n");
+#if ENABLE_REPBUF
+    // ===== 追加到响应缓冲区 =====
+    if (len > 0) {
+        // printf("debug 1: get cmd done\n");
+        resp_buf_append(ctx, single_resp, len);
+        ctx->send_pending = 1;  // 标记有待发送数据
+        // printf("debug 2: 追加数据成功，发送标志位置位成功\n");
+    }
+    // 释放内存池分配的缓冲区
+    if (single_resp) {
+        kvs_mempool_free(resp_pool, single_resp);
+    }
+#endif
+    return len;
+    #undef SAFE_APPEND
 }
 
 int kvs_protocol(int fd, char *msg, int length, char *response) {
 
+
 #if ENABLE_CMD_BATCH
 
     if (fd < 0 || fd >= MAX_CONN) return -1;
-    if (msg == NULL || length <= 0 || response == NULL) return -1;
+    if (msg == NULL || length <= 0 ) return -1;
     
     // ===== 获取或初始化连接上下文 =====
     kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[fd];
@@ -760,13 +1216,19 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
     
     // ===== 追加新数据到缓冲区 =====
     kvs_ctx_append(ctx, msg, length);
+    // printf("debug 0。0:\n");
+#if ENABLE_REPBUF
+    // 处理命令，响应写入 resp_buffer
+    kvs_ctx_process(fd, ctx, NULL, 0);
+    // printf("debug 0。1:\n");
+    // 不在这里触发 EPOLLOUT，等 recv_cb 触发
+    return 0;
+#else
 
-    p_cmd_count = 0;
     int ret =  kvs_ctx_process(fd, ctx, response, BUFFER_LENGTH);
-    // printf("has pd cmd conts: %d\n", p_cmd_count);
 
-    // ===== 处理缓冲区中的完整命令 =====
     return ret;
+#endif
 
 #else
 /*
@@ -774,7 +1236,7 @@ msg: request message
 length:length of request msg
 response: need to send
 @return : len of response
-协议解析：拆分命令 + 协议处理 = 返回响应
+协议解析：拆分命令 + 协议处理 = 返回响应   单条命令模式
 */
     if (msg == NULL || length <= 0 || response == NULL) return -1;
     // printf("kvstore.c recv %d: %s\n", length, msg);
