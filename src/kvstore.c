@@ -572,25 +572,31 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 // 进行协议数据过滤
     if (tokens == NULL || count == 0) return -1;
     // 移除 response == NULL 的检查
-
-#if ENABLE_REPBUF &&  ENABLE_MEMPOOL
-    // 获取连接上下文
-    kvs_conn_ctx_t *ctx = &kvs_conn_ctxs[fd];
-    // 从内存池分配响应缓冲区
-    char *single_resp = (char*)kvs_mempool_alloc(resp_pool, RESP_POOL_BLOCK_SIZE);
-    if (!single_resp) {
-        // 池分配失败，使用 malloc
-        printf("kvs_alloc_resp_pool_failed\n");
-        // single_resp = (char*)kvs_malloc(RESP_POOL_BLOCK_SIZE);
-        if (!single_resp) return -1;
+    // ===== 新增：忽略 PING/PONG 心跳命令 =====
+    if (strcmp(tokens[0], "PING") == 0 || strcmp(tokens[0], "PONG") == 0) {
+        return 0;  // 直接返回，不处理
     }
-    single_resp[0] = '\0';
-    int resp_cap = RESP_POOL_BLOCK_SIZE;
-    // char single_resp[15100] = {0};
+    // 来自 AOF 同步的命令，不需要响应
+    int is_aof_sync = (fd < 0);
+
+    kvs_conn_ctx_t *ctx = NULL;
+    char *single_resp = NULL;
+    int resp_cap = 0;
+    if (!is_aof_sync) {
+#if ENABLE_REPBUF && ENABLE_MEMPOOL
+        // 获取连接上下文
+        ctx = &kvs_conn_ctxs[fd];
+        // 从内存池分配响应缓冲区
+        single_resp = (char*)kvs_mempool_alloc(resp_pool, RESP_POOL_BLOCK_SIZE);
+        resp_cap = RESP_POOL_BLOCK_SIZE;
 #else
-    if (response == NULL) return -1;
-    char *single_resp = response;  // 兼容旧逻辑
+        single_resp = response;
 #endif
+
+
+    }
+    // single_resp[0] = '\0';
+
 
     int cmd = KVS_CMD_START;
     for (cmd = KVS_CMD_START; cmd < KVS_CMD_COUNT; cmd++) {
@@ -883,11 +889,14 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (g_is_master) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
-                if (ret < 0) {
-                    SAFE_APPEND("error\r\n");
-                } else if (ret == 0) {
-                    SAFE_APPEND("ok\r\n");
-                }
+                break;
+                // if (ret < 0) {
+                //     SAFE_APPEND("error\r\n");
+                // } else if (ret == 0) {
+                //     SAFE_APPEND("ok\r\n");
+                // }
+                // 注意：这里不回复，因为 handle_sync_request 会保持连接
+        // 并且会发送 AOF_SYNC_OK 确认
             } else {
                 // 从节点：发起同步
                 if (count < 3) {
@@ -1185,7 +1194,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     // printf("debug 0: 解析完成\n");
 #if ENABLE_REPBUF
     // ===== 追加到响应缓冲区 =====
-    if (len > 0) {
+    if (len > 0 && ctx != NULL ) {
         // printf("debug 1: get cmd done\n");
         resp_buf_append(ctx, single_resp, len);
         ctx->send_pending = 1;  // 标记有待发送数据
