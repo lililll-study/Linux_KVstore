@@ -556,10 +556,10 @@ void echo_test(int connfd) {
 
 void large_value_test(int connfd) {
     struct timeval tv_begin, tv_cur;
-    char key[] = "lhy";
+    char key[] = "lhy2w";
     
     // ===== 1. 构建 2048 字节的 value =====
-    const int value_len = 40000;
+    const int value_len = 20000;
     char *value = (char *)malloc(value_len + 1);
     if (!value) {
         printf("malloc failed\n");

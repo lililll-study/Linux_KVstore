@@ -33,7 +33,7 @@
 
 #define ENABLE_SYNC			 1
 #define ENABLE_REPBUF   1           // 启动响应缓冲区，避免响应过大溢出
-
+#define ENABLE_AOF_SYNC     1   // 开启增量同步备份
 
 #if ENABLE_CMD_BATCH
 typedef struct kvs_conn_ctx {
@@ -156,7 +156,7 @@ int replay_aof(const char *filename);
 
 
 #if ENABLE_SYNC
-#define SYNC_BUFFER_SIZE 8192
+#define SYNC_BUFFER_SIZE 2000
 
 extern int g_is_master;
 
@@ -166,6 +166,17 @@ int sync_from_master(const char *master_ip, int port);	// 由从节点发起同�
 // 主节点传输和从节点接收
 int send_file(int fd, const char *filepath);
 int recv_file(int fd, const char *save_dir);
+
+#if ENABLE_AOF_SYNC
+
+
+// 函数声明
+void init_aof_sync_ctx(void);
+void disconnect_aof_sync(void);
+void* aof_master_check_thread(void* arg);
+void* aof_slave_recv_thread(void* arg);
+
+#endif
 
 #endif
 
