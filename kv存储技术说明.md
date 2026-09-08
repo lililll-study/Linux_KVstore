@@ -294,9 +294,13 @@ rbtree，b+ tree
    
    
 
-## 3 跳表引擎实现
+# 四、作业
 
-### 3.1 为什么要跳表，而不是使用二分查找？
+
+
+## 1 跳表引擎实现
+
+### 1.1 为什么要跳表，而不是使用二分查找？
 
 因为二分查找的前提是，数据必须存储在数组中，并且始终保持有序和不变。数组要求底层是连续内存，并且插入和删除的复杂度都是O(n)。
 
@@ -304,11 +308,17 @@ rbtree，b+ tree
 
 **一句话：二分查找需要数组支持，数组插入太慢；跳表用链表 + 多层索引，实现了同样快的查找，但插入和删除快得多。**
 
-### 3.2 跳表数据结构实现
+### 1.2 跳表代码实现
 
-关键点：
+本次跳表的实现主要涉及到：跳表的定义，接口层适配函数，接口函数。
 
-增删改查；
+定义跳表包括定义跳表中的每个节点，以及跳表的表结构体
+
+跳表节点包括key, value, forward。forward[i]用来表示每个节点在第i层的下一个节点（二级指针）
+
+跳表表结构包括跳表层级level和头节点
+
+关键点：增删改查
 
 1. 节点设计
 
@@ -357,6 +367,12 @@ typedef struct kvs_skiptable {
 │ forward[6] → 第6层的第一个节点│
 └─────────────────────────────┘
 ```
+
+// 定义跳表最大层数，每个节点可以出现在多个层级中，6表示最高允许建到第五层
+
+// 这样查找时最多跳跃6次就能找到目标
+
+// 一般取log2(n)作为最大层数，比如100w节点，log2(100w)=20
 
 
 
@@ -409,6 +425,8 @@ void free_node(kvs_node_t *node) {
 
 （5）搜索，插入，删除，修改
 
+搜索：自顶层向下搜索
+
 ```c
 kvs_node_t* search(kvs_skiptable_t* skipList, char* key) {
     if (skipList == NULL || key == NULL) return NULL;
@@ -432,6 +450,53 @@ kvs_node_t* search(kvs_skiptable_t* skipList, char* key) {
     }
 }
 
+
+int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
+    if (inst == NULL || key == NULL || value == NULL) return -1;
+
+    // 先检查key是否存在
+    if (search(inst, key) == NULL) return 1; // key不存在
+
+    // update表示在第i层，新节点应该插入在哪个节点之后
+    // 1. 初始化查找update和current
+    kvs_node_t *update[MAX_LEVEL + 1];
+    kvs_node_t *current = inst->header;
+
+    int i = 0;
+    // 从最高层向下寻找要插入的位置
+    // 2. 查找插入位置
+    for (i = inst->level; i>=0; i--) {
+        // 在每一层向右移动，直到找到key大于等于当前key的位置
+        while (current->forward[i] != NULL && strcmp(current->forward[i]->key, key) <0) {
+                current = current->forward[i];
+            }
+            update[i] = current;// 记录每层的前驱节点
+    }
+    // 找到位置
+    current = current->forward[0];
+
+    // 3. 更新value
+    if (current == NULL || strcmp(current->key, key) != 0) {
+        // 释放旧的value 替换为新的
+        return -1;
+    }
+    kvs_free(current->value);
+    current->value = strdup(value);
+    return 0;
+}
+
+
+```
+
+插入：
+
+在比较的时候，需要把每一层的待插入位置的前驱结点update记录下来，逻辑是：当current->forward[i]比key大，那么就把当前current保存到update[i]，后续只要插入在update后面即可。然后找到current在第0层的位置。
+
+然后判断level是不是比当前跳表层数高，如果新节点层数 > 当前跳表最高层，那么需要把update数组补齐，把新增的层的头节点分配给前驱update
+
+最后插入新节点，从底层开始遍历，新节点指向update的下一个节点，然后把新节点赋值给update的下一个节点
+
+```c
 int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
     if (inst == NULL || key == NULL || value == NULL) return -1;
 
@@ -452,11 +517,9 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
             }
             update[i] = current;// 记录每层的前驱节点
     }
-    // 找到位置
     current = current->forward[0];
 
 
-    // 插入新节点
     // 4. 先分配层数
     int level = random_level();
     if (level > inst->level) {
@@ -473,15 +536,20 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
 
     // 在各层插入新节点
     for (i=0; i<=level; i++) {
-        // 先把第i层的待插入的前一个节点update的下一个节点，用new_node指向
-        new_node->forward[i] = update[i]->forward[i]; // 新节点指向后继
-        // 然后更新update指向new_node
-        // 这样就变成update->new_node->forward
-        update[i]->forward[i] = new_node;           // 前驱指向新节点
+        new_node->forward[i] = update[i]->forward[i]; 
+        update[i]->forward[i] = new_node;
     }
     return 0;
 }
+```
 
+
+
+删除
+
+先搜索节点是否存在，然后初始化前驱的数组，接着在各层把current删除，并释放current，最后更新跳表层数
+
+```c
 int kvs_skiptable_del(kvs_skiptable_t *inst, char *key) {
     if (inst == NULL || key == NULL) return -1;
 
@@ -527,43 +595,6 @@ int kvs_skiptable_del(kvs_skiptable_t *inst, char *key) {
 
     return 0;
 }
-
-
-int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
-    if (inst == NULL || key == NULL || value == NULL) return -1;
-
-    // 先检查key是否存在
-    if (search(inst, key) == NULL) return 1; // key不存在
-
-    // update表示在第i层，新节点应该插入在哪个节点之后
-    // 1. 初始化查找update和current
-    kvs_node_t *update[MAX_LEVEL + 1];
-    kvs_node_t *current = inst->header;
-
-    int i = 0;
-    // 从最高层向下寻找要插入的位置
-    // 2. 查找插入位置
-    for (i = inst->level; i>=0; i--) {
-        // 在每一层向右移动，直到找到key大于等于当前key的位置
-        while (current->forward[i] != NULL && strcmp(current->forward[i]->key, key) <0) {
-                current = current->forward[i];
-            }
-            update[i] = current;// 记录每层的前驱节点
-    }
-    // 找到位置
-    current = current->forward[0];
-
-    // 3. 更新value
-    if (current == NULL || strcmp(current->key, key) != 0) {
-        // 释放旧的value 替换为新的
-        return -1;
-    }
-    kvs_free(current->value);
-    current->value = strdup(value);
-    return 0;
-}
-
-
 ```
 
 
@@ -595,11 +626,13 @@ update：记录新节点一个插入在哪些节点之后
 
 
 
-# 四、作业
+
+
+
 
 ## 2 持久化存储
 
-分为全量存储和增量存储。全量存储用快照snap的形式，使用命令行调用SAVE时，把所有引擎的数据遍历存储进磁盘文件中，下一次启动引擎时加载set读取。增量存储记录set、del、mod成功的命令，并把命令写入磁盘文件。如果执行SAVE则删除aof，没有执行则在启动加载全量数据后，再把增量操作执行。这样就能恢复到上一次关闭前的数据状态。
+分为全量存储和增量存储。全量存储用快照snap的形式，使用命令行调用SAVE时，把所有引擎的数据遍历存储进磁盘文件中，下一次启动引擎时加载读取。增量存储记录set、del、mod成功的命令，并把命令写入磁盘文件。如果执行SAVE则删除aof，没有执行则在启动加载全量数据后，再把增量操作执行。这样就能恢复到上一次关闭前的数据状态。
 
 全量：
 
@@ -655,11 +688,37 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
 
 ## 3 内存碎片管理
 
+3.1 
+
 内存碎片会存在内部碎片和外部碎片
 
-        内部碎片指的是在分配内存时，因为内存对齐的原因，导致使用到的内存只占用了分配内存的一部分，使得另一部分未使用的处于空闲状态被浪费。例如：使用malloc(17)分配了17字节，但是由于内存对齐可能分配了32字节，剩余的15字节被浪费。
+        内部碎片指的是在分配内存时，因为<mark>内存对齐</mark>的原因，导致使用到的内存只占用了分配内存的一部分，<mark>使得另一部分未使用的处于空闲状态被浪费。</mark>例如：<mark>使用malloc(17)分配了17字节，但是由于内存对齐可能分配了32字节，剩余的15字节被浪费。</mark>
 
-        外部碎片指的是分配的内存块之间存在空闲内存间隙，这些间隙无法满足新的内存请求，尽管总的空闲内存量看起来可能足够满足40字节的请求，但由于空闲块是零散分布且大小都小于40字节，所以无法满足这一分配需求，从而形成了外部碎片。
+        <mark>外部碎片指的是分配的内存块之间存在空闲内存间隙，这些间隙无法满足新的内存请求，尽管总的空闲内存量看起来可能足够满足40字节的请求，但由于空闲块是零散分布且大小都小于40字节，所以无法满足这一分配需求，从而形成了外部碎片。</mark>
+
+
+
+内存池的设计思路：
+
+        将内存拆分为一个一个chunk块，然后用链表连接起来。然后在每个块的前8个字节用来存储下一个空闲块的地址。（注意这8个字节不算入可用空间）
+
+然后在调用不同存储引擎时，会将数据存入不同内存池，做到内存池分类。因为每种数据的大小都是不同的，做到分区管理。而且系统大小的对象做到连续释放，能够提高缓存命中率。
+
+
+
+问题：
+
+1、为什么使用8个字节？
+
+**CPU 访问对齐内存更快**，特别是指针操作。如果块地址不是 8 的倍数，CPU 需要两次内存访问才能读取一个 8 字节的指针。
+
+
+
+2、这里的内存设计如何支持任意大小KV的？
+
+在kvs_mempool_alloc中，会先计算用户可用空间，如果本次请求大小超过了块的容量，那么直接用malloc，不会出现溢出情况。
+
+好处：小数据用池（快），大数据用 malloc（灵活）
 
 
 

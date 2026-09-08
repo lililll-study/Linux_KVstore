@@ -452,8 +452,6 @@ int kvs_rbtree_create(kvs_rbtree_t *inst) {
 void kvs_rbtree_destory(kvs_rbtree_t *inst) {
 	if (inst == NULL) return;
 
-	rbtree_node *node = NULL;
-
 	while (inst->root != inst->nil) {
 		rbtree_node *mini = rbtree_mini(inst, inst->root);// 每次找到最小的节点
 		rbtree_node *cur = rbtree_delete(inst, mini); // 然后删除它，并free

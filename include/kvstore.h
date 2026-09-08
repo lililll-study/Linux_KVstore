@@ -10,6 +10,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <time.h>      
+#include <pthread.h>   
+#include <unistd.h>    
 
 #define NET_REACTOR 0
 #define NET_NTYCO 1
@@ -17,63 +20,31 @@
 
 #define NET_SELECT NET_REACTOR
 
-#define KVS_MAX_TOKENS 128
-
 
 #define ENABLE_ARRAY         1
 #define ENABLE_RBTREE        1
 #define ENABLE_HASH			 1
 #define ENABLE_SKIPTABLE	 1
 
-#define ENABLE_PERSIST 		 1	// 开启持久化存储
-#define ENABLE_MEMPOOL		 1
-#define ENABLE_LEVEL_MEMPOOL 1
+#define ENABLE_PERSIST 		 1	 // 开启本地持久化存储
+#define ENABLE_MEMPOOL		 1   // 开启内存池
+#define ENABLE_LEVEL_MEMPOOL 1   // 开启cmd批处理
 
-#define ENABLE_CMD_BATCH	 1
+#define ENABLE_CMD_BATCH	 1   // 开启cmd批处理
 
-#define ENABLE_SYNC			 1
-#define ENABLE_REPBUF   1           // 启动响应缓冲区，避免响应过大溢出
-#define ENABLE_AOF_SYNC     1   // 开启增量同步备份
+#define ENABLE_SYNC			 1   // 开启同步备份功能
+#define ENABLE_AOF_SYNC      1   // 开启增量同步备份
+#define ENABLE_REPBUF        1   // 启动响应缓冲区，避免响应过大溢出
 
-#if ENABLE_CMD_BATCH
-typedef struct kvs_conn_ctx {
-	char *cmd_buffer;      // 命令积累缓冲区
-    int cmd_buffer_len;    // 当前有效数据长度
-    int cmd_buffer_cap;    // 缓冲区容量
-    
-#if ENABLE_REPBUF
-    // ===== 响应缓冲区 =====
-    char *resp_buffer;
-    int resp_len;
-    int resp_cap;
-    int resp_sent;          // 已发送位置
-    
-    // ===== 发送标志 =====
-    int send_pending;       // 1: 有待发送数据, 0: 无
+/*
+======================================= 底层网络架构 ======================================
+==========================================================================================
+*/
 
-#endif
+extern  const char *command[];
+extern const char *response[];
 
-} kvs_conn_ctx_t;
-#define MAX_CONN 1024
-extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
-int kvs_ctx_init(kvs_conn_ctx_t *ctx);
-void kvs_ctx_free(kvs_conn_ctx_t *ctx);
-int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len);
-void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed);
-int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap);
-// 清理连接上下文（在连接关闭时调用）
-void cleanup_connection(int fd);
-
-
-#endif
-
-#if ENABLE_REPBUF
-int resp_buf_append(kvs_conn_ctx_t *ctx, const char *data, int len);
-char* resp_buf_get_data(kvs_conn_ctx_t *ctx, int *out_len);
-void resp_buf_advance(kvs_conn_ctx_t *ctx, int sent_len);
-int resp_buf_has_data(kvs_conn_ctx_t *ctx);
-#endif
-
+#define KVS_MAX_TOKENS 128
 
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 
@@ -81,113 +52,18 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 
-#if ENABLE_MEMPOOL
-// 内存池结构
-typedef struct mempool_s{
-    size_t block_size;       // 每个内存块的总大小
-    size_t total_blocks;    // 内存池总块数
-    size_t free_blocks;     // 当前空闲块数量
-    void* free_list;        // 空闲链表头指针
-    char data[];        // 柔性数组
-// data[] 不占结构体空间，但可以通过 pool->data 访问结构体后面的内存：
-} mempool_t;
-
-extern mempool_t *array_item_pool;
-extern mempool_t *array_string_pool;
-extern mempool_t *rbtree_node_pool;
-extern mempool_t *rbtree_string_pool;
-extern mempool_t *hash_node_pool;
-extern mempool_t *hash_string_pool;
-extern mempool_t *skiptable_node_pool;
-extern mempool_t *skiptable_string_pool;
-
-#define SMALL_STRING_THRESHOLD 128  // 小字符串阈值
-
-
-
-
-// 指定块大小和块数量 
-mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks);
-// 分配块
-void* kvs_mempool_alloc(mempool_t *pool, size_t size);
-// 释放块
-void kvs_mempool_free(mempool_t *pool, void *ptr);
-// 重置块
-void kvs_mempool_reset(mempool_t *pool);
-// 销毁内存池
-void kvs_mempool_destroy(mempool_t *pool);
-
-#endif
-
-extern  const char *command[];
-extern const char *response[];
-
-#if ENABLE_PERSIST
-
-// 快照文件路径（放在 data 目录下）
-#define SNAP_ARRAY_FILE     "data/array.snap"
-#define SNAP_RBTREE_FILE    "data/rbtree.snap"
-#define SNAP_HASH_FILE      "data/hash.snap"
-#define SNAP_SKIPTABLE_FILE "data/skiptable.snap"
-
-// AOF文件路径（放在 data 目录下）
-#define AOF_ARRAY_FILE      "data/array.aof"
-#define AOF_RBTREE_FILE     "data/rbtree.aof"
-#define AOF_HASH_FILE       "data/hash.aof"
-#define AOF_SKIPTABLE_FILE  "data/skiptable.aof"
-
-int save_snapshots();
-int load_snapshots();
-// 快照保存
-int save_snapshot_array(const char *filename);
-int save_snapshot_rbtree(const char *filename);
-int save_snapshot_hash(const char *filename);
-int save_snapshot_skiptable(const char *filename);
-// 快照加载
-int load_snapshot_array(const char *filename);
-int load_snapshot_rbtree(const char *filename);
-int load_snapshot_hash(const char *filename);
-int load_snapshot_skiptable(const char *filename);
-
-// AOF
-int append_aof(const char *filename, const char *cmd, const char *key, const char *value);
-int replay_aof(const char *filename);
-#endif
-
-
-#if ENABLE_SYNC
-#define SYNC_BUFFER_SIZE 2000
-
-extern int g_is_master;
-
-// 同步函数
-int handle_sync_request(int fd);          // 主节点：处理同步
-int sync_from_master(const char *master_ip, int port);	// 由从节点发起同步
-// 主节点传输和从节点接收
-int send_file(int fd, const char *filepath);
-int recv_file(int fd, const char *save_dir);
-
-#if ENABLE_AOF_SYNC
-
-
-// 函数声明
-void init_aof_sync_ctx(void);
-void disconnect_aof_sync(void);
-void* aof_master_check_thread(void* arg);
-void* aof_slave_recv_thread(void* arg);
-
-#endif
-
-#endif
-
+/*
+======================================= 1.kv引擎 ======================================
+==========================================================================================
+*/
 #if ENABLE_ARRAY
-// 单个key
 typedef struct kvs_array_item_s {
     char *key;
     char *value;
 } kvs_array_item_t;
 
-#define KVS_ARRAY_SIZE 1024
+
+#define KVS_ARRAY_SIZE 1024                                 /*@param*/ 
 
 // 定义所有key
 typedef struct kvs_array_s {
@@ -311,6 +187,178 @@ int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
 int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
 int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
 #endif
+
+int kvs_split_token(char *msg, char *tokens[]);
+int kvs_filter_protocol(int fd, char **tokens, int count, char *response);
+int kvs_protocol(int fd, char *msg, int length, char *response);
+
+
+/*
+======================================= 2.持久化persist ======================================
+==========================================================================================
+*/
+#if ENABLE_PERSIST
+
+// 快照文件路径（放在 data 目录下）
+#define SNAP_ARRAY_FILE     "data/array.snap"
+#define SNAP_RBTREE_FILE    "data/rbtree.snap"
+#define SNAP_HASH_FILE      "data/hash.snap"
+#define SNAP_SKIPTABLE_FILE "data/skiptable.snap"
+
+// AOF文件路径（放在 data 目录下）
+#define AOF_ARRAY_FILE      "data/array.aof"
+#define AOF_RBTREE_FILE     "data/rbtree.aof"
+#define AOF_HASH_FILE       "data/hash.aof"
+#define AOF_SKIPTABLE_FILE  "data/skiptable.aof"
+
+int save_snapshots();
+int load_snapshots();
+// 快照保存
+int save_snapshot_array(const char *filename);
+int save_snapshot_rbtree(const char *filename);
+int save_snapshot_hash(const char *filename);
+int save_snapshot_skiptable(const char *filename);
+// 快照加载
+int load_snapshot_array(const char *filename);
+int load_snapshot_rbtree(const char *filename);
+int load_snapshot_hash(const char *filename);
+int load_snapshot_skiptable(const char *filename);
+
+// AOF
+int append_aof(const char *filename, const char *cmd, const char *key, const char *value);
+int replay_aof(const char *filename);
+#endif
+
+
+/*
+======================================= 3.内存池 ======================================
+==========================================================================================
+*/
+#if ENABLE_MEMPOOL
+
+#define KVS_POOL_NODE_COUNT     100000
+#define KVS_POOL_STRING_COUNT   200000
+#define RESP_POOL_BLOCK_SIZE    4096
+#define RESP_POOL_BLOCK_COUNT   1024
+
+// 内存池结构
+typedef struct mempool_s{
+    size_t block_size;       // 每个内存块的总大小
+    size_t total_blocks;    // 内存池总块数
+    size_t free_blocks;     // 当前空闲块数量
+    void* free_list;        // 空闲链表头指针
+    char data[];        // 柔性数组
+// data[] 不占结构体空间，但可以通过 pool->data 访问结构体后面的内存：
+} mempool_t;
+
+extern mempool_t *resp_pool;
+
+// 不同数据类型分类设计
+extern mempool_t *array_item_pool;
+extern mempool_t *array_string_pool;
+extern mempool_t *rbtree_node_pool;
+extern mempool_t *rbtree_string_pool;
+extern mempool_t *hash_node_pool;
+extern mempool_t *hash_string_pool;
+extern mempool_t *skiptable_node_pool;
+extern mempool_t *skiptable_string_pool;
+
+#define SMALL_STRING_THRESHOLD 128  // 小字符串阈值
+
+// 指定块大小和块数量 
+mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks);
+void* kvs_mempool_alloc(mempool_t *pool, size_t size);
+void kvs_mempool_free(mempool_t *pool, void *ptr);
+void kvs_mempool_reset(mempool_t *pool);
+void kvs_mempool_destroy(mempool_t *pool);
+int init_mempools(void);
+void dest_mempools(void);
+#endif
+
+
+/*
+（设计请求缓冲区和响应缓冲区）
+======================================= 4.批处理 ======================================
+==========================================================================================
+*/
+#if ENABLE_CMD_BATCH
+
+#define MAX_CONN 1024
+
+typedef struct kvs_conn_ctx {
+	char *cmd_buffer;      // 命令积累缓冲区
+    int cmd_buffer_len;    // 当前有效数据长度
+    int cmd_buffer_cap;    // 缓冲区容量
+    
+#if ENABLE_REPBUF
+    // ===== 响应缓冲区 =====
+    char *resp_buffer;
+    int resp_len;
+    int resp_cap;
+    int resp_sent;          // 已发送位置
+    
+    // ===== 发送标志 =====
+    int send_pending;       // 1: 有待发送数据, 0: 无
+
+#endif
+
+} kvs_conn_ctx_t;
+
+extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
+int kvs_ctx_init(kvs_conn_ctx_t *ctx);
+void kvs_ctx_free(kvs_conn_ctx_t *ctx);
+int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len);
+void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed);
+int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap);
+// 清理连接上下文（在连接关闭时调用）
+void cleanup_connection(int fd);
+
+#if ENABLE_REPBUF
+int resp_buf_append(kvs_conn_ctx_t *ctx, const char *data, int len);
+char* resp_buf_get_data(kvs_conn_ctx_t *ctx, int *out_len);
+void resp_buf_advance(kvs_conn_ctx_t *ctx, int sent_len);
+int resp_buf_has_data(kvs_conn_ctx_t *ctx);
+#endif
+
+
+#endif
+
+
+
+
+
+
+/*
+======================================= 5.  全量和增量同步 ======================================
+==========================================================================================
+*/
+#if ENABLE_SYNC
+#define SYNC_BUFFER_SIZE 2000
+
+extern int g_is_master;
+
+// 同步函数
+int handle_sync_request(int fd);          // 主节点：处理同步
+int sync_from_master(const char *master_ip, int port);	// 由从节点发起同步
+// 主节点传输和从节点接收
+int send_file(int fd, const char *filepath);
+int recv_file(int fd, const char *save_dir);
+
+#if ENABLE_AOF_SYNC
+// 函数声明
+void init_aof_sync_ctx(void);
+void disconnect_aof_sync(void);
+void* aof_master_check_thread(void* arg);
+void* aof_slave_recv_thread(void* arg);
+
+#endif
+
+#endif
+
+
+
+
+
 
 
 void kvs_free(void *ptr);

@@ -211,7 +211,6 @@ int replay_aof(const char *filename) {
 
     char *line = NULL, *cmd = NULL, *key = NULL, *value = NULL;
     size_t line_len = 0;
-    int ret = 0;
 
     while (getline(&line, &line_len, fp) != -1) {
 
@@ -271,7 +270,7 @@ int replay_aof(const char *filename) {
                 // printf("set start A\n");
                 if (strcmp(cmd, "SET") == 0 && count == 3) {
                     // printf("set start\n");
-                    int ret = kvs_array_set(&global_array, key, value);
+                    kvs_array_set(&global_array, key, value);
                     // printf("kvs_array_set returned: %d\n", ret);
                 } else if (strcmp(cmd, "MOD") == 0 && count == 3) {
                     kvs_array_mod(&global_array, key, value);
