@@ -1,16 +1,13 @@
 #include "kvstore.h"
+#include "server.h"
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>  
 #include <sys/stat.h>  
 #include <fcntl.h>     
-#include "server.h"
 #include <errno.h>
 
-#include <time.h>      // 添加
-#include <pthread.h>   // 添加
-static int sync_fd = 1;
 
 #if ENABLE_AOF_SYNC
 

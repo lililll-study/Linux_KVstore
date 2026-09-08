@@ -10,10 +10,7 @@ kvs_skiptable_t global_skiptable;
 kvs_node_t* createNode(int level, char *key, char *value) {
 #if ENABLE_MEMPOOL
     // 使用内存池分配节点（包含 forward 数组）
-    kvs_node_t* newNode = (kvs_node_t*)kvs_mempool_alloc(
-        skiptable_node_pool, 
-        sizeof(kvs_node_t) + (level + 1) * sizeof(kvs_node_t*)
-    );
+    kvs_node_t* newNode = (kvs_node_t*)kvs_mempool_alloc(skiptable_node_pool,  sizeof(kvs_node_t) + (level + 1) * sizeof(kvs_node_t*));
 #else
     kvs_node_t* newNode = (kvs_node_t*)malloc(sizeof(kvs_node_t));
 #endif

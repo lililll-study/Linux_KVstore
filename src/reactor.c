@@ -118,6 +118,7 @@ int set_event(int fd, int event, int flag) {
         ev.data.fd = fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
     }
+    return 0;
 }
 
 
