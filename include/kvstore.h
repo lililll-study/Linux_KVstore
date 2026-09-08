@@ -63,12 +63,13 @@ typedef struct kvs_array_item_s {
 } kvs_array_item_t;
 
 
-#define KVS_ARRAY_SIZE 1024                                 /*@param*/ 
+#define KVS_ARRAY_INIT_SIZE 1024      // 初始容量
+#define KVS_ARRAY_GROW_FACTOR 2       // 扩容因子
 
-// 定义所有key
 typedef struct kvs_array_s {
     kvs_array_item_t *table;
     int total;
+    int capacity;    // 当前容量（新增）
 } kvs_array_t;
 
 void kvs_array_destory(kvs_array_t *inst);
