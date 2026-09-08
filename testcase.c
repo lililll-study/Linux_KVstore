@@ -220,6 +220,70 @@ void skiptable_testcase_3w_0_mix (int connfd) {
     printf("skiptable_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
 }
 
+void array_testcase_3w_0_mix (int connfd) {
+    int count = 10000;
+    int i = 0;
+    struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "SET Teacher%d King%d\n", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "SET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "GET Teacher%d\n", i);
+
+        char result[128] = {0};
+        snprintf(result, 128, "King%d\r\n", i);
+        testcase(connfd, cmd,     result, "GET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "MOD Teacher%d Lililihy%d\n", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "MOD-Teacher");
+    }
+
+    struct timeval tv_cur;
+    gettimeofday(&tv_cur, NULL);
+
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin); //ms
+    printf("array_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
+}
+void hash_testcase_3w_0_mix (int connfd) {
+    int count = 10000;
+    int i = 0;
+    struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "HSET Teacher%d King%d\n", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "HSET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "HGET Teacher%d\n", i);
+
+        char result[128] = {0};
+        snprintf(result, 128, "King%d\r\n", i);
+        testcase(connfd, cmd,     result, "HGET-Teacher");
+    }
+    for (i = 0; i< count; i++) {
+        char cmd[128] = {0};
+        snprintf(cmd, 128, "HMOD Teacher%d Lililihy%d\n", i, i);
+        testcase(connfd, cmd,     "ok\r\n", "HMOD-Teacher");
+    }
+
+    struct timeval tv_cur;
+    gettimeofday(&tv_cur, NULL);
+
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin); //ms
+    printf("hash_testcase_1w -- > time used: %d, qps: %d\n", time_used, count * 3 * 1000 / time_used);
+}
+
+
 /**
  * 统计响应缓冲区中的响应条数
  * 每条响应以 \r\n 结尾
@@ -486,7 +550,7 @@ void batch_test(int connfd) {
     }
 
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
-    printf("skiptable_batch_1500 -- > time used: %d, qps: %d\n", 
+    printf("%d_batch_1500 -- > time used: %d, qps: %d\n", mode,
            time_used, count * 3 * 1000 / time_used);
     // 验证结果
     if (strcmp(result, expected) == 0) {
@@ -554,7 +618,7 @@ void echo_test(int connfd) {
 }
 
 
-void large_value_test(int connfd) {
+void array_large_value_test(int connfd) {
     struct timeval tv_begin, tv_cur;
     char key[] = "lhy2w";
     
@@ -625,6 +689,221 @@ void large_value_test(int connfd) {
     free(get_result);
 }
 
+void hash_large_value_test(int connfd) {
+    struct timeval tv_begin, tv_cur;
+    char key[] = "lhy2w";
+    
+    // ===== 1. 构建 2048 字节的 value =====
+    const int value_len = 20000;
+    char *value = (char *)malloc(value_len + 1);
+    if (!value) {
+        printf("malloc failed\n");
+        return;
+    }
+    memset(value, 'H', value_len);
+    value[value_len] = '\0';
+    printf("Value size: %d bytes (%.2f KB)\n", value_len, value_len / 1024.0);
+    
+    // ===== 2. SET =====
+    char *cmd = (char *)malloc(value_len + 64);
+    int cmd_len = snprintf(cmd, value_len + 64, "HSET %s ", key);
+    memcpy(cmd + cmd_len, value, value_len);
+    cmd_len += value_len;
+    cmd[cmd_len++] = '\n';
+    cmd[cmd_len] = '\0';
+    
+    char result[1024] = {0};
+    
+    send(connfd, cmd, cmd_len, 0);
+    recv(connfd, result, sizeof(result), 0);
+    printf("HSET response: %s", result);
+    
+    // ===== 3. GET =====
+    char get_cmd[32];
+    snprintf(get_cmd, sizeof(get_cmd), "HGET %s\n", key);
+    
+    char *get_result = (char *)malloc(value_len + 256);
+    memset(get_result, 0, value_len + 256);
+    send(connfd, get_cmd, strlen(get_cmd), 0);
+    
+    int total_recv = 0;
+    while (1) {
+        int ret = recv(connfd, get_result + total_recv, value_len + 256 - total_recv - 1, 0);
+        if (ret <= 0) break;
+        total_recv += ret;
+        if (total_recv >= 2 && get_result[total_recv-2] == '\r' && get_result[total_recv-1] == '\n') {
+            break;
+        }
+    }
+    get_result[total_recv] = '\0';
+    
+    printf("Total received: %d bytes\n", total_recv);
+    printf("Full response:\n%s\n", get_result);
+    
+    // ===== 4. 验证 =====
+    // 去掉末尾的 \r\n
+    int len = strlen(get_result);
+    if (len >= 2 && get_result[len-2] == '\r' && get_result[len-1] == '\n') {
+        get_result[len-2] = '\0';
+    }
+
+    if (strcmp(get_result, value) == 0) {
+        printf("PASS\n");
+    } else {
+        printf("FAILED\n");
+
+    }
+    printf("Expected len: %d, Received len: %d\n", 
+        (int)strlen(value), (int)strlen(get_result));
+    free(value);
+    free(cmd);
+    free(get_result);
+}
+
+void rbtree_large_value_test(int connfd) {
+    struct timeval tv_begin, tv_cur;
+    char key[] = "lhy2w";
+    
+    // ===== 1. 构建 2048 字节的 value =====
+    const int value_len = 20000;
+    char *value = (char *)malloc(value_len + 1);
+    if (!value) {
+        printf("malloc failed\n");
+        return;
+    }
+    memset(value, 'R', value_len);
+    value[value_len] = '\0';
+    printf("Value size: %d bytes (%.2f KB)\n", value_len, value_len / 1024.0);
+    
+    // ===== 2. SET =====
+    char *cmd = (char *)malloc(value_len + 64);
+    int cmd_len = snprintf(cmd, value_len + 64, "RSET %s ", key);
+    memcpy(cmd + cmd_len, value, value_len);
+    cmd_len += value_len;
+    cmd[cmd_len++] = '\n';
+    cmd[cmd_len] = '\0';
+    
+    char result[1024] = {0};
+    
+    send(connfd, cmd, cmd_len, 0);
+    recv(connfd, result, sizeof(result), 0);
+    printf("RSET response: %s", result);
+    
+    // ===== 3. GET =====
+    char get_cmd[32];
+    snprintf(get_cmd, sizeof(get_cmd), "RGET %s\n", key);
+    
+    char *get_result = (char *)malloc(value_len + 256);
+    memset(get_result, 0, value_len + 256);
+    send(connfd, get_cmd, strlen(get_cmd), 0);
+    
+    int total_recv = 0;
+    while (1) {
+        int ret = recv(connfd, get_result + total_recv, value_len + 256 - total_recv - 1, 0);
+        if (ret <= 0) break;
+        total_recv += ret;
+        if (total_recv >= 2 && get_result[total_recv-2] == '\r' && get_result[total_recv-1] == '\n') {
+            break;
+        }
+    }
+    get_result[total_recv] = '\0';
+    
+    printf("Total received: %d bytes\n", total_recv);
+    printf("Full response:\n%s\n", get_result);
+    
+    // ===== 4. 验证 =====
+    // 去掉末尾的 \r\n
+    int len = strlen(get_result);
+    if (len >= 2 && get_result[len-2] == '\r' && get_result[len-1] == '\n') {
+        get_result[len-2] = '\0';
+    }
+
+    if (strcmp(get_result, value) == 0) {
+        printf("PASS\n");
+    } else {
+        printf("FAILED\n");
+
+    }
+    printf("Expected len: %d, Received len: %d\n", 
+        (int)strlen(value), (int)strlen(get_result));
+    free(value);
+    free(cmd);
+    free(get_result);
+}
+
+
+void skiptable_large_value_test(int connfd) {
+    struct timeval tv_begin, tv_cur;
+    char key[] = "lhy2w";
+    
+    // ===== 1. 构建 2048 字节的 value =====
+    const int value_len = 20000;
+    char *value = (char *)malloc(value_len + 1);
+    if (!value) {
+        printf("malloc failed\n");
+        return;
+    }
+    memset(value, 'S', value_len);
+    value[value_len] = '\0';
+    printf("Value size: %d bytes (%.2f KB)\n", value_len, value_len / 1024.0);
+    
+    // ===== 2. SET =====
+    char *cmd = (char *)malloc(value_len + 64);
+    int cmd_len = snprintf(cmd, value_len + 64, "SSET %s ", key);
+    memcpy(cmd + cmd_len, value, value_len);
+    cmd_len += value_len;
+    cmd[cmd_len++] = '\n';
+    cmd[cmd_len] = '\0';
+    
+    char result[1024] = {0};
+    
+    send(connfd, cmd, cmd_len, 0);
+    recv(connfd, result, sizeof(result), 0);
+    printf("SSET response: %s", result);
+    
+    // ===== 3. GET =====
+    char get_cmd[32];
+    snprintf(get_cmd, sizeof(get_cmd), "SGET %s\n", key);
+    
+    char *get_result = (char *)malloc(value_len + 256);
+    memset(get_result, 0, value_len + 256);
+    send(connfd, get_cmd, strlen(get_cmd), 0);
+    
+    int total_recv = 0;
+    while (1) {
+        int ret = recv(connfd, get_result + total_recv, value_len + 256 - total_recv - 1, 0);
+        if (ret <= 0) break;
+        total_recv += ret;
+        if (total_recv >= 2 && get_result[total_recv-2] == '\r' && get_result[total_recv-1] == '\n') {
+            break;
+        }
+    }
+    get_result[total_recv] = '\0';
+    
+    printf("Total received: %d bytes\n", total_recv);
+    printf("Full response:\n%s\n", get_result);
+    
+    // ===== 4. 验证 =====
+    // 去掉末尾的 \r\n
+    int len = strlen(get_result);
+    if (len >= 2 && get_result[len-2] == '\r' && get_result[len-1] == '\n') {
+        get_result[len-2] = '\0';
+    }
+
+    if (strcmp(get_result, value) == 0) {
+        printf("PASS\n");
+    } else {
+        printf("FAILED\n");
+
+    }
+    printf("Expected len: %d, Received len: %d\n", 
+        (int)strlen(value), (int)strlen(get_result));
+    free(value);
+    free(cmd);
+    free(get_result);
+}
+
+
 // testcase 192.168.137.128 2000
 int main(int argc, char *argv[]) {
 
@@ -650,11 +929,15 @@ int main(int argc, char *argv[]) {
     } else if (mode == 4) {
         skiptable_testcase(connfd); // 正常
 
-    // 插入量测试  
+    // 单条发送的命令测试
     } else if (mode == 11) {
         rbtree_testcase_3w_0_mix(connfd);   // 正常 QPS:5000
     } else if (mode == 12) {
         skiptable_testcase_3w_0_mix(connfd);    // 正常 QPS:4700
+    } else if (mode == 13) {
+        array_testcase_3w_0_mix(connfd);
+    } else if (mode == 14) {
+        hash_testcase_3w_0_mix(connfd);
     
 // 批数据测试      跳表         红黑树          哈希        数组
     } else if (mode == 21 || mode == 22 || mode == 23 || mode == 24) {    
@@ -664,8 +947,16 @@ int main(int argc, char *argv[]) {
     else if (mode == 31) {    // echo 收发完整性测试
         echo_test(connfd);
     }
-    else if (mode == 41) {    // 测试大长度kv通过性
-        large_value_test(connfd);
+    
+    // 测试超长kv通过性
+    else if (mode == 41) {    
+        array_large_value_test(connfd);
+    } else if (mode == 42) {   
+        hash_large_value_test(connfd);
+    } else if (mode == 43) {    
+        rbtree_large_value_test(connfd);
+    } else if (mode == 44) {   
+        skiptable_large_value_test(connfd);
     }
 
     

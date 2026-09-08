@@ -5,7 +5,6 @@
 
 kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
 
-// 初始化
 int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     if (!ctx) return -1;
     ctx->cmd_buffer_cap = 4096;
@@ -32,7 +31,6 @@ int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     return 0;
 }
 
-// 释放
 void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
     if (!ctx) return;
     if (ctx->cmd_buffer) {
@@ -54,7 +52,6 @@ void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
 #endif
 }
 
-// 动态扩展缓冲区
 int kvs_ctx_expand(kvs_conn_ctx_t *ctx, int need) {
     if (ctx->cmd_buffer_cap >= need) return 0;
     
@@ -68,7 +65,6 @@ int kvs_ctx_expand(kvs_conn_ctx_t *ctx, int need) {
     return 0;
 }
 
-// 追加数据到缓冲区
 int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len) {
     if (!ctx || !data || len <= 0) return -1;
     
@@ -83,7 +79,6 @@ int kvs_ctx_append(kvs_conn_ctx_t *ctx, const char *data, int len) {
     return 0;
 }
 
-// 移除已处理的数据
 void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
     if (!ctx || consumed <= 0) return;
     if (consumed >= ctx->cmd_buffer_len) {
