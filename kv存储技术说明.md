@@ -688,7 +688,7 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
 
 ## 3 内存碎片管理
 
-3.1 
+### 3.1 碎片存在的原因
 
 内存碎片会存在内部碎片和外部碎片
 
@@ -698,7 +698,7 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
 
 
 
-内存池的设计思路：
+### 3.2 内存池的设计思路：
 
         将内存拆分为一个一个chunk块，然后用链表连接起来。然后在每个块的前8个字节用来存储下一个空闲块的地址。（注意这8个字节不算入可用空间）
 
@@ -706,7 +706,7 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
 
 
 
-问题：
+**问题：**
 
 1、为什么使用8个字节？
 
@@ -722,7 +722,7 @@ nodes[3]: → node4 → node5 → node6 → NULL  ← 桶3的链表（冲突）
 
 
 
-**内存池设计**
+### 3.3 内存池代码实现
 
 
 
@@ -744,7 +744,9 @@ typedef struct mempool_s{
 
 sizeof(void *)：表示内存块在空闲的时候，需要用前8个字节来记录下一个空闲块在哪。
 
-假设要创建5个块，每个块能用100字节：
+
+
+**假设要创建5个块，每个块能用100字节：**
 
 第一步，计算大小
 
@@ -760,6 +762,8 @@ malloc 后内存布局：
      ↑           ↑
    pool      pool->data 指向这里
 ```
+
+
 
 第二步，初始化链表
 
@@ -789,51 +793,41 @@ free_list → 块2 → 块1 → 块0 → NULL
 
 
 
-分配块过程：
+第三步，分配块malloc
 
-1 取出链表第一个块
+1 检查pool是否有效，计算用户可用容量
 
-2 读取块的前8字节， 得到下一个空闲块
+2 小对象继续，大对象用malloc
 
-3 减少空闲块数量
+3 从空闲表，取出链表第一个块
 
-4 返回用户可用的地址（跳过前8字节）
+4 读取块的前8字节， 得到下一个空闲块
 
-```c
-
-```
+5 返回用户可用的地址（跳过前8字节）
 
 
 
+第四步，释放块
+
+1 计算块起始地址：block = (char*)ptr - sizeof(void*)
+
+2 判断 ptr 是否在池内：在池内 → 放回空闲链表 ： 不在池内 → 直接free
+
+3 放回空闲链表 (头插法)：// 块指向旧链表头 -> 块成为新链表头
 
 
-## 4 数据从机备份
 
-### 全量同步流程
 
-1. **主节点收到 SYNC** → 执行 `save_snapshots()`
 
-2. **备份快照文件**（防止传输时被修改）→ 复制到临时文件
+## 4 批处理
 
-3. **分批传输**（大文件分块）→ 使用非阻塞IO
+实现思路：
 
-4. **从节点备份旧数据** → 备份 `data/` 目录
+<img src="file:///U:/kvs_lhy/screen/32badd17-31a1-48a8-b9f8-2eaae02585d4.png" title="" alt="32badd17-31a1-48a8-b9f8-2eaae02585d4" style="zoom:50%;"><img src="file:///U:/kvs_lhy/screen/e71cda89-0188-4642-a99a-c56fcd1b0f0c.png" title="" alt="e71cda89-0188-4642-a99a-c56fcd1b0f0c" style="zoom:50%;">
 
-5. **接收快照** → 解压/写入 `data/` 目录
+        主要做法是，输入端命令需要有\n结尾，作为识别符。底层网络回调接收批量数据后，kvs业务层把传入的数据直接append进一块内存缓冲区cmd_buf，然后循环处理缓冲区中的数据。包括查找\n符号分割cmd，接着把解析到的命令存入cmd_temp_buf这个临时缓冲区。如果有完整命令，就调用协议解析处理。如果没有，就等下一次触发接收。cmd_buf用于累计所有数据，cmd_temp_buf用于累计单条命令，处理完后立即释放。
 
-6. **加载快照** → 重新加载数据
-
-### 增量同步流程
-
-1. **每次写操作**（SET/MOD/DEL）→ 写入 AOF
-
-2. **同时发送命令**到从节点 → 从节点执行相同操作
-   
-   
-   
-   
-
-## 5 批处理问题（📌）
+        如果遇到长命令，if (!line_end) break;则说明没有检测到完整行，然后计算命令长度int cmd_len = line_end - line_start + 1，把数据复制到cmd_temp_buf，最后退出循环，下一次接着用cmd_temp_buf中的数据。
 
 9-4号流程2点解决该问题，因为服务端和客户端的LINUX内核wmem都是1024到2048，所以当客户端一次send大批量数据到server会出现分包发送的情况，大量数据还没到达服务端，在客户端的内核发送缓冲区等待。服务端处理完数据并把响应回发，由于客户端send是阻塞的，所以还没到接收流程。服务端的回发响应就卡在发送缓冲区。当发送缓冲区满了，就无法继续消费客户端发来的数据了，因为阻塞窗口长度变为0，会停止接收数据。
 
@@ -844,16 +838,194 @@ free_list → 块2 → 块1 → 块0 → NULL
 属于大幅提升了写入性能
 
 ```bash
-lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 21
-skiptable_batch_1500 -- > time used: 58, qps: 51724
-PASS
-lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 22
-skiptable_batch_1500 -- > time used: 101, qps: 29702
-PASS
-lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 23
-skiptable_batch_1500 -- > time used: 149, qps: 20134
-PASS
-lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 24
-skiptable_batch_1500 -- > time used: 65, qps: 46153
 
+    lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 21
+    skiptable_batch_1500 -- > time used: 58, qps: 51724
+    PASS
+    lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 22
+    skiptable_batch_1500 -- > time used: 101, qps: 29702
+    PASS
+    lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 23
+    skiptable_batch_1500 -- > time used: 149, qps: 20134
+    PASS
+    lhy@ubuntu:~/share/kvs_lhy$ ./testcase 192.168.137.128 2000 24
+    skiptable_batch_1500 -- > time used: 65, qps: 46153
 ```
+
+
+
+## 5 主从备份
+
+```c
+┌─────────────────────────────────────────────────────────────────┐
+│                      主从备份架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────┐    TCP长连接    ┌────────────────┐│
+│  │      主节点 (Master)    │◄───────────────►│  从节点 (Slave) ││
+│  │                         │                  │                ││
+│  │  • 处理读写请求         │   ① SYNC命令    │  • 只读        ││
+│  │  • 写入AOF文件          │   ② 快照文件    │  • 接收增量    ││
+│  │  • 检测AOF变化          │   ③ AOF增量     │  • 执行AOF     ││
+│  │  • 发送增量数据         │   ④ PING/PONG   │  • 心跳维持    ││
+│  └─────────────────────────┘                  └────────────────┘│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 全量备份
+
+1. **从节点发SYNC，主节点收到** → 执行 `save_snapshots()`清空aof并回应ok
+
+2. **主节点发送snap**，发完会有END\n标志
+
+3. 主节点进入增量备份模式--启动检测线程pthread
+
+4. 从节点清空aof，接收snap，并写入data
+
+5. 从节点启动接收线程
+
+### 增量备份
+
+1. 全量备份结束后，两者间维护TCP长连接
+
+2. PING/PONG心跳维持
+
+3. 主机有aof写入，则同步到从机
+   
+   
+
+#### 1. 主节点检测线程 (`aof_master_check_thread`)
+
+```c
+void* aof_master_check_thread(void* arg) {
+    while (g_aof_ctx.is_active && g_aof_ctx.fd > 0) {
+        sleep(5);  // 每5秒检查一次
+
+        // 1. 发送心跳 PING
+        safe_send(g_aof_ctx.fd, "PING\n", 5);
+
+        // 2. 检查4个AOF文件
+        for (i = 0; i < 4; i++) {
+            struct stat st;
+            stat(aof_files[i], &st);
+
+            // 文件变大 → 有新增内容
+            if (st.st_size > g_aof_ctx.last_size[i]) {
+                // 读取增量内容
+                fseek(fp, g_aof_ctx.last_size[i], SEEK_SET);
+                while (getline(&line, &line_len, fp) > 0) {
+                    // 发送到从节点
+                    safe_send(g_aof_ctx.fd, line, read);
+                }
+                g_aof_ctx.last_size[i] = st.st_size;
+            }
+        }
+    }
+}
+```
+
+**核心逻辑**：
+
+1. 使用 `stat()` 获取文件大小
+
+2. 比较当前大小和上次记录的大小
+
+3. 如果有增长，从上次位置读取新增内容
+
+4. 发送给从节点
+
+#### 2. 从节点接收线程 (`aof_slave_recv_thread`)
+
+```c
+void* aof_slave_recv_thread(void* arg) {
+    while (ctx->is_active && fd > 0) {
+        // 1. 接收数据
+        n = recv(fd, buffer, sizeof(buffer)-1, 0);
+
+        // 2. 更新心跳时间
+        ctx->last_heartbeat = time(NULL);
+
+        // 3. 处理 PING → 回复 PONG
+        if (strncmp(buffer, "PING", 4) == 0) {
+            safe_send(fd, "PONG\n", 5);
+            continue;
+        }
+
+        // 4. 按行解析并执行 AOF 命令
+        while ((next = strchr(line, '\n'))) {
+            *next = '\0';
+            sscanf(line, "%s %s %s", cmd, key, val);
+            kvs_filter_protocol(-1, tokens, cnt, NULL);
+        }
+    }
+}
+```
+
+
+
+### 心跳实现
+
+```c
+┌─────────────────────────────────────────────────────────────────┐
+│                      心跳机制原理                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  主节点 (Master)                    从节点 (Slave)             │
+│      |                                  |                       │
+│      | ① 每5秒发送 "PING\n"            |                       │
+│      |--------------------------------->|                       │
+│      |                                  | ② 收到 PING          │
+│      |                                  | ③ 回复 "PONG\n"      │
+│      |<---------------------------------|                       │
+│      | ④ 收到 PONG，连接正常           | ④ 收到 PONG，连接正常│
+│      |                                  |                       │
+│      | ⑤ 如果发送失败 → 断开连接        | ⑤ 如果 recv 返回0   │
+│      |                                  |    → 断开连接        │
+│      |                                  |                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+
+
+### 数据传输
+
+#### 全量同步数据传输
+
+stat获取文件信息后，发送文件名和大小
+
+接着分块发送文件内容，每次fread读取1KB的数据并发送，循环发完
+
+
+
+增量同步数据传输
+
+主节点调用线程aof_master_check_thread，每5s检测一次。if (st.st_size > g_aof_ctx.last_size[i])判断当前文件大小后最后一次记录大小，如果增大，就用fseek跳到上次读取的位置，接着逐行读取新增的内容，并发送。发完后更新记录的大小。
+
+从节点调用线程aof_slave_recv_thread，并设置一个缓冲区accum，然后循环接收数据，在这期间会接收心跳数据并回复。然后解析并执行AOF命令。如果有不完整的数据就保存到accum中。
+
+
+
+## 6 任意字符大小
+
+#### 1. 内存池分配函数 (`kvs_mempool_alloc`)
+
+大数据 → 自动降级到 malloc
+
+* 小数据（≤ 248 字节）→ 从内存池分配（快）
+
+* 大数据（> 248 字节）→ 自动降级到 `malloc`（灵活）
+  
+  
+
+#### 2. 数据结构层都使用指针，而不是固定数组
+
+
+
+### 3.传输层协议处理无长度限制
+
+主从同步的协议解析是动态分配的：aof_slave_exec_line
+
+
+
+批处理中针对cmd_buf和resp_buf是动态扩容的：kvs_ctx_expand

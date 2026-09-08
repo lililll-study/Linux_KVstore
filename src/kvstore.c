@@ -96,13 +96,13 @@ int kvs_split_token(char *msg, char *tokens[]) {
     if (msg == NULL || tokens == NULL)return -1;
     int idx = 0;
     char *token = strtok(msg, " ");
-    printf("debug start\n");
+    // printf("debug start\n");
     while (token != NULL) {
-        printf("idx: %d, %s\n", idx, token);
+        // printf("idx: %d, %s\n", idx, token);
         tokens[idx ++] = token;
         token = strtok(NULL, " ");
     }
-    printf("debug done\n");
+    // printf("debug done\n");
     return idx;
 
 }
@@ -136,7 +136,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
 
     }
-    // single_resp[0] = '\0';
 
 
     int cmd = KVS_CMD_START;

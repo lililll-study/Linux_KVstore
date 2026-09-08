@@ -204,7 +204,7 @@ int recv_cb(int fd) {
         conn_list[fd].rbuffer[data_len] = '\0';
     }
     conn_list[fd].rlength = data_len;
-    printf("recv buffer: %s\n", conn_list[fd].rbuffer);
+    // printf("recv buffer: %s\n", conn_list[fd].rbuffer);
 
 #if 0 // echo
     conn_list[fd].wlength = conn_list[fd].rlength;
