@@ -286,6 +286,9 @@ void dest_mempools(void);
 
 #define MAX_CONN 1024
 
+
+
+
 typedef struct kvs_conn_ctx {
 	char *cmd_buffer;      // 命令积累缓冲区
     int cmd_buffer_len;    // 当前有效数据长度
@@ -302,6 +305,13 @@ typedef struct kvs_conn_ctx {
     int send_pending;       // 1: 有待发送数据, 0: 无
 
 #endif
+
+    int resp_state;     // RESP解析状态
+    int resp_cmd_num;   // RESP头表示cmd的数量
+    int resp_cmd_idx;   // 当前准备处理的cmd索引
+
+    int resp_scmd_unit_num; // 单条命令的元素数量
+    int resp_scmd_unit_idx; // 单条命令的元素索引
 
 } kvs_conn_ctx_t;
 
