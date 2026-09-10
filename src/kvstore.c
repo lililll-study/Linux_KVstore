@@ -763,14 +763,14 @@ int kvs_protocol(int fd, char *msg, int length, char *response) {
         kvs_ctx_init(ctx);
     }
     
-    // ===== 追加新数据到缓冲区 =====
+    // 1. 追加数据到 cmd_buffer
     kvs_ctx_append(ctx, msg, length);
     // printf("debug 0。0:\n");
 #if ENABLE_REPBUF
-    // 处理命令，响应写入 resp_buffer
+    // 2. RESP 解析 + 执行命令
     kvs_ctx_process(fd, ctx, NULL, 0);
     // printf("debug 0。1:\n");
-    // 不在这里触发 EPOLLOUT，等 recv_cb 触发
+
     return 0;
 #else
 

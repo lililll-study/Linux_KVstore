@@ -313,6 +313,10 @@ typedef struct kvs_conn_ctx {
     int resp_scmd_unit_num; // 单条命令的元素数量
     int resp_scmd_unit_idx; // 单条命令的元素索引
 
+    int resp_token_len; //token的字节数
+    char *resp_temp_buffer; // 用于存储解析好的cmd token的临时缓冲区
+    int resp_temp_buffer_cap;   // 临时token缓冲区的容量
+
 } kvs_conn_ctx_t;
 
 extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
