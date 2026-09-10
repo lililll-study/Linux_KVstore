@@ -120,8 +120,6 @@ void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
 
 
 
-
-
 /*
 // 解析器收到的数据
 *2\r\n                          // ← 外层数组，2个元素
@@ -137,10 +135,10 @@ void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
  * @param input: 
  * @param output: 
  */
-int resp_parse_cmd(char *msg, char *tokens[]) {
+// int resp_parse_cmd(char *msg, char *tokens[]) {
 
 
-}
+// }
 
 /**
  * 解析 RESP 协议中的一行：*N\r\n 或 $N\r\n
@@ -260,15 +258,18 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
     char *data = ctx->cmd_buffer;           // 数据的起始位置
     int remain = ctx->cmd_buffer_len;  // 未处理的数据长度
     int processed_data = 0;                 // 已处理的数据长度
-    
+    printf("[DEBUG] kvs_ctx_process: cmd_buffer_len=%d, data='%.*s'\n", 
+       ctx->cmd_buffer_len, ctx->cmd_buffer_len, ctx->cmd_buffer);
+
     while (processed_data < remain) {   // 只要已经处理的字数小于缓冲区数量，就循环处理
-        
+
 #if 1
         char *p = data + processed_data;    // 当前未处理的数据位置
         int left = remain - processed_data; // 当前剩余没处理的数据
 
         // 1. 检测开头*xxx\r\n，把总cmd数量拿到，此时正在识别开头
         if (ctx->resp_state == RESP_TOTAL_HEAD) {
+            printf("debug RESP_TOTAL_HEAD\n");
             // 2. 如果没检测到直接break，说明数据不够，等更多数据再检测（防止分包粘包问题）
             if (left < 4) break;
             if (p[0] != '*') {//如果起始不是*说明数据错误
@@ -287,7 +288,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
 
             // 如果没有cmd长度，报错并停止循环
             if (num_len == 0) {
-                printf("[RESP1] ERROR: cmd_num is null");
+                printf("[RESP1] ERROR: cmd_num is null\n");
                 break;
             }
 
@@ -305,7 +306,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             cmd_num_buf[num_len] = '\0'; // 确保字符串以结束符结尾
             ctx->resp_cmd_num = atoi(cmd_num_buf);// 把头值存入cmd_num
 
-
+            // printf("debug resp_cmd_num: %d\n", ctx->resp_cmd_num);
             // 并更新已处理内容
             p += 2; //跳过\r\n
             processed_data = p - data; // 处理过的数据
@@ -353,7 +354,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             cmd_num_buf[num_len] = '\0'; // 确保字符串以结束符结尾
             ctx->resp_scmd_unit_num = atoi(cmd_num_buf);// 把头值存入resp_sgl_cmd_unit_count
             ctx->resp_scmd_unit_idx = 0;    // 准备处理第一个元素
-
+            printf("debug resp_scmd_unit_num: %d\n", ctx->resp_scmd_unit_num);
             // 跳过 \r\n
             p += 2;
             processed_data = p - data;
@@ -479,8 +480,8 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                 ctx->resp_state = RESP_TOKEN;
             }
         }
-}
-
+    }
+printf("[DEBUG] kvs_ctx_process: processed_data=%d\n", processed_data);
         // 8. 此处引入状态机，如果检测完开头，就把状态机置位，如果数据不够等下一次数据来了，直接检测不同状态，例如head，cmd，token
         //      这样即使token因为分包问题没收完退出循环后，下一次接着token解析的循环进行处理，不影响头和cmd个数的解析。
         

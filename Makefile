@@ -12,7 +12,7 @@ SRCS = $(SRC_DIR)/kvstore.c \
        $(SRC_DIR)/kvs_hash.c \
        $(SRC_DIR)/kvs_skiptable.c \
        $(SRC_DIR)/kvs_persist.c \
-	   $(SRC_DIR)/kvs_batch.c \
+	   $(SRC_DIR)/resp.c \
 	   $(SRC_DIR)/kvs_mempool.c \
        $(SRC_DIR)/kvs_sync.c
 

@@ -904,6 +904,28 @@ void skiptable_large_value_test(int connfd) {
 }
 
 
+void test_resp_batch(int connfd) {
+    // 发送 RESP 批量命令
+    const char *cmd = 
+        "*2\r\n"
+        "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+        "*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
+    
+    printf("Sending: %s\n", cmd);
+    send(connfd, cmd, strlen(cmd), 0);
+    
+    // 接收响应
+    char result[1024] = {0};
+    int n = recv(connfd, result, sizeof(result) - 1, 0);
+    if (n > 0) {
+        result[n] = '\0';
+        printf("Response: %s\n", result);
+    } else {
+        printf("recv failed\n");
+    }
+}
+
+
 // testcase 192.168.137.128 2000
 int main(int argc, char *argv[]) {
 
@@ -957,6 +979,9 @@ int main(int argc, char *argv[]) {
         rbtree_large_value_test(connfd);
     } else if (mode == 44) {   
         skiptable_large_value_test(connfd);
+    }
+    else if (mode == 51) {   
+        test_resp_batch(connfd);
     }
 
     

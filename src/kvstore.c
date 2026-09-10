@@ -98,7 +98,7 @@ int kvs_split_token(char *msg, char *tokens[]) {
     char *token = strtok(msg, " ");
     // printf("debug start\n");
     while (token != NULL) {
-        // printf("idx: %d, %s\n", idx, token);
+        printf("idx: %d, %s\n", idx, token);
         tokens[idx ++] = token;
         token = strtok(NULL, " ");
     }
