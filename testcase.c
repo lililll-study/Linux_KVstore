@@ -907,9 +907,16 @@ void skiptable_large_value_test(int connfd) {
 void test_resp_batch(int connfd) {
     // 发送 RESP 批量命令
     const char *cmd = 
-        "*2\r\n"
-        "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
-        "*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
+        "*9\r\n"
+        "*3\r\n$3\r\nSET\r\n$6\r\nlhyyyy\r\n$9\r\n123456789\r\n"
+        "*2\r\n$3\r\nGET\r\n$6\r\nlhyyyy\r\n"
+        "*3\r\n$3\r\nMOD\r\n$6\r\nlhyyyy\r\n$8\r\nLILILILI\r\n"
+        "*2\r\n$3\r\nGET\r\n$6\r\nlhyyyy\r\n"
+        "*2\r\n$5\r\nEXIST\r\n$6\r\nlhyyyy\r\n"
+        "*2\r\n$3\r\nDEL\r\n$6\r\nlhyyyy\r\n"
+        "*2\r\n$3\r\nGET\r\n$6\r\nlhyyyy\r\n"
+        "*3\r\n$3\r\nMOD\r\n$6\r\nlhyyyy\r\n$9\r\nLILILILI2\r\n"
+        "*2\r\n$5\r\nEXIST\r\n$6\r\nlhyyyy\r\n";
     
     printf("Sending: %s\n", cmd);
     send(connfd, cmd, strlen(cmd), 0);

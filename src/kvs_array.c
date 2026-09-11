@@ -134,20 +134,19 @@ int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
     int i = 0;
     // 先查找 key 是否已存在（更新）
     for (i = 0; i < inst->total; i++) {
-        if (inst->table[i].key != NULL && 
-            strcmp(inst->table[i].key, key) == 0) {
-            // 更新 value
-#if ENABLE_MEMPOOL
-            kvs_mempool_free(array_string_pool, inst->table[i].value);
-            char *kvalue = kvs_mempool_alloc(array_string_pool, strlen(value) + 1);
-#else
-            kvs_free(inst->table[i].value);
-            char *kvalue = kvs_malloc(strlen(value) + 1);
-#endif
-            if (!kvalue) return -2;
-            strcpy(kvalue, value);
-            inst->table[i].value = kvalue;
-            return 0;
+        if (inst->table[i].key != NULL && strcmp(inst->table[i].key, key) == 0) {
+//             // 更新 value
+// #if ENABLE_MEMPOOL
+//             kvs_mempool_free(array_string_pool, inst->table[i].value);
+//             char *kvalue = kvs_mempool_alloc(array_string_pool, strlen(value) + 1);
+// #else
+//             kvs_free(inst->table[i].value);
+//             char *kvalue = kvs_malloc(strlen(value) + 1);
+// #endif
+//             if (!kvalue) return -2;
+//             strcpy(kvalue, value);
+//             inst->table[i].value = kvalue;
+            return 1;
         }
     }
     
