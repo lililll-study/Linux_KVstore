@@ -525,92 +525,82 @@ int recv_file_from_master(int fd, const char *save_dir) {
 int handle_sync_request(int fd) {
     printf("Handling SYNC request on fd %d\n", fd);
 
-// 1. 发送 OK（循环发送，处理 EAGAIN）
-#if ENABLE_NOBLOCK
-    const char *ok = "OK\n";
-    size_t ok_len = 3;
-    size_t sent = 0;
-    while (sent < ok_len) {
-        int n = send(fd, ok + sent, ok_len - sent, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            perror("send OK");
-            return -1;
-        }
-        sent += n;
-    }
-#else
+// 1. 发送 OK
+
     if (send(fd, "OK\n", 3, 0) < 0) {
         perror("send OK");
         return -1;
     }
-#endif
 
     // 2. 保存快照
-    printf("Saving snapshots...\n");
-    save_snapshots();
-
-    // 3. 清空 AOF（先清空，再发送，避免发送期间新增数据）
-    int i = 0;
-    for (i = 0; i < 4; i++) {
-        FILE *fp = fopen(aof_files[i], "w");
-        if (fp) fclose(fp);
+    if (g_config.snap_enable) {
+        printf("Saving snapshots...\n");
+        save_snapshots();
+        // 3. 清空 AOF（先清空，再发送，避免发送期间新增数据）
+        int i = 0;
+        for (i = 0; i < 4; i++) {
+            FILE *fp = fopen(aof_files[i], "w");
+            if (fp) fclose(fp);
+        }
+        printf("AOF cleared\n");
+        // 3. 发送快照文件
+        send_all_files(fd);
+        printf("SYNC completed for fd %d\n", fd);
     }
-    printf("AOF cleared\n");
-    // 3. 发送快照文件
-    send_all_files(fd);
-    printf("SYNC completed for fd %d\n", fd);
-
+    
 
 #if ENABLE_AOF_SYNC
-    printf("[AOF Sync] Switching to sync mode...\n");
-    // 初始化上下文
-    init_aof_sync_ctx();
-    g_aof_ctx.fd = fd;
-    g_aof_ctx.is_active = 1;
-    g_aof_ctx.last_heartbeat = time(NULL);
-
-    // 记录当前 AOF 文件大小
-    for (i = 0; i < 4; i++) {
-        struct stat st;
-        if (stat(aof_files[i], &st) == 0) {
-            g_aof_ctx.last_size[i] = st.st_size;
-        } else {
-            g_aof_ctx.last_size[i] = 0;
+    if (g_config.aof_enable) {
+        printf("[AOF Sync] Switching to sync mode...\n");
+        // 初始化上下文
+        init_aof_sync_ctx();
+        g_aof_ctx.fd = fd;
+        g_aof_ctx.is_active = 1;
+        g_aof_ctx.last_heartbeat = time(NULL);
+        int i = 0;
+        // 记录当前 AOF 文件大小
+        for (i = 0; i < 4; i++) {
+            struct stat st;
+            if (stat(aof_files[i], &st) == 0) {
+                g_aof_ctx.last_size[i] = st.st_size;
+            } else {
+                g_aof_ctx.last_size[i] = 0;
+            }
+            // printf("[AOF Sync] %s: %ld bytes\n", aof_files[i], g_aof_ctx.last_size[i]);
         }
-        // printf("[AOF Sync] %s: %ld bytes\n", aof_files[i], g_aof_ctx.last_size[i]);
-    }
-
-    // 发送确认
+        // 发送确认
     safe_send(fd, "AOF_SYNC_OK\n", 12);
 
-    // 启动主节点检测线程（只启动一次）
-    static int check_thread_started = 0;
-    if (!check_thread_started) {
-        pthread_create(&g_aof_ctx.check_thread, NULL, aof_master_check_thread, NULL);
-        pthread_detach(g_aof_ctx.check_thread);
-        check_thread_started = 1;
-        printf("[AOF Sync] Master check thread started\n");
+        // 启动主节点检测线程（只启动一次）
+        static int check_thread_started = 0;
+        if (!check_thread_started) {
+            pthread_create(&g_aof_ctx.check_thread, NULL, aof_master_check_thread, NULL);
+            pthread_detach(g_aof_ctx.check_thread);
+            check_thread_started = 1;
+            printf("[AOF Sync] Master check thread started\n");
+        }
+    }  else {
+        // 仅snap：发送结束标记，关闭连接
+        safe_send(fd, "SYNC_DONE\n", 10);
+        printf("Full sync only mode: connection closed\n");
+        close(fd);
     }
-    return 0;
+    return 0;    
 #endif
 }
 
 // ============ 从节点：发起 SYNC ============
 // 全量同步和增量同步，都从从节点发送sync开始
 int sync_from_master(const char *master_ip, int port) {
-    
+
     printf("Connecting to master %s:%d\n", master_ip, port);
-    
+
     // 连接主节点（作为普通客户端）
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
         return -1;
     }
-    
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -640,100 +630,82 @@ int sync_from_master(const char *master_ip, int port) {
         return -1;
     }
     resp[n] = '\0';
-    
     if (strcmp(resp, "OK\n") != 0) {
         printf("Sync rejected: %s\n", resp);
         close(fd);
         return -1;
     }
+
+    // 如果开启了snap
+    if (g_config.snap_enable) {
+        printf("Receiving files...\n");
+        // 接收所有文件
+        while (1) {
+            int ret = recv_file_from_master(fd, "data");
+            if (ret != 0) {
+                // 检查是否是 END 标记
+                char buf[16];
+                n = recv(fd, buf, sizeof(buf), 0);
+                if (n > 0 && strcmp(buf, "END\n") == 0) {
+                    printf("Received END marker\n");
+                    break;
+                }
+            }
+        }
+        // 加载快照
+        printf("Reloading snapshots from master...\n");
+        load_snapshots();
+        // ===== 清空从机 AOF =====
+        int i;
+        for (i = 0; i < 4; i++) {
+            FILE *fp = fopen(aof_files[i], "w");
+            if (fp) fclose(fp);
+        }
+        printf("Slave AOF cleared\n");
+    }
     
-    printf("Receiving files...\n");
 
-#if ENABLE_NOBLOCK
-// 接收所有文件
-    int file_count = 0;
-    while (1) {
-        int ret = recv_file_from_master(fd, "data");
-        if (ret == 0) {
-            file_count++;
-            printf("  Received file #%d\n", file_count);
-            continue;
-        } else if (ret == -2) {
-            // 数据还没到，继续等待
-            usleep(10000);
-            continue;
-        }
-        
-        // ret == -1，检查是否是 END
-        char end_buf[16];
-        n = recv(fd, end_buf, sizeof(end_buf)-1, 0);
-        if (n > 0) {
-            end_buf[n] = '\0';
-            if (strcmp(end_buf, "END\n") == 0) {
-                printf("Received END marker (total %d files)\n", file_count);
-                break;
-            }
-        }
-        break;
-    }
-#else
-    // 接收所有文件
-    while (1) {
-        int ret = recv_file_from_master(fd, "data");
-        if (ret != 0) {
-            // 检查是否是 END 标记
-            char buf[16];
-            n = recv(fd, buf, sizeof(buf), 0);
-            if (n > 0 && strcmp(buf, "END\n") == 0) {
-                printf("Received END marker\n");
-                break;
-            }
-        }
-    }
-#endif
-
-
-    // 加载快照
-    printf("Reloading snapshots from master...\n");
-    load_snapshots();
-
-    // ===== 清空从机 AOF =====
-    int i;
-    for (i = 0; i < 4; i++) {
-        FILE *fp = fopen(aof_files[i], "w");
-        if (fp) fclose(fp);
-    }
-    printf("Slave AOF cleared\n");
 #if ENABLE_AOF_SYNC
     // ===== 关键改动：不关闭连接，等待 AOF 增量同步 =====
     // 接收 AOF_SYNC_OK
-    char ack[32];
-    n = recv(fd, ack, sizeof(ack)-1, 0);
-    if (n <= 0) {
-        printf("[AOF Sync] Failed to receive AOF sync ack\n");
+    if(g_config.aof_enable) {
+        char ack[32];
+        n = recv(fd, ack, sizeof(ack)-1, 0);
+        if (n <= 0) {
+            printf("[AOF Sync] Failed to receive AOF sync ack\n");
+            close(fd);
+            return -1;
+        }
+        ack[n] = '\0';
+        
+        if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
+            printf("[AOF Sync] AOF sync rejected: %s\n", ack);
+            close(fd);
+            return -1;
+        }
+        
+        printf("[AOF Sync] AOF sync started!\n");
+        // 保存连接
+        init_aof_sync_ctx();
+        g_aof_ctx.fd = fd;
+        g_aof_ctx.is_active = 1;
+        g_aof_ctx.last_heartbeat = time(NULL);
+        
+        // 启动从节点接收线程
+        pthread_create(&g_aof_ctx.recv_thread, NULL, aof_slave_recv_thread, &g_aof_ctx);
+        pthread_detach(g_aof_ctx.recv_thread);
+        
+        printf("[AOF Sync] Receive thread started\n");
+    } else {
+        // 仅全量模式
+        char done[16];
+        n = recv(fd, done, sizeof(done)-1, 0);
+        if (n > 0 && strcmp(done, "SYNC_DONE\n") == 0) {
+            printf("Full sync completed, connection closed\n");
+        }
         close(fd);
-        return -1;
     }
-    ack[n] = '\0';
-    
-    if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
-        printf("[AOF Sync] AOF sync rejected: %s\n", ack);
-        close(fd);
-        return -1;
-    }
-    
-    printf("[AOF Sync] AOF sync started!\n");
-    // 保存连接
-    init_aof_sync_ctx();
-    g_aof_ctx.fd = fd;
-    g_aof_ctx.is_active = 1;
-    g_aof_ctx.last_heartbeat = time(NULL);
-    
-    // 启动从节点接收线程
-    pthread_create(&g_aof_ctx.recv_thread, NULL, aof_slave_recv_thread, &g_aof_ctx);
-    pthread_detach(g_aof_ctx.recv_thread);
-    
-    printf("[AOF Sync] Receive thread started\n");
+
     
     return 0;
 #else

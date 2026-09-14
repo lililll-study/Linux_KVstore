@@ -1,5 +1,4 @@
-# 编译生成的可执行文件
-kvstore
+
 
 # 编译中间文件
 *.o
@@ -8,8 +7,6 @@ kvstore
 *.dll
 *.lib
 
-# build 目录
-build/
 
 # data 目录（数据文件）
 

@@ -966,29 +966,26 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
- //   ./kvstore 2000 --master 
-    if (argc < 2) {
-        printf("Usage: ./kvstore <port> [--master|--slave]\n");
+ //  ./kvstore --config master.conf
+    const char *config_file = NULL;
+    int i = 0;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            config_file = argv[++i];
+        }
+    }
+    if (!config_file) {
+        printf("Usage: ./kvstore --config <config_file>\n");
         return -1;
     }
-    int port = atoi(argv[1]);
-    g_is_master = 1;  // 默认主节点
-
-    // 判断备份角色
-    if (argc >= 3) {
-        if (strcmp(argv[2], "--slave") == 0) { // 从节点
-            g_is_master = 0;
-            printf("Running as SLAVE node\n");
-        } else if (strcmp(argv[2], "--master") == 0) { // 主节点
-            g_is_master = 1;
-            printf("Running as MASTER node\n");
-        } else {
-            printf("Unknown option: %s\n", argv[2]);
-            return -1;
-        }
-    } else {
-        printf("Running as MASTER node (default)\n");
+    // 加载配置
+    if (kvs_config_load(config_file) < 0) {
+        return -1;
     }
+    kvs_config_print();
+    // 设置全局角色
+    g_is_master = (g_config.role == ROLE_MASTER);
+    int port = g_config.port;
 
 #if ENABLE_PERSIST // 检查data目录是否存在
     if (check_datafile_exist()== -1) return -1;
@@ -997,16 +994,14 @@ int main(int argc, char *argv[]) {
     // 用于创建kv存储全局单例内存块global_array
     init_kvengine();
 
-    // 如果是从节点
-    if (g_is_master == 0) {
+    // 如果是从节点：创建 CLI 线程
+    if (g_config.role == ROLE_SLAVE) {
     // ===== 创建 CLI 线程 =====
         pthread_t cli_tid;
         pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
     // =========================    
     }
 
-// 功能入口函数，第二个参数为函数指针msg_handler，把kvs_protocol传入作为函数
-// 间接
 #if (NET_SELECT == NET_REACTOR)
     reactor_start(port, kvs_protocol);
 #elif (NET_SELECT == NET_NTYCO)
