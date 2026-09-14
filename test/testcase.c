@@ -907,8 +907,9 @@ void skiptable_large_value_test(int connfd) {
 void test_resp_batch(int connfd) {
     // 发送 RESP 批量命令
     const char *cmd = 
-        "*9\r\n"
+        "*10\r\n"
         "*3\r\n$3\r\nSET\r\n$6\r\nlhyyyy\r\n$9\r\n123456789\r\n"
+        "*3\r\n$3\r\nSET\r\n$6\r\nlhyyyy\r\n$10\r\n1234567891\r\n"
         "*2\r\n$3\r\nGET\r\n$6\r\nlhyyyy\r\n"
         "*3\r\n$3\r\nMOD\r\n$6\r\nlhyyyy\r\n$8\r\nLILILILI\r\n"
         "*2\r\n$3\r\nGET\r\n$6\r\nlhyyyy\r\n"

@@ -106,3 +106,42 @@ for each cmd in 外层数组:
 
 
 # 3 config配置
+
+通常情况下全量和增量只会选择一个开启，因此需要把全量同步和增量同步功能独立出来，然后通过config文件进行配置，比如说./kvstore --config master.conf启动主节点，./kvstore --config slave.conf启动从节点。
+
+
+
+主从备份：
+
+主节点
+
+```c
+# 主节点配置
+role = master
+port = 2000
+
+
+# snap快照同步
+snap.enable=true
+# 从节点一般不启动aof
+aof.enable=true
+```
+
+
+
+从节点
+
+```c
+# 从节点配置
+role=slave
+port=2001
+master_ip=192.168.137.128
+master_port=2000
+
+# snap快照同步
+snap.enable=true
+# 从节点一般不启动aof
+aof.enable=false
+```
+
+

@@ -370,8 +370,29 @@ void* aof_slave_recv_thread(void* arg);
 
 #endif
 
+/*
+======================================= 6.  配置config ======================================
+==========================================================================================
+*/
+typedef enum {
+    ROLE_MASTER = 0,
+    ROLE_SLAVE
+} kvs_role_t;
 
+typedef struct {
+    kvs_role_t role;
+    int port;
+    char master_ip[64];
+    int master_port;
 
+    int snap_enable;
+    int aof_enable;
+} kvs_config_t;
+
+extern kvs_config_t g_config;
+
+int kvs_config_load(const char *filename);
+void kvs_config_print(void);
 
 
 
