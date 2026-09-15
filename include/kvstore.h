@@ -14,6 +14,9 @@
 #include <pthread.h>   
 #include <unistd.h>    
 
+
+#define ENABLE_NEW_FUN 1
+
 #define NET_REACTOR 0
 #define NET_NTYCO 1
 #define NET_PROACTOR 2
@@ -200,6 +203,15 @@ int kvs_protocol(int fd, char *msg, int length, char *response);
 */
 #if ENABLE_PERSIST
 
+#if ENABLE_NEW_FUN
+#define SNAP_FILE "data/data_snap.snap"
+#define AOF_FILE   "data/data_aof.aof"
+int save_snapshots();
+int load_snapshots();
+// AOF
+int append_aof(const char *cmd, const char *key, const char *value);
+int replay_aof(const char *filename);
+#else
 // 快照文件路径（放在 data 目录下）
 #define SNAP_ARRAY_FILE     "data/array.snap"
 #define SNAP_RBTREE_FILE    "data/rbtree.snap"
@@ -228,6 +240,7 @@ int load_snapshot_skiptable(const char *filename);
 // AOF
 int append_aof(const char *filename, const char *cmd, const char *key, const char *value);
 int replay_aof(const char *filename);
+#endif
 #endif
 
 
