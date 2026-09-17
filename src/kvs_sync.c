@@ -26,10 +26,7 @@ static aof_sync_ctx_t g_aof_ctx = {0};
 
 // AOF 文件列表（与 kvs_persist.c 保持一致）
 static const char* aof_files[] = {
-    AOF_ARRAY_FILE,
-    AOF_RBTREE_FILE,
-    AOF_HASH_FILE,
-    AOF_SKIPTABLE_FILE
+    AOF_FILE
 };
 
 // 初始化 AOF 上下文
@@ -127,10 +124,7 @@ int send_file(int fd, const char *filepath) {
 int send_all_files(int fd) {
     int i = 0;
     const char *files[] = {
-        SNAP_ARRAY_FILE,
-        SNAP_RBTREE_FILE,
-        SNAP_HASH_FILE,
-        SNAP_SKIPTABLE_FILE,
+        SNAP_FILE,
         NULL
     };
     // 发送文件
