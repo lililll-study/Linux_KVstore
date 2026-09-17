@@ -145,6 +145,22 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         }
     }
 
+    // 解析到错误token后，应该打印错误的token信息，然后跳过这条cmd命令，继续执行后续的。
+    if (cmd >= KVS_CMD_COUNT) {
+        printf("[ERROR] unknown command token: '%s'\n", tokens[0]);
+
+        const char *err = "error: unknown command\r\n";
+        int err_len = strlen(err);
+        if (ctx != NULL) {
+            resp_buf_append(ctx, err, err_len);
+            ctx->send_pending = 1;
+        }
+        if (single_resp && !is_aof_sync) {
+            kvs_mempool_free(resp_pool, single_resp);
+        }
+
+        return -1;
+    }
     int len = 0;
     int ret = 0;
     char *key = NULL;
@@ -184,7 +200,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         len += snprintf(single_resp + len, resp_cap - len, fmt, ##__VA_ARGS__); \
     } while(0)
 
-#if 1
+
     switch (cmd) {
 #if ENABLE_ARRAY
         case KVS_CMD_SET:
@@ -424,12 +440,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
                 break;
-                // if (ret < 0) {
-                //     SAFE_APPEND("error\r\n");
-                // } else if (ret == 0) {
-                //     SAFE_APPEND("ok\r\n");
-                // }
-                // 注意：这里不回复，因为 handle_sync_request 会保持连接
         // 并且会发送 AOF_SYNC_OK 确认
             } else {
                 // 从节点：发起同步
@@ -449,280 +459,20 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 #endif
         default:
-            assert(0);
-    }
-#else
-    switch (cmd) {
-#if ENABLE_ARRAY
-        case KVS_CMD_SET:
-            ret = kvs_array_set(&global_array, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "set error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "SET", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "exist\r\n");
+            printf("[ERROR] unhandled cmd=%d, token='%s'\n", cmd, tokens[0]);
+            // 发送错误响应给客户端
+            if (ctx != NULL) {
+                const char *err = "error: unhandled command\r\n";
+                resp_buf_append(ctx, err, strlen(err));
+                ctx->send_pending = 1;
             }
-            break;
+             if (single_resp && !is_aof_sync) {
+                kvs_mempool_free(resp_pool, single_resp);
+            }
 
-        case KVS_CMD_GET:{
-            result = kvs_array_get(&global_array, key);
-            if (result == NULL) {
-                len = sprintf(single_resp, "no exist\r\n");
-            } else {
-                len = sprintf(single_resp, "%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_DEL:
-            ret = kvs_array_del(&global_array, key);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "DEL", key, NULL);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_MOD:
-            ret = kvs_array_mod(&global_array, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "MOD", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-        case KVS_CMD_EXIST:
-            ret = kvs_array_exist(&global_array, key);
-            if (ret == 0) {
-                len = sprintf(single_resp, "exist\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-#endif
-#if ENABLE_RBTREE
-        case KVS_CMD_RSET:
-            ret = kvs_rbtree_set(&global_rbtree, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "set error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RSET", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_RGET:{
-            char *result = kvs_rbtree_get(&global_rbtree, key);
-            if (result == NULL) {
-                len = sprintf(single_resp, "no exist\r\n");
-            } else {
-                len = sprintf(single_resp, "%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_RDEL:
-            ret = kvs_rbtree_del(&global_rbtree, key);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RDEL", key, NULL);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_RMOD:
-            ret = kvs_rbtree_mod(&global_rbtree, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RMOD", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-        case KVS_CMD_REXIST:
-            ret = kvs_rbtree_exist(&global_rbtree, key);
-            if (ret == 0) {
-                len = sprintf(single_resp, "exist\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-#endif
-#if ENABLE_HASH
-        case KVS_CMD_HSET:
-            ret = kvs_hash_set(&global_hash ,key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HSET", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "exist\r\n");
-            } 
-            
-            break;
-        case KVS_CMD_HGET: {
-            char *result = kvs_hash_get(&global_hash, key);
-            if (result == NULL) {
-                len = sprintf(single_resp, "no exist\r\n");
-            } else {
-                len = sprintf(single_resp, "%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_HDEL:
-            ret = kvs_hash_del(&global_hash ,key);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HDEL", key, NULL);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-        case KVS_CMD_HMOD:
-            ret = kvs_hash_mod(&global_hash ,key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HMOD", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-        case KVS_CMD_HEXIST:
-            ret = kvs_hash_exist(&global_hash ,key);
-            if (ret == 0) {
-                len = sprintf(single_resp, "exist\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-#endif
-#if ENABLE_SKIPTABLE
-        case KVS_CMD_SSET:
-            ret = kvs_skiptable_set(&global_skiptable, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "set error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_SGET:{
-            char *result = kvs_skiptable_get(&global_skiptable, key);
-            if (result == NULL) {
-                len = sprintf(single_resp, "no exist\r\n");
-            } else {
-                len = sprintf(single_resp, "%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_SDEL:
-            ret = kvs_skiptable_del(&global_skiptable, key);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SDEL", key, NULL);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_SMOD:
-            ret = kvs_skiptable_mod(&global_skiptable, key, value);
-            if (ret < 0) {
-                len = sprintf(single_resp, "error\r\n");
-            } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, value);  // 追加AOF
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-        case KVS_CMD_SEXIST:
-            ret = kvs_skiptable_exist(&global_skiptable, key);
-            if (ret == 0) {
-                len = sprintf(single_resp, "exist\r\n");
-            } else {
-                len = sprintf(single_resp, "no exist\r\n");
-            }
-            break;
-#endif
-
-#if ENABLE_PERSIST
-        case KVS_CMD_SAVE:
-            ret = save_snapshots();
-            if (ret == 0) {
-                // 清空所有 AOF 文件
-                FILE *fp = fopen(AOF_ARRAY_FILE, "w"); // w模式会清空文件内容
-                if (fp) fclose(fp);
-                fp = fopen(AOF_RBTREE_FILE, "w");
-                if (fp) fclose(fp);
-                fp = fopen(AOF_HASH_FILE, "w");
-                if (fp) fclose(fp);
-                fp = fopen(AOF_SKIPTABLE_FILE, "w");
-                if (fp) fclose(fp);
-
-                len = sprintf(single_resp, "ok\r\n");
-            } else {
-                len = sprintf(single_resp, "error\r\n");
-            }
-            break;
-#endif
-
-#if ENABLE_SYNC
-        case KVS_CMD_SYNC:
-            printf("sync now\n");
-            if (g_is_master) {
-                // 主节点：则处理同步请求
-                ret = handle_sync_request(fd);
-                if (ret < 0) {
-                    len = sprintf(single_resp, "error\r\n");
-                } else if (ret == 0) {
-                    len = sprintf(single_resp, "ok\r\n");
-                }
-            } else {
-                // 从节点：发起同步
-                if (count < 3) {
-                    len = sprintf(single_resp, "error: need master_ip, port\r\n");
-                    break;
-                }
-                char *maser_ip = tokens[1];
-                int port = atoi(tokens[2]);
-                ret = sync_from_master(maser_ip, port);
-                if (ret < 0) {
-                    len = sprintf(single_resp, "error\r\n");
-                } else if (ret == 0) {
-                    len = sprintf(single_resp, "ok\r\n");
-                }
-            }
-            break;
-#endif
-        default:
-            assert(0);
+            return -1;
     }
 
-#endif
 
 
     // printf("debug 0: 解析完成\n");
