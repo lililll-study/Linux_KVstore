@@ -488,7 +488,6 @@ void batch_test(int connfd) {
 
     // 发送批量命令并接收响应
     char result[65536] = {0};
-    int result_size = 0;
 
     gettimeofday(&tv_begin, NULL);
 #if 1
@@ -619,7 +618,6 @@ void echo_test(int connfd) {
 
 
 void array_large_value_test(int connfd) {
-    struct timeval tv_begin, tv_cur;
     char key[] = "lhy2w";
     
     // ===== 1. 构建 2048 字节的 value =====
@@ -690,7 +688,6 @@ void array_large_value_test(int connfd) {
 }
 
 void hash_large_value_test(int connfd) {
-    struct timeval tv_begin, tv_cur;
     char key[] = "lhy2w";
     
     // ===== 1. 构建 2048 字节的 value =====
@@ -761,7 +758,6 @@ void hash_large_value_test(int connfd) {
 }
 
 void rbtree_large_value_test(int connfd) {
-    struct timeval tv_begin, tv_cur;
     char key[] = "lhy2w";
     
     // ===== 1. 构建 2048 字节的 value =====
@@ -833,7 +829,6 @@ void rbtree_large_value_test(int connfd) {
 
 
 void skiptable_large_value_test(int connfd) {
-    struct timeval tv_begin, tv_cur;
     char key[] = "lhy2w";
     
     // ===== 1. 构建 2048 字节的 value =====
