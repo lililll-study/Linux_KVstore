@@ -36,8 +36,14 @@ static int parse_bool(const char *value) {
 int kvs_config_load(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
-        printf("[Config] Cannot open config file: %s\n", filename);
-        return -1;
+        // 回退：尝试 config/ 目录
+        char path[256];
+        snprintf(path, sizeof(path), "config/%s", filename);
+        fp = fopen(path, "r");
+        if (!fp) {
+            printf("Cannot open config file: %s\n", filename);
+            return -1;
+        }
     }
     
     char line[512];
