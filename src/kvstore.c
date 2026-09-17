@@ -98,7 +98,7 @@ int kvs_split_token(char *msg, char *tokens[]) {
     char *token = strtok(msg, " ");
     // printf("debug start\n");
     while (token != NULL) {
-        printf("idx: %d, %s\n", idx, token);
+        // printf("idx: %d, %s\n", idx, token);
         tokens[idx ++] = token;
         token = strtok(NULL, " ");
     }
@@ -192,7 +192,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "SET", key, value);  // 追加AOF
+                append_aof("SET", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -213,7 +213,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "DEL", key, NULL);  // 追加AOF
+                append_aof("DEL", key, NULL);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -225,7 +225,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_ARRAY_FILE, "MOD", key, value);  // 追加AOF
+                append_aof("MOD", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -246,7 +246,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RSET", key, value);  // 追加AOF
+                append_aof("RSET", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -267,7 +267,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RDEL", key, NULL);  // 追加AOF
+                append_aof("RDEL", key, NULL);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -279,7 +279,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_RBTREE_FILE, "RMOD", key, value);  // 追加AOF
+                append_aof("RMOD", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -300,7 +300,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HSET", key, value);  // 追加AOF
+                append_aof("HSET", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -321,7 +321,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HDEL", key, NULL);  // 追加AOF
+                append_aof("HDEL", key, NULL);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -332,7 +332,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_HASH_FILE, "HMOD", key, value);  // 追加AOF
+                append_aof("HMOD", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -353,7 +353,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SSET", key, value);  // 追加AOF
+                append_aof("SSET", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -374,7 +374,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SDEL", key, NULL);  // 追加AOF
+                append_aof("SDEL", key, NULL);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -386,7 +386,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof(AOF_SKIPTABLE_FILE, "SMOD", key, value);  // 追加AOF
+                append_aof("SMOD", key, value);  // 追加AOF
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -407,13 +407,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             ret = save_snapshots();
             if (ret == 0) {
                 // 清空所有 AOF 文件
-                FILE *fp = fopen(AOF_ARRAY_FILE, "w"); // w模式会清空文件内容
-                if (fp) fclose(fp);
-                fp = fopen(AOF_RBTREE_FILE, "w");
-                if (fp) fclose(fp);
-                fp = fopen(AOF_HASH_FILE, "w");
-                if (fp) fclose(fp);
-                fp = fopen(AOF_SKIPTABLE_FILE, "w");
+                FILE *fp = fopen(AOF_FILE, "w"); // w模式会清空文件内容
                 if (fp) fclose(fp);
 
                 SAFE_APPEND("ok\r\n");
@@ -845,17 +839,23 @@ printf("------------ 2. kvs_engine created ----\n");
 
 
 #if ENABLE_PERSIST
-    // 先加载快照
-    if (load_snapshots() != 0) {
-        printf("No snapshot found\n");
+    // 先加载快照（只有配置开启 snap 才加载）
+    if (g_config.snap_enable) {
+        if (load_snapshots() != 0) {
+            printf("No snapshot found\n");
+        }
+        printf("------------ 3. Snapshots loaded ---\n");
+    } else {
+        printf("------------ 3. Snapshots disabled, skip load ---\n");
     }
-    printf("------------ 3. Snapshots loaded ---\n");
-    // 再重放AOF
-    replay_aof(AOF_ARRAY_FILE);
-    replay_aof(AOF_RBTREE_FILE);
-    replay_aof(AOF_HASH_FILE);
-    replay_aof(AOF_SKIPTABLE_FILE);
-    printf("------------ 4. AOF done ---\n");
+
+    // 再重放 AOF（只有配置开启 aof 才重放）
+    if (g_config.aof_enable) {
+        replay_aof(AOF_FILE);
+        printf("------------ 4. AOF done ---\n");
+    } else {
+        printf("------------ 4. AOF disabled, skip replay ---\n");
+    }
 #endif
 
     return 0;
