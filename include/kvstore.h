@@ -330,6 +330,8 @@ typedef struct kvs_conn_ctx {
     char *resp_temp_buffer; // 用于存储解析好的cmd token的临时缓冲区
     int resp_temp_buffer_cap;   // 临时token缓冲区的容量
 
+    int resp_cmd_start;     // 当前命令起始偏移
+
 } kvs_conn_ctx_t;
 
 extern kvs_conn_ctx_t kvs_conn_ctxs[MAX_CONN];
