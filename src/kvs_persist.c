@@ -21,15 +21,19 @@ extern kvs_skiptable_t global_skiptable;
 
 /*snap快照统一调度接口*/
 typedef int (*snapshot_save_fn)(const char *filename);
-typedef int (*snapshot_load_fn)(const char *filename);
 // 定义回调函数类型
 typedef int (*kv_set_fn)(void *inst, char *key, char *value);
 
+
+int save_snapshot_array(const char *filename);
+int save_snapshot_rbtree(const char *filename);
+int save_snapshot_hash(const char *filename) ;
+int save_snapshot_skiptable(const char *filename) ;
+
+// 使用结构体+函数指针解决不同引擎独立保存和加载复杂的问题
 typedef struct engine_persist_s {
     const char *name;
-    const char *snap_file;
     snapshot_save_fn save_fn;
-    snapshot_load_fn load_fn;
 } engine_persist_t;
 
 typedef enum {
@@ -41,14 +45,78 @@ typedef enum {
 
 // 引擎配置
 static engine_persist_t engine_persist_table[] = {
-    {"array",   "data/array.snap",       save_snapshot_array,     load_snapshot_array},
-    {"rbtree",  "data/rbtree.snap",      save_snapshot_rbtree,    load_snapshot_rbtree},
-    {"hash",    "data/hash.snap",        save_snapshot_hash,      load_snapshot_hash},
-    {"skiptable", "data/skiptable.snap", save_snapshot_skiptable, load_snapshot_skiptable},
-    {NULL, NULL, NULL, NULL}
+    {"array",       save_snapshot_array},
+    {"rbtree",      save_snapshot_rbtree},
+    {"hash",        save_snapshot_hash},
+    {"skiptable",   save_snapshot_skiptable},
+    {NULL, NULL}
 };
 
+// ===== 写入一个 token =====
+static int write_token(FILE *fp, const char *data) {
+    if (!data) return -1;
+    int len = strlen(data);
+    fprintf(fp, "$%d\r\n%s\r\n", len, data);
+    return 0;
+}
 
+// ===== 读取一个 token =====
+static char* read_token(FILE *fp) {
+    char line[64];
+    // 读取 $长度\r\n
+    if (!fgets(line, sizeof(line), fp)) return NULL;
+    
+    // 跳过空行
+    while (line[0] == '\n' || line[0] == '\r') {
+        if (!fgets(line, sizeof(line), fp)) return NULL;
+    }
+    
+    // 必须是 $ 开头
+    if (line[0] != '$') {
+        printf("[Snap] ERROR: expected '$', got '%c'\n", line[0]);
+        return NULL;
+    }
+    
+    // 解析长度
+    int len = atoi(line + 1);
+    if (len < 0) return NULL;
+    
+    // 读取数据
+    char *data = (char*)malloc(len + 1);
+    if (!data) return NULL;
+    
+    int n = fread(data, 1, len, fp);
+    if (n != len) {
+        free(data);
+        return NULL;
+    }
+    data[len] = '\0';
+    
+    // 跳过 \r\n 或 \n
+    int c1 = fgetc(fp);
+    if (c1 == '\r') {
+        int c2 = fgetc(fp);
+        if (c2 != '\n' && c2 != EOF) ungetc(c2, fp);
+    }
+    
+    return data;
+}
+
+
+
+
+#if ENABLE_NEW_FUN
+static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
+    if (node == T->nil || node == NULL) return;
+    
+    travel_rbtree_node(T, node->left, fp);
+    
+    write_token(fp, node->key);
+    write_token(fp, (char*)node->value);   // 直接连在一起
+    
+    travel_rbtree_node(T, node->right, fp);
+}
+#else
 // 递归遍历红黑树
 static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
     if (node == T->nil || node == NULL) {
@@ -61,9 +129,83 @@ static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
     // 3. 再遍历右子树
     travel_rbtree_node(T, node->right, fp);
 }
+#endif
+
+
+
 
 /* 底层函数 */
 // 快照保存
+#if ENABLE_NEW_FUN
+int save_snapshot_array(const char *filename) {
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return -1;
+    
+    fprintf(fp, "# array\n");
+    int i = 0;
+    for (i = 0; i < global_array.total; i++) {
+        if (global_array.table[i].key != NULL) {
+            write_token(fp, global_array.table[i].key);
+            write_token(fp, global_array.table[i].value);   // 直接连在一起
+        }
+    }
+    
+    fclose(fp);
+    printf("Snapshot array saved to %s\n", filename);
+    return 0;
+}
+
+int save_snapshot_rbtree(const char *filename) {
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return -1;
+    
+    fprintf(fp, "# rbtree\n");
+    travel_rbtree_node(&global_rbtree, global_rbtree.root, fp);
+    
+    fclose(fp);
+    printf("Snapshot rbtree saved to %s\n", filename);
+    return 0;
+}
+
+int save_snapshot_hash(const char *filename) {
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return -1;
+    
+    fprintf(fp, "# hash\n");
+    int i = 0;
+    for (i = 0; i < global_hash.max_slots; i++) {
+        hashnode_t *node = global_hash.nodes[i];
+        while (node != NULL) {
+            write_token(fp, node->key);
+            write_token(fp, node->value);   // 直接连在一起
+            node = node->next;
+        }
+    }
+    
+    fclose(fp);
+    printf("Snapshot hash saved to %s\n", filename);
+    return 0;
+}
+
+int save_snapshot_skiptable(const char *filename) {
+    FILE *fp = fopen(filename, "a");
+    if (!fp) return -1;
+    
+    fprintf(fp, "# skiptable\n");
+    
+    kvs_node_t *curr = global_skiptable.header->forward[0];
+    while (curr != NULL) {
+        write_token(fp, curr->key);
+        write_token(fp, curr->value);   // 直接连在一起
+        curr = curr->forward[0];
+    }
+    
+    fclose(fp);
+    printf("Snapshot skiptable saved to %s\n", filename);
+    return 0;
+}
+
+#else
 int save_snapshot_array(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) return -1;
@@ -121,75 +263,104 @@ int save_snapshot_skiptable(const char *filename) {
     return 0;
 }
 
-// 快照加载
+#endif
 
-// 定义底层解析接口
-static int load_snap_func(const char *filename, void *inst, kv_set_fn set_fn) {
-    FILE *fp = fopen(filename, "r");
+
+
+
+#if ENABLE_NEW_FUN
+int append_aof(const char *cmd, const char *key, const char *value) {
+    FILE *fp = fopen(AOF_FILE, "a");
     if (!fp) return -1;
-    char ch;
-    char *key = NULL;
-    char *value = NULL;
-    int key_len = 0;
-    int value_len = 0;
-    int key_cap = 64;
-    int value_cap = 64;
-
-    key = (char *)malloc(key_cap);
-    value = (char *)malloc(value_cap);
-
-    int read_status = READ_KEY;
-    while ((ch = fgetc(fp)) != EOF) {
-        if (ch == ' ') {
-            // key读结束，开始读value
-            key[key_len] = '\0';
-            value_len = 0;
-            read_status = READ_VALUE;
-        } else if (ch == '\n') {
-            // 换行：一条数据结束，执行set
-            value[value_len] = '\0';
-            if (key_len > 0) {
-                set_fn(inst, key, value);
-            }
-            // 准备读下一条
-            read_status = READ_KEY;
-            key_len = 0;
-        } else {
-            if (read_status == READ_KEY){
-                if (key_len + 1 >= key_cap) {
-                    key_cap *= 2;
-                    key = (char*)realloc(key, key_cap);
-                }
-                key[key_len++] = ch;
-            } else {
-                if (value_len + 1 >= value_cap) {
-                    value_cap *= 2;
-                    value = (char*)realloc(value, value_cap);
-                }
-                value[value_len++] = ch;
-            }
-
-        }
+    
+    // 写命令（不带空格）
+    fprintf(fp, "%s", cmd);
+    
+    // 写 key（直接连在一起）
+    write_token(fp, key);
+    
+    // 写 value（如果有，直接连在一起）
+    if (value) {
+        write_token(fp, value);
     }
-    free(key);
-    free(value);
+    
     fclose(fp);
     return 0;
 }
 
-// 封装kv引擎的API
-int load_snapshot_array(const char *filename) {
-    return load_snap_func(filename, &global_array, (kv_set_fn)kvs_array_set);
+int replay_aof(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) return -1;
+    
+    int count = 0;
+    int ch;
+    
+    while ((ch = fgetc(fp)) != EOF) {
+        // 跳过换行符和空格
+        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+        
+        // ===== 读取命令名（到 $ 或换行为止） =====
+        char cmd[16];
+        int i = 0;
+        while (ch != EOF && ch != '$' && ch != '\n' && ch != '\r') {
+            if (i < sizeof(cmd) - 1) cmd[i++] = ch;
+            ch = fgetc(fp);
+        }
+        cmd[i] = '\0';
+        
+        if (ch == EOF) break;
+        if (i == 0) continue;
+        
+        // 把 $ 放回
+        if (ch == '$') ungetc(ch, fp);
+        
+        // ===== 读取 key =====
+        char *key = read_token(fp);
+        if (!key) {
+            printf("[AOF] ERROR: failed to read key\n");
+            break;
+        }
+        
+        // ===== 判断是不是删除cmd=====
+        char *value = NULL;
+        int has_value = (strcmp(cmd, "DEL") != 0 &&
+                        strcmp(cmd, "RDEL") != 0 &&
+                        strcmp(cmd, "HDEL") != 0 &&
+                        strcmp(cmd, "SDEL") != 0);
+        // 不读，value = NULL
+        if (has_value) {
+            value = read_token(fp);
+            if (!value) {
+                printf("[AOF] ERROR: failed to read value\n");
+                free(key);
+                break;
+            }
+        }
+        
+        // ===== 分发 =====
+        if (strcmp(cmd, "SET") == 0)       kvs_array_set(&global_array, key, value);
+        else if (strcmp(cmd, "DEL") == 0)  kvs_array_del(&global_array, key);
+        else if (strcmp(cmd, "MOD") == 0)  kvs_array_mod(&global_array, key, value);
+        else if (strcmp(cmd, "RSET") == 0) kvs_rbtree_set(&global_rbtree, key, value);
+        else if (strcmp(cmd, "RDEL") == 0) kvs_rbtree_del(&global_rbtree, key);
+        else if (strcmp(cmd, "RMOD") == 0) kvs_rbtree_mod(&global_rbtree, key, value);
+        else if (strcmp(cmd, "HSET") == 0) kvs_hash_set(&global_hash, key, value);
+        else if (strcmp(cmd, "HDEL") == 0) kvs_hash_del(&global_hash, key);
+        else if (strcmp(cmd, "HMOD") == 0) kvs_hash_mod(&global_hash, key, value);
+        else if (strcmp(cmd, "SSET") == 0) kvs_skiptable_set(&global_skiptable, key, value);
+        else if (strcmp(cmd, "SDEL") == 0) kvs_skiptable_del(&global_skiptable, key);
+        else if (strcmp(cmd, "SMOD") == 0) kvs_skiptable_mod(&global_skiptable, key, value);
+        
+        free(key);
+        if (value) free(value);
+        count++;
+    }
+    
+    fclose(fp);
+    printf("Replayed %d entries from %s\n", count, filename);
+    return 0;
 }
-int load_snapshot_rbtree(const char *filename) {
-    return load_snap_func(filename, &global_rbtree, (kv_set_fn)kvs_rbtree_set);
-}
-int load_snapshot_hash(const char *filename) {
-    return load_snap_func(filename, &global_hash, (kv_set_fn)kvs_hash_set);
-}
-int load_snapshot_skiptable(const char *filename) {
-    return load_snap_func(filename, &global_skiptable, (kv_set_fn)kvs_skiptable_set);
-}
+#else
 
 // AOF
 int append_aof(const char *filename, const char *cmd, const char *key, const char *value) {
@@ -291,10 +462,97 @@ int replay_aof(const char *filename) {
     fclose(fp);
     return 0;
 }
+#endif
 
 
 
 
+#if ENABLE_NEW_FUN
+int save_snapshots() {
+    // 先清空文件
+    FILE *fp = fopen(SNAP_FILE, "w");
+    if (!fp) return -1;
+    fclose(fp);
+
+    // 依次调用各引擎的保存函数
+    int ret = 0, i = 0;
+    for (i = 0; engine_persist_table[i].name != NULL; i++) {
+        if (engine_persist_table[i].save_fn(SNAP_FILE) != 0) {
+            printf("failed to save %s snap\n", engine_persist_table[i].name);
+            ret = -1;
+        }
+    }
+    return ret;
+}
+
+int load_snapshots() {
+    FILE *fp = fopen(SNAP_FILE, "r");
+    if (!fp) {
+        printf("No snapshot file: %s\n", SNAP_FILE);
+        return -1;
+    }
+    
+    int count = 0;
+    int current_engine = -1;
+    int ch;
+    
+    while ((ch = fgetc(fp)) != EOF) {
+        // 跳过换行符和空格
+        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+        
+        // ===== 检测引擎标记 =====
+        if (ch == '#') {
+            char line[64];
+            int i = 0;
+            while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+                if (i < sizeof(line) - 1) line[i++] = ch;
+            }
+            line[i] = '\0';
+            line[strcspn(line, "\r\n")] = '\0';
+            
+            if (strstr(line, "array"))          current_engine = 0;
+            else if (strstr(line, "rbtree"))    current_engine = 1;
+            else if (strstr(line, "hash"))      current_engine = 2;
+            else if (strstr(line, "skiptable")) current_engine = 3;
+            continue;
+        }
+        
+        // ===== 读取 $ 开头的 token =====
+        if (ch == '$') {
+            ungetc(ch, fp);
+            
+            char *key = read_token(fp);
+            if (!key) {
+                printf("[Snap] ERROR: failed to read key\n");
+                break;
+            }
+            
+            char *value = read_token(fp);
+            if (!value) {
+                printf("[Snap] ERROR: failed to read value\n");
+                free(key);
+                break;
+            }
+            
+            // ===== 根据当前引擎分发 =====
+            switch (current_engine) {
+                case 0: kvs_array_set(&global_array, key, value); break;
+                case 1: kvs_rbtree_set(&global_rbtree, key, value); break;
+                case 2: kvs_hash_set(&global_hash, key, value); break;
+                case 3: kvs_skiptable_set(&global_skiptable, key, value); break;
+            }
+            
+            free(key);
+            free(value);
+            count++;
+        }
+    }
+    
+    fclose(fp);
+    printf("Loaded %d entries from %s\n", count, SNAP_FILE);
+    return 0;
+}
+#else
 
 //snap保存接口
 int save_snapshots() {
@@ -320,7 +578,7 @@ int load_snapshots() {
     return ret;
 }
 
-
+#endif
 
 
 
