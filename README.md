@@ -1,20 +1,80 @@
 # 使用说明
 
-```bash
+## 编译运行
 
-编译
-进入项目根目录
+```bash
+cd kvs_lhy
 make
 
-运行主节点 master
-make run
-
-
-从机运行（可选）
-make run-slave
-
+运行项目
+./build/kvstore --config master.conf
 
 ```
+
+
+
+
+
+## 持久化
+
+### 1 增量持久化
+
+master.conf
+
+```bash
+# 主节点配置
+role=master
+port=2000
+# 不启动snap
+snap.enable=false
+# 启动aof
+aof.enable=true
+```
+
+
+
+### 2 全量持久化
+
+```bash
+# 主节点配置
+role=master
+port=2000
+# 启动snap
+snap.enable=true
+# 不启动aof
+aof.enable=false
+```
+
+
+
+### 3 功能测试
+
+aof
+
+```bash
+# AOF 测试
+./build/snap_aof_test 192.168.137.128 2000 1
+# 插入完成后，重启服务端
+./build/kvstore --config master.conf
+# 测试端读取aof加载的数据
+./build/snap_aof_test 192.168.137.128 2000 2
+
+```
+
+
+
+snap
+
+```bash
+# SNAP 测试
+./build/snap_aof_test 192.168.137.128 2000 3
+# 插入完成后，重启服务端
+./build/kvstore --config master.conf
+# 测试端读取aof加载的数据
+./build/snap_aof_test 192.168.137.128 2000 4
+```
+
+
 
 ---
 
@@ -143,5 +203,15 @@ snap.enable=true
 # 从节点一般不启动aof
 aof.enable=false
 ```
+
+
+
+# 4 持久化
+
+## 增量持久化
+
+
+
+## 全量持久化
 
 
