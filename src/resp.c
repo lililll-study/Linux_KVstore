@@ -45,6 +45,7 @@ int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     ctx->resp_token_len = 0;
     ctx->resp_temp_buffer = NULL;
     ctx->resp_temp_buffer_cap = 0;
+    ctx->resp_cmd_start = 0;
     return 0;
 }
 
@@ -73,6 +74,7 @@ void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
         ctx->resp_temp_buffer = NULL;
     }
     ctx->resp_temp_buffer_cap = 0;
+    ctx->resp_cmd_start = 0;
     ctx->resp_state = RESP_TOTAL_HEAD;
 }
 
@@ -118,7 +120,22 @@ void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
 
 
 
-
+static void resp_reset_and_consume(kvs_conn_ctx_t *ctx, int consume_len) {
+    ctx->resp_state = RESP_TOTAL_HEAD;
+    ctx->resp_cmd_num = 0;
+    ctx->resp_cmd_idx = 0;
+    ctx->resp_scmd_unit_num = 0;
+    ctx->resp_scmd_unit_idx = 0;
+    ctx->resp_token_len = 0;
+    ctx->resp_cmd_start = 0;
+    if (ctx->resp_temp_buffer) {
+        free(ctx->resp_temp_buffer);
+        ctx->resp_temp_buffer = NULL;
+        ctx->resp_temp_buffer_cap = 0;
+    }
+    if (consume_len <= 0) consume_len = 1;  // 至少跳 1 字节，避免死循环
+    kvs_ctx_consume(ctx, consume_len);
+}
 
 /*
 // 解析器收到的数据
@@ -156,6 +173,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             if (left < 4) break;
             if (p[0] != '*') {//如果起始不是*说明数据错误
                 printf("[RESP1] ERROR: cmd_total_head is wrong");
+                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
             // 3. 如果检测到，就把cmd_num记录下来
@@ -188,6 +206,8 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             cmd_num_buf[num_len] = '\0'; // 确保字符串以结束符结尾
             ctx->resp_cmd_num = atoi(cmd_num_buf);// 把头值存入cmd_num
 
+            // ===== 成功读到外层头，记录命令起始偏移 =====
+            ctx->resp_cmd_start = processed_data;
             // printf("debug resp_cmd_num: %d\n", ctx->resp_cmd_num);
             // 并更新已处理内容
             p += 2; //跳过\r\n
@@ -204,6 +224,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             if (left < 4) break; // 如果剩余数据少于4个，那么继续攒数据
             if (p[0] != '*') {//如果起始不是*说明数据错误
                 printf("[RESP2] ERROR: cmd_head is wrong");
+                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
 
@@ -260,6 +281,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             if (left < 4) break; // 如果剩余数据少于4个，那么继续攒数据
             if (p[0] != '$') {//如果起始不是$说明数据错误
                 printf("[RESP2] ERROR: token_head is wrong");
+                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
             p++;  // 跳过 $
@@ -330,6 +352,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 如果所有的都执行完了，那么本次批处理结束，置位所有结构体状态，并读下一次RESP_TOTAL_HEAD
             // 如果所有没读完，单条读完了，就执行单条的，并读下一个cmd 的RESP_CMD_HEAD
             if (ctx->resp_scmd_unit_idx >= ctx->resp_scmd_unit_num){
+                int exec_ret = 0;
                 // 执行命令（用 resp_temp_buffer）
                 if (ctx->resp_temp_buffer && strlen(ctx->resp_temp_buffer) > 0) {
                     char *tokens[KVS_MAX_TOKENS] = {0};
@@ -340,9 +363,16 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                         tokens[i++] = token_str;
                         token_str = strtok_r(NULL, " ", &saveptr);
                     }
-                    kvs_filter_protocol(fd, tokens, i, NULL);
+                    exec_ret = kvs_filter_protocol(fd, tokens, i, NULL);
                 }
-                
+                // ===== 命令执行失败：跳过当前命令 =====
+                if (exec_ret < 0) {
+                    printf("[RESP] skip bad cmd: start=%d, end=%d, remain=%d\n",
+                        ctx->resp_cmd_start, processed_data,
+                        ctx->cmd_buffer_len - processed_data);
+                    resp_reset_and_consume(ctx, processed_data);
+                    return 0;
+                }
                 // 释放 resp_temp_buffer
                 if (ctx->resp_temp_buffer) {
                     free(ctx->resp_temp_buffer);
