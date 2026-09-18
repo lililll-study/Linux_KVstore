@@ -403,7 +403,7 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
 
 	if (!recv_f) init_hook();
 
-	printf("recv\n");
+	// printf("recv\n");
 	
 	struct pollfd fds;
 	fds.fd = fd;
@@ -427,7 +427,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 
 	if (!recvfrom_f) init_hook();
 
-	printf("recvfrom\n");
+	// printf("recvfrom\n");
 
 	struct pollfd fds;
 	fds.fd = fd;
@@ -484,7 +484,7 @@ ssize_t send(int fd, const void *buf, size_t len, int flags) {
 
 	if (!send_f) init_hook();
 
-	printf("send\n");
+	// printf("send\n");
 	
 	int sent = 0;
 
@@ -516,7 +516,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 
 	if (!sendto_f) init_hook();
 
-	printf("sendto\n");
+	// printf("sendto\n");
 	
 	struct pollfd fds;
 	fds.fd = sockfd;
@@ -542,7 +542,7 @@ int accept(int fd, struct sockaddr *addr, socklen_t *len) {
 
 	if (!accept_f) init_hook();
 
-	printf("accept\n");
+	// printf("accept\n");
 	
 	int sockfd = -1;
 	int timeout = 1;
