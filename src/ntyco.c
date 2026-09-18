@@ -10,7 +10,10 @@
 typedef int (*msg_handler)(char *msg, int length, char *response);
 static msg_handler kvs_handler;
 
-
+/**
+ * 每个协程管理一个fd，功能是负责recv数据，分配给业务层函数，并send
+ * 异步处理
+ */
 void server_reader(void *arg) {
 	int fd = *(int *)arg;
 	int ret = 0;
@@ -39,7 +42,10 @@ void server_reader(void *arg) {
 }
 
 
-
+/**
+ * fd注册服务
+ * 在server协程中，循环接收sockfd，然后为每个fd分配一个协程
+*/
 void server(void *arg) {
 
 	unsigned short port = *(unsigned short *)arg;
