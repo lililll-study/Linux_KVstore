@@ -21,7 +21,7 @@
 #define NET_NTYCO 1
 #define NET_PROACTOR 2
 
-#define NET_SELECT NET_REACTOR
+#define NET_SELECT NET_NTYCO
 
 
 #define ENABLE_ARRAY         1
