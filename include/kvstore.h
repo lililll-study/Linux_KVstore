@@ -16,7 +16,7 @@
 
 
 #define ENABLE_NEW_FUN 1
-
+#define ENABLE_URING 1
 #define NET_REACTOR 0
 #define NET_NTYCO 1
 #define NET_PROACTOR 2
@@ -211,6 +211,12 @@ int load_snapshots();
 // AOF
 int append_aof(const char *cmd, const char *key, const char *value);
 int replay_aof(const char *filename);
+
+/* io_uring-backed AOF lifecycle */
+int persistence_init(void);
+int persistence_flush(void);
+int persistence_reset_aof(void);
+void persistence_shutdown(void);
 #else
 // 快照文件路径（放在 data 目录下）
 #define SNAP_ARRAY_FILE     "data/array.snap"
