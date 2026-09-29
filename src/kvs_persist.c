@@ -1,4 +1,9 @@
 #include "kvstore.h"
+#include "kvs_uring.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -269,6 +274,219 @@ int save_snapshot_skiptable(const char *filename) {
 
 
 #if ENABLE_NEW_FUN
+
+// aof文件的fd，进程启动打开一次，且常开
+static int g_aof_fd = -1;
+// uring封装实例，管理写入队列和worker线程
+static kvs_uring_t *g_aof_uring = NULL;
+
+// 构建aof字节串
+static int build_aof_record(const char *cmd, const char *key, const char *value, char **out_buf, size_t *out_len) {
+    if (!cmd || !key || !out_buf || !out_len)
+        return -EINVAL;
+
+    int need;
+    // 如果没有value表示是删除del等cmd，有value表示是set等
+    if (value) {
+        // 用snprintf预计算长度，计算aof record需要的字节数
+        // 此时str==null&&size==0，不写入如任何东西
+        need = snprintf(NULL, 0,
+                        "%s$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        cmd, strlen(key), key,
+                        strlen(value), value);
+    } else {
+        need = snprintf(NULL, 0,
+                        "%s$%zu\r\n%s\r\n",
+                        cmd, strlen(key), key);
+    }
+
+    if (need < 0)
+        return -EINVAL;
+    // 给返回数据分配内存，且末尾保留\0：因为snprintf总是再末尾加入\0，如果不写，会被截断
+    char *buf = (char *)malloc((size_t)need + 1);
+    if (!buf)
+        return -ENOMEM;
+
+    if (value) {
+        snprintf(buf, (size_t)need + 1,
+                 "%s$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                 cmd, strlen(key), key,
+                 strlen(value), value);
+    } else {
+        snprintf(buf, (size_t)need + 1,
+                 "%s$%zu\r\n%s\r\n",
+                 cmd, strlen(key), key);
+    }
+
+    *out_buf = buf;
+    *out_len = (size_t)need;
+    return 0;
+}
+
+// 进程启动时调用一次，初始化aof持久化的uring环境
+/**
+ * 返回值：
+ * 0：aof未启用/ 已经初始化过了/ 正常初始化成功
+ */
+int persistence_init(void)
+{
+    if (!g_config.aof_enable) return 0;
+
+    if (g_aof_uring) return 0;
+    // 打开aof文件获得fd    读写模式    不存在则创建 exec 时自动关闭
+    g_aof_fd = open(AOF_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (g_aof_fd < 0) {
+        printf("[AOF] open %s failed: %s\n", AOF_FILE, strerror(errno));
+        return -errno;
+    }
+
+    struct stat st;
+    // 获取文件大小，作为首次写入offset
+    if (fstat(g_aof_fd, &st) < 0) {
+        int err = errno;
+        close(g_aof_fd);
+        g_aof_fd = -1;
+        return -err;
+    }
+
+    // 初始化uring子系统，失败就清理fd
+    int ret = kvs_uring_init(&g_aof_uring, g_aof_fd, st.st_size);
+    if (ret < 0) {
+        printf("[AOF] io_uring init failed: %s\n",
+               strerror(-ret));
+        close(g_aof_fd);
+        g_aof_fd = -1;
+        return ret;
+    }
+
+    printf("[AOF] io_uring writer started, offset=%lld\n", (long long)st.st_size);
+
+    return 0;
+}
+
+/**
+ * 业务层调用，异步写aof
+ * 构造 AOF 字节串 → 入队到 io_uring → 立刻返回（不阻塞）
+ */
+int append_aof(const char *cmd, const char *key, const char *value)
+{
+    if (!g_config.aof_enable) return 0;
+    if (!g_aof_uring) return -ESHUTDOWN;    //返回-108：未初始化
+
+    char *record = NULL;
+    size_t record_len = 0;
+
+    // 把cmd拼接为aof格式
+    int ret = build_aof_record(cmd, key, value, &record, &record_len);
+    if (ret < 0) return ret;
+    // 入队@@@
+    ret = kvs_uring_append(g_aof_uring, record, record_len);
+    free(record);   // 释放
+
+    return ret;
+}
+
+// 等所有已经入队的 AOF 写请求完成。
+// 返回0：AOF 未启用，没有请求要等；io_uring 未初始化，没有队列
+// 上级调用：SAVE命令中
+int persistence_flush(void)
+{
+    if (!g_config.aof_enable || !g_aof_uring) return 0;
+    return kvs_uring_flush(g_aof_uring);
+}
+// 清空aof
+// 清空文件+重置uring的offset
+// 上级调用：SAVE 命令生成快照后
+int persistence_reset_aof(void)
+{
+    if (!g_config.aof_enable || !g_aof_uring) return 0;
+    return kvs_uring_reset(g_aof_uring);
+}
+
+// 退出清理：进程退出时清理 AOF 子系统。
+void persistence_shutdown(void)
+{   
+    // 先关闭uring
+    if (g_aof_uring) {
+        kvs_uring_shutdown(g_aof_uring);
+        g_aof_uring = NULL;
+    }
+    // 再关闭fd
+    if (g_aof_fd >= 0) {
+        close(g_aof_fd);
+        g_aof_fd = -1;
+    }
+}
+
+
+int replay_aof(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) return -1;
+
+    int count = 0;
+    int ch;
+
+    while ((ch = fgetc(fp)) != EOF) {
+        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+
+        char cmd[16];
+        int i = 0;
+        while (ch != EOF && ch != '$' && ch != '\n' && ch != '\r') {
+            if (i < (int)sizeof(cmd) - 1) cmd[i++] = (char)ch;
+            ch = fgetc(fp);
+        }
+        cmd[i] = '\0';
+
+        if (ch == EOF) break;
+        if (i == 0) continue;
+
+        if (ch == '$') ungetc(ch, fp);
+
+        char *key = read_token(fp);
+        if (!key) {
+            printf("[AOF] ERROR: failed to read key\n");
+            break;
+        }
+
+        char *value = NULL;
+        int has_value = (strcmp(cmd, "DEL") != 0 &&
+                         strcmp(cmd, "RDEL") != 0 &&
+                         strcmp(cmd, "HDEL") != 0 &&
+                         strcmp(cmd, "SDEL") != 0);
+
+        if (has_value) {
+            value = read_token(fp);
+            if (!value) {
+                printf("[AOF] ERROR: failed to read value\n");
+                free(key);
+                break;
+            }
+        }
+
+        if (strcmp(cmd, "SET") == 0)       kvs_array_set(&global_array, key, value);
+        else if (strcmp(cmd, "DEL") == 0)  kvs_array_del(&global_array, key);
+        else if (strcmp(cmd, "MOD") == 0)  kvs_array_mod(&global_array, key, value);
+        else if (strcmp(cmd, "RSET") == 0) kvs_rbtree_set(&global_rbtree, key, value);
+        else if (strcmp(cmd, "RDEL") == 0) kvs_rbtree_del(&global_rbtree, key);
+        else if (strcmp(cmd, "RMOD") == 0) kvs_rbtree_mod(&global_rbtree, key, value);
+        else if (strcmp(cmd, "HSET") == 0) kvs_hash_set(&global_hash, key, value);
+        else if (strcmp(cmd, "HDEL") == 0) kvs_hash_del(&global_hash, key);
+        else if (strcmp(cmd, "HMOD") == 0) kvs_hash_mod(&global_hash, key, value);
+        else if (strcmp(cmd, "SSET") == 0) kvs_skiptable_set(&global_skiptable, key, value);
+        else if (strcmp(cmd, "SDEL") == 0) kvs_skiptable_del(&global_skiptable, key);
+        else if (strcmp(cmd, "SMOD") == 0) kvs_skiptable_mod(&global_skiptable, key, value);
+
+        free(key);
+        if (value) free(value);
+        count++;
+    }
+
+    fclose(fp);
+    printf("Replayed %d entries from %s\n", count, filename);
+    return 0;
+}
+#else
+
 int append_aof(const char *cmd, const char *key, const char *value) {
     FILE *fp = fopen(AOF_FILE, "a");
     if (!fp) return -1;
@@ -358,108 +576,6 @@ int replay_aof(const char *filename) {
     
     fclose(fp);
     printf("Replayed %d entries from %s\n", count, filename);
-    return 0;
-}
-#else
-
-// AOF
-int append_aof(const char *filename, const char *cmd, const char *key, const char *value) {
-    FILE *fp = fopen(filename, "a");
-    if (!fp) return -1;
-
-    if (value) { // set mod
-        fprintf(fp, "%s %s %s\n", cmd, key, value);
-    } else {// del
-        fprintf(fp, "%s %s\n", cmd, key);
-    }
-    fclose(fp);
-    return 0;
-}
-
-int replay_aof(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) return -1;
-
-    char *line = NULL, *cmd = NULL, *key = NULL, *value = NULL;
-    size_t line_len = 0;
-
-    while (getline(&line, &line_len, fp) != -1) {
-
-        // 去掉换行符
-        line[strcspn(line, "\n")] = 0;
-        printf("%s\n", line);
-
-        cmd = (char*)malloc(strlen(line) + 1);
-        key = (char*)malloc(strlen(line) + 1);
-        value = (char*)malloc(strlen(line) + 1);
-
-        if (!cmd || !key || !value) {
-            if (cmd) free(cmd);
-            if (key) free(key);
-            if (value) free(value);
-            break;
-        }
-
-        // 解析命令
-        int count = sscanf(line, "%s %s %s", cmd, key, value);
-        // printf("%d\n", count);
-        if (count >= 2) {
-            // printf("count start\n");
-            // 根据命令前缀分发
-            if (cmd[0] == 'S' && cmd[1] == 'S') {
-                // printf("set start S\n");
-                // 跳表命令
-                if (strcmp(cmd, "SSET") == 0 && count == 3) {
-                    kvs_skiptable_set(&global_skiptable, key, value);
-                } else if (strcmp(cmd, "SMOD") == 0 && count == 3) {
-                    kvs_skiptable_mod(&global_skiptable, key, value);
-                } else if (strcmp(cmd, "SDEL") == 0) {
-                    kvs_skiptable_del(&global_skiptable, key);
-                }
-            } else if (cmd[0] == 'R' && cmd[1] == 'S') {
-                // printf("set start R\n");
-                // 红黑树命令
-                if (strcmp(cmd, "RSET") == 0 && count == 3) {
-                    kvs_rbtree_set(&global_rbtree, key, value);
-                } else if (strcmp(cmd, "RMOD") == 0 && count == 3) {
-                    kvs_rbtree_mod(&global_rbtree, key, value);
-                } else if (strcmp(cmd, "RDEL") == 0) {
-                    kvs_rbtree_del(&global_rbtree, key);
-                }
-            } else if (cmd[0] == 'H' && cmd[1] == 'S') {
-                // printf("set start H\n");
-                // 哈希命令
-                if (strcmp(cmd, "HSET") == 0 && count == 3) {
-                    kvs_hash_set(&global_hash, key, value);
-                } else if (strcmp(cmd, "HMOD") == 0 && count == 3) {
-                    kvs_hash_mod(&global_hash, key, value);
-                } else if (strcmp(cmd, "HDEL") == 0) {
-                    kvs_hash_del(&global_hash, key);
-                }
-            } else {
-                // 数组命令
-                // printf("set start A\n");
-                if (strcmp(cmd, "SET") == 0 && count == 3) {
-                    // printf("set start\n");
-                    kvs_array_set(&global_array, key, value);
-                    // printf("kvs_array_set returned: %d\n", ret);
-                } else if (strcmp(cmd, "MOD") == 0 && count == 3) {
-                    kvs_array_mod(&global_array, key, value);
-                } else if (strcmp(cmd, "DEL") == 0) {
-                    kvs_array_del(&global_array, key);
-                }
-            }
-        }
-        // 释放内存
-        free(cmd);
-        free(key);
-        free(value);
-        cmd = NULL;
-        key = NULL;
-        value = NULL;
-    }
-    free(line);
-    fclose(fp);
     return 0;
 }
 #endif
