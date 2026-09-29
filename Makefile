@@ -15,12 +15,13 @@ SRCS = $(SRC_DIR)/kvstore.c \
        $(SRC_DIR)/kvs_hash.c \
        $(SRC_DIR)/kvs_skiptable.c \
        $(SRC_DIR)/kvs_persist.c \
+	   $(SRC_DIR)/kvs_uring.c \
 	   $(SRC_DIR)/resp.c \
 	   $(SRC_DIR)/kvs_mempool.c \
 	   $(SRC_DIR)/config.c \
 	   $(SRC_DIR)/reactor.c \
        $(SRC_DIR)/kvs_sync.c \
-	   $(SRC_DIR)/ntyco_net.c 
+	   $(SRC_DIR)/ntyco.c 
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
@@ -42,17 +43,17 @@ dirs:
 
 # ===== 链接服务端 =====
 $(TARGET): $(OBJS)
-	$(CC) -o $@ $(OBJS) $(LIBS)
+	$(CC) -no-pie -o $@ $(OBJS) $(LIBS)
 	@echo "Build complete: $(TARGET)"
 
 # ===== 编译测试端 1：testcase =====
 $(TESTCASE_TARGET): $(TEST_DIR)/testcase.c
-	$(CC) $(CFLAGS) -o $@ $< $(TEST_LIBS)
+	$(CC) -no-pie $(CFLAGS) -o $@ $< $(TEST_LIBS)
 	@echo "Build complete: $(TESTCASE_TARGET)"
 
 # ===== 编译测试端 2：snap_aof_test =====
 $(SNAP_AOF_TARGET): $(TEST_DIR)/snap_aof_test.c
-	$(CC) $(CFLAGS) -o $@ $< $(TEST_LIBS)
+	$(CC) -no-pie $(CFLAGS) -o $@ $< $(TEST_LIBS)
 	@echo "Build complete: $(SNAP_AOF_TARGET)"
 
 
