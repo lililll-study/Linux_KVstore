@@ -13,10 +13,6 @@
 #include "server.h"
 #include "kvstore.h"
 
-#include <openssl/sha.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
-#include <openssl/evp.h>
 
 #include <fcntl.h>
 /* 
