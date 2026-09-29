@@ -419,6 +419,29 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #endif
 
 #if ENABLE_PERSIST
+#if ENABLE_URING
+        case KVS_CMD_SAVE:
+            // 等待所有已经提交到aof的写请求落盘
+            ret = persistence_flush();
+            if (ret != 0) {
+                printf("[SAVE] AOF flush failed: %s\n", strerror(-ret));
+                SAFE_APPEND("error\r\n");
+                break;
+            }
+
+            ret = save_snapshots();
+            if (ret == 0) {
+                // 清空aof文件，并把uring的写入偏移重置
+                ret = persistence_reset_aof();
+            }
+
+            if (ret == 0) {
+                SAFE_APPEND("ok\r\n");
+            } else {
+                SAFE_APPEND("error\r\n");
+            }
+            break;
+#else
         case KVS_CMD_SAVE:
             ret = save_snapshots();
             if (ret == 0) {
@@ -431,6 +454,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             }
             break;
+#endif
 #endif
 
 #if ENABLE_SYNC
@@ -603,6 +627,16 @@ printf("------------ 2. kvs_engine created ----\n");
     if (g_config.aof_enable) {
         replay_aof(AOF_FILE);
         printf("------------ 4. AOF done ---\n");
+#if ENABLE_URING
+        /*
+         * Recovery must finish before live AOF appends begin.
+         */
+        if (persistence_init() != 0) {
+            printf("------------ 5. AOF io_uring init FAILED ---\n");
+            return -1;
+        }
+        printf("------------ 5. AOF io_uring writer started ---\n");
+#endif
     } else {
         printf("------------ 4. AOF disabled, skip replay ---\n");
     }
@@ -612,6 +646,10 @@ printf("------------ 2. kvs_engine created ----\n");
 }
 
 void dest_kvengine(void) {
+#if ENABLE_PERSIST
+    /* Drain/stop AOF before destroying the KV engine. */
+    persistence_shutdown();
+#endif
 #if ENABLE_ARRAY
     kvs_array_destory(&global_array);
 #endif
