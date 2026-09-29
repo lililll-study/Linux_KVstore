@@ -161,7 +161,135 @@ for each cmd in 外层数组:
 
 # 2 协程和IO_uring应用
 
+## 基于coroutine的网络框架
 
+
+
+## 基于uring的持久化数据落盘
+
+问题
+
+```bash
+原先的aof数据落盘：
+每次 SET/MOD/DEL 都会同步执行文件 I/O，每条写命令 open → fprintf → close，高频同步阻塞
+```
+
+改造方法
+
+```bash
+把aof改为持久化请求队列，append_aof()变为：
+构造 AOF record    // 定义一条 AOF 记录
+      ↓
+加入 queue
+      ↓
+唤醒 persistence thread
+      ↓
+io_uring 提交
+
+
+真正做法：做到高并发异步 I/O，实现批量提交
+       ┌── request 1 ──┐
+       ├── request 2 ──┤
+queue ─┼── request 3 ──┼→ SQ
+       ├── request 4 ──┤
+       └── request 5 ──┘
+                       ↓
+                  kernel I/O
+                       ↓
+       ┌── CQE 1 ──────┐
+       ├── CQE 2 ──────┤
+       ├── CQE 3 ──────┤
+       └── CQE 4 ──────┘
+
+
+而且需要保证aof的顺序，不能让多个业务线程随意直接操作同一个ring，故uring只由一个线程负责
+```
+
+
+
+修改业务流程
+
+业务请求线程只负责把 AOF 数据放进内存队列，不直接执行磁盘写；后台持久化线程负责批量提交 io_uring。
+
+```c
+客户端
+  ↓
+ntyco 协程
+  ↓
+kvs_handler()
+  ↓
+SET / DEL / MOD
+  ↓
+append_aof()
+  ↓
+内存 FIFO 队列
+  ↓
+Persistence Worker
+  ↓
+io_uring SQ
+  ↓
+IORING_OP_WRITE
+  ↓
+AOF
+```
+
+同时需要确保SAVA的一致性：
+
+```c
+SAVE
+ ↓
+persistence_flush()
+ ↓
+等待所有 AOF 写完成
+ ↓
+save_snapshots()
+ ↓
+清空 AOF
+
+```
+
+
+
+设计方案
+
+```bash
+kvs_uring_t          ← 对外实例（含 worker 线程、队列、计数）
+    └── kvs_ring_t   ← io_uring 裸封装（mmap 区域指针）
+            └── io_uring_sqe / io_uring_cqe  ← 内核数据结构
+
+
+业务线程: kvs_uring_append → 构造 req → 入队 → signal(cond)
+                                                  ↓
+worker线程: cond_wait → 批量取 64 个 → submit_requests
+              → ring_get_sqe × N → ring_submit → reap_one × N
+              → free_req → completed++
+```
+
+
+
+## 基于mmap的持久化数据加载
+
+当前代码的 `load_snapshots()` 和 `replay_aof()` 都是 `fopen + fgetc/fread，效率低
+
+改造方案
+
+```c
+AOF/SNAP 文件
+      ↓
+open()
+      ↓
+fstat()
+      ↓
+mmap(PROT_READ, MAP_PRIVATE)
+      ↓
+内存中的 char *data
+      ↓
+基于指针 offset 顺序解析
+      ↓
+KV 引擎恢复
+      ↓
+munmap()
+```
 
 
 
