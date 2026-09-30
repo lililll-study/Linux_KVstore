@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -57,14 +58,186 @@ static engine_persist_t engine_persist_table[] = {
     {NULL, NULL}
 };
 
-// ===== 写入一个 token =====
-static int write_token(FILE *fp, const char *data) {
-    if (!data) return -1;
-    int len = strlen(data);
-    fprintf(fp, "$%d\r\n%s\r\n", len, data);
+// mmap文件结构
+typedef struct {
+    int fd;     // 文件描述符
+    size_t size; // 保存文件的大小
+    char *data; // mmap返回的文件首地址
+} mmap_file_t;
+
+#if ENABLE_MMAP
+/**
+ * mmap_file_open：以只读方式打开持久化文件并映射到内存。
+ * 成功后 mf->data 指向整个文件，mf->size 保存文件大小；
+ * 后续读取直接通过 data + offset 完成，不再使用 stdio。
+ */
+static int mmap_file_open(const char *filename, mmap_file_t *mf)
+{
+    struct stat st;
+
+    memset(mf, 0, sizeof(*mf));
+    mf->fd = -1;
+
+    mf->fd = open(filename, O_RDONLY | O_CLOEXEC);
+    if (mf->fd < 0)
+        return -errno;
+
+    if (fstat(mf->fd, &st) < 0) {
+        int ret = -errno;
+        close(mf->fd);
+        mf->fd = -1;
+        return ret;
+    }
+
+    mf->size = (size_t)st.st_size;
+
+    if (mf->size == 0)
+        return 0;
+
+    mf->data = mmap(NULL, mf->size, PROT_READ, MAP_PRIVATE, mf->fd, 0);
+    if (mf->data == MAP_FAILED) {
+        int ret = -errno;
+        mf->data = NULL;
+        close(mf->fd);
+        mf->fd = -1;
+        return ret;
+    }
+
+    return 0;
+}
+/**
+ * mmap_file_close：解除文件映射并关闭文件描述符。
+ * AOF 或 Snapshot 解析结束后调用，保证 mmap 区域和 fd 正确释放。
+ */
+static void mmap_file_close(mmap_file_t *mf)
+{
+    if (!mf)
+        return;
+
+    if (mf->data && mf->size)
+        munmap(mf->data, mf->size);
+
+    if (mf->fd >= 0)
+        close(mf->fd);
+
+    mf->data = NULL;
+    mf->size = 0;
+    mf->fd = -1;
+}
+/**
+ * mmap_read_token：从 mmap 区域读取一个 $length\r\nvalue\r\n 格式的 token。
+ * offset 表示当前解析位置，成功后自动移动到下一个 token；
+ * 返回值独立分配内存，因此解除 mmap 后 key/value 仍然有效。
+ */
+static char *mmap_read_token(const char *data, size_t size, size_t *offset)
+{
+    size_t pos;
+    size_t len = 0;
+    char *value;
+
+    if (!data || !offset || *offset >= size || data[*offset] != '$')
+        return NULL;
+
+    pos = *offset + 1;
+
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+        len = len * 10 + (data[pos] - '0');
+
+        if (len > size)
+            return NULL;
+
+        pos++;
+    }
+
+    if (pos + 1 >= size || data[pos] != '\r' || data[pos + 1] != '\n')
+        return NULL;
+
+    pos += 2;
+
+    if (len > size - pos)
+        return NULL;
+
+    value = malloc(len + 1);
+    if (!value)
+        return NULL;
+
+    memcpy(value, data + pos, len);
+    value[len] = '\0';
+
+    pos += len;
+
+    if (pos + 1 >= size || data[pos] != '\r' || data[pos + 1] != '\n') {
+        free(value);
+        return NULL;
+    }
+
+    *offset = pos + 2;
+
+    return value;
+}
+
+/**
+ * mmap_read_command：从 mmap 区域读取 AOF 命令名，并将 offset 保持在后续 token 的 '$' 位置。
+ */
+static int mmap_read_command(const char *data, size_t size,
+                             size_t *offset, char *cmd, size_t cmd_size)
+{
+    size_t len = 0;
+
+    while (*offset < size &&
+           (data[*offset] == '\r' ||
+            data[*offset] == '\n' ||
+            data[*offset] == ' ' ||
+            data[*offset] == '\t')) {
+        (*offset)++;
+    }
+
+    while (*offset < size &&
+           data[*offset] != '$' &&
+           data[*offset] != '\r' &&
+           data[*offset] != '\n') {
+        if (len + 1 < cmd_size)
+            cmd[len++] = data[*offset];
+
+        (*offset)++;
+    }
+
+    if (len == 0 || *offset >= size || data[*offset] != '$')
+        return -1;
+
+    cmd[len] = '\0';
     return 0;
 }
 
+/**
+ * mmap_read_line：从 mmap 区域读取一行文本。
+ * 主要用于读取 Snapshot 中的 # array、# rbtree、# hash、# skiptable 标记。
+ */
+static int mmap_read_line(const char *data, size_t size,
+                          size_t *offset, char *line, size_t line_size)
+{
+    size_t len = 0;
+
+    while (*offset < size &&
+           data[*offset] != '\r' &&
+           data[*offset] != '\n') {
+
+        if (len + 1 < line_size)
+            line[len++] = data[*offset];
+
+        (*offset)++;
+    }
+
+    line[len] = '\0';
+
+    while (*offset < size &&
+           (data[*offset] == '\r' || data[*offset] == '\n')) {
+        (*offset)++;
+    }
+
+    return 0;
+}
+#else
 // ===== 读取一个 token =====
 static char* read_token(FILE *fp) {
     char line[64];
@@ -106,6 +279,17 @@ static char* read_token(FILE *fp) {
     
     return data;
 }
+
+#endif
+// ===== 写入一个 token =====
+static int write_token(FILE *fp, const char *data) {
+    if (!data) return -1;
+    int len = strlen(data);
+    fprintf(fp, "$%d\r\n%s\r\n", len, data);
+    return 0;
+}
+
+
 
 
 
@@ -418,6 +602,91 @@ void persistence_shutdown(void)
     }
 }
 
+#if ENABLE_MMAP
+/**
+ * replay_aof：使用 mmap 一次性映射整个 AOF 文件，
+ * 通过 offset 顺序解析 command、key、value，并调用现有 KV 引擎恢复数据。
+ */
+int replay_aof(const char *filename)
+{
+    mmap_file_t mf;
+    size_t offset = 0;
+    int count = 0;
+
+    if (mmap_file_open(filename, &mf) < 0)
+        return -1;
+
+    if (mf.size == 0) {
+        mmap_file_close(&mf);
+        return 0;
+    }
+
+    while (offset < mf.size) {
+        char cmd[16];
+        char *key;
+        char *value = NULL;
+
+        if (mmap_read_command(mf.data, mf.size,
+                              &offset, cmd, sizeof(cmd)) < 0)
+            break;
+
+        key = mmap_read_token(mf.data, mf.size, &offset);
+        if (!key) {
+            printf("[AOF] ERROR: failed to read key\n");
+            break;
+        }
+
+        if (strcmp(cmd, "DEL") != 0 &&
+            strcmp(cmd, "RDEL") != 0 &&
+            strcmp(cmd, "HDEL") != 0 &&
+            strcmp(cmd, "SDEL") != 0) {
+
+            value = mmap_read_token(mf.data, mf.size, &offset);
+
+            if (!value) {
+                printf("[AOF] ERROR: failed to read value\n");
+                free(key);
+                break;
+            }
+        }
+
+        if (strcmp(cmd, "SET") == 0)
+            kvs_array_set(&global_array, key, value);
+        else if (strcmp(cmd, "DEL") == 0)
+            kvs_array_del(&global_array, key);
+        else if (strcmp(cmd, "MOD") == 0)
+            kvs_array_mod(&global_array, key, value);
+        else if (strcmp(cmd, "RSET") == 0)
+            kvs_rbtree_set(&global_rbtree, key, value);
+        else if (strcmp(cmd, "RDEL") == 0)
+            kvs_rbtree_del(&global_rbtree, key);
+        else if (strcmp(cmd, "RMOD") == 0)
+            kvs_rbtree_mod(&global_rbtree, key, value);
+        else if (strcmp(cmd, "HSET") == 0)
+            kvs_hash_set(&global_hash, key, value);
+        else if (strcmp(cmd, "HDEL") == 0)
+            kvs_hash_del(&global_hash, key);
+        else if (strcmp(cmd, "HMOD") == 0)
+            kvs_hash_mod(&global_hash, key, value);
+        else if (strcmp(cmd, "SSET") == 0)
+            kvs_skiptable_set(&global_skiptable, key, value);
+        else if (strcmp(cmd, "SDEL") == 0)
+            kvs_skiptable_del(&global_skiptable, key);
+        else if (strcmp(cmd, "SMOD") == 0)
+            kvs_skiptable_mod(&global_skiptable, key, value);
+
+        free(key);
+        free(value);
+        count++;
+    }
+
+    mmap_file_close(&mf);
+
+    printf("Replayed %d entries from %s\n", count, filename);
+
+    return 0;
+}
+#else
 
 int replay_aof(const char *filename) {
     FILE *fp = fopen(filename, "r");
@@ -485,6 +754,8 @@ int replay_aof(const char *filename) {
     printf("Replayed %d entries from %s\n", count, filename);
     return 0;
 }
+
+#endif
 #else
 
 int append_aof(const char *cmd, const char *key, const char *value) {
@@ -601,6 +872,123 @@ int save_snapshots() {
     return ret;
 }
 
+
+#if ENABLE_MMAP
+
+/**
+ * load_snapshots：使用 mmap 一次性映射 Snapshot 文件，
+ * 根据引擎标记解析 key/value，并恢复到对应 KV 引擎。
+ */
+int load_snapshots()
+{
+    mmap_file_t mf;
+    size_t offset = 0;
+    int count = 0;
+    int current_engine = -1;
+
+    if (mmap_file_open(SNAP_FILE, &mf) < 0) {
+        printf("No snapshot file: %s\n", SNAP_FILE);
+        return -1;
+    }
+
+    if (mf.size == 0) {
+        mmap_file_close(&mf);
+        return 0;
+    }
+
+    while (offset < mf.size) {
+        while (offset < mf.size &&
+               (mf.data[offset] == '\r' ||
+                mf.data[offset] == '\n' ||
+                mf.data[offset] == ' ' ||
+                mf.data[offset] == '\t')) {
+            offset++;
+        }
+
+        if (offset >= mf.size)
+            break;
+
+        /* 读取当前引擎 */
+        if (mf.data[offset] == '#') {
+            char line[64];
+
+            mmap_read_line(mf.data, mf.size,
+                           &offset, line, sizeof(line));
+
+            if (strstr(line, "array"))
+                current_engine = 0;
+            else if (strstr(line, "rbtree"))
+                current_engine = 1;
+            else if (strstr(line, "hash"))
+                current_engine = 2;
+            else if (strstr(line, "skiptable"))
+                current_engine = 3;
+
+            continue;
+        }
+
+        /* 读取 key/value */
+        if (mf.data[offset] == '$') {
+            char *key = mmap_read_token(
+                mf.data, mf.size, &offset);
+
+            if (!key) {
+                printf("[Snap] ERROR: failed to read key\n");
+                break;
+            }
+
+            char *value = mmap_read_token(
+                mf.data, mf.size, &offset);
+
+            if (!value) {
+                printf("[Snap] ERROR: failed to read value\n");
+                free(key);
+                break;
+            }
+
+            switch (current_engine) {
+            case 0:
+                kvs_array_set(&global_array, key, value);
+                break;
+
+            case 1:
+                kvs_rbtree_set(&global_rbtree, key, value);
+                break;
+
+            case 2:
+                kvs_hash_set(&global_hash, key, value);
+                break;
+
+            case 3:
+                kvs_skiptable_set(
+                    &global_skiptable, key, value);
+                break;
+
+            default:
+                printf("[Snap] ERROR: unknown engine\n");
+                free(key);
+                free(value);
+                mmap_file_close(&mf);
+                return -1;
+            }
+
+            free(key);
+            free(value);
+            count++;
+        } else {
+            offset++;
+        }
+    }
+
+    mmap_file_close(&mf);
+
+    printf("Loaded %d entries from %s\n",
+           count, SNAP_FILE);
+
+    return 0;
+}
+
+#else
 int load_snapshots() {
     FILE *fp = fopen(SNAP_FILE, "r");
     if (!fp) {
@@ -668,6 +1056,8 @@ int load_snapshots() {
     printf("Loaded %d entries from %s\n", count, SNAP_FILE);
     return 0;
 }
+#endif
+
 #else
 
 //snap保存接口
