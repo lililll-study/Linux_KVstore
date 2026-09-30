@@ -14,12 +14,11 @@
 #include <pthread.h>   
 #include <unistd.h>    
 
-
-#define ENABLE_NEW_FUN 1
-#define ENABLE_URING 1
-#define NET_REACTOR 0
-#define NET_NTYCO 1
-#define NET_PROACTOR 2
+#define ENABLE_MMAP         1   // 持久化数据加载
+#define ENABLE_URING        1   // 持久化数据落盘
+#define NET_REACTOR     0
+#define NET_NTYCO       1
+#define NET_PROACTOR    2
 
 #define NET_SELECT NET_NTYCO
 
@@ -39,7 +38,7 @@
 #define ENABLE_AOF_SYNC      1   // 开启增量同步备份
 #define ENABLE_REPBUF        1   // 启动响应缓冲区，避免响应过大溢出
 
-#define ENABLE_MMAP         1
+
 
 /*
 ======================================= 底层网络架构 ======================================
@@ -205,7 +204,7 @@ int kvs_protocol(int fd, char *msg, int length, char *response);
 */
 #if ENABLE_PERSIST
 
-#if ENABLE_NEW_FUN
+#if ENABLE_URING
 #define SNAP_FILE "data/data_snap.snap"
 #define AOF_FILE   "data/data_aof.aof"
 int save_snapshots();

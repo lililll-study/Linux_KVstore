@@ -149,9 +149,6 @@ void kvs_mempool_destroy(mempool_t *pool) {
     }
 }
 
-// 大字符串分配函数
-
-// 
 int init_mempools(void) {
     // 数组：1024个item，2048个字符串（key+value）
     array_item_pool = kvs_mempool_create(sizeof(kvs_array_item_t), KVS_POOL_NODE_COUNT);

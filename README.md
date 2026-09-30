@@ -293,6 +293,50 @@ munmap()
 
 
 
+代码实现
+
+1 mmap把文件映射到进程虚拟地址空间
+
+要映射到虚拟地址空间的原因：CPU不能直接读磁盘文件，所以需要先把磁盘内容加载进内存。传统方式：read拷贝。内核从磁盘读文件到page cache（物理内存），然后把数据从pc拷贝进用户态缓冲区，CPU通过用户态缓冲区的虚拟地址访问数据。
+
+    问题是从磁盘→pc，再从pc->用户态空间，需要两次拷贝。
+
+mmap的方式：直接映射，char *p = mmap(...);内核建立虚拟地址->pc的页表映射，CPU通过p的虚拟地址直接访问pc，少了一次拷贝。关键：<mark>p是虚拟地址，页表把p映射到page cache的物理页，cpu访问p的时候直接访问pagecache。</mark>
+
+```c
+mf->data = mmap(NULL, mf->size, PROT_READ, MAP_PRIVATE, mf->fd, 0);
+         让内核自己选映射地址、映射多少字节、只读、只读场景写时复制
+
+一次拷贝
+磁盘
+  │ ① DMA 拷贝（磁盘 → page cache）
+  ↓
+page cache
+  │ ② 页表映射（虚拟地址 → page cache）
+  ↓
+进程虚拟地址空间（p）
+  │ ③ CPU 访问
+  ↓
+CPU 读到数据
+
+
+两次拷贝
+磁盘
+  │ ① DMA 拷贝（磁盘 → page cache）
+  ↓
+page cache
+  │ ② CPU 拷贝（page cache → 用户态 buf）
+  ↓
+用户态 buf
+  │ ③ CPU 访问
+  ↓
+CPU 读到数据
+```
+
+
+
+
+
 # 3 config配置
 
 通常情况下全量和增量只会选择一个开启，因此需要把全量同步和增量同步功能独立出来，然后通过config文件进行配置，比如说./kvstore --config master.conf启动主节点，./kvstore --config slave.conf启动从节点。
