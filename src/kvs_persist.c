@@ -6,26 +6,19 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-#if ENABLE_ARRAY
-extern kvs_array_t global_array;
-#endif
-
-#if ENABLE_RBTREE
+extern kvs_array_t  global_array;
 extern kvs_rbtree_t global_rbtree;
-#endif
-
-#if ENABLE_HASH
-extern kvs_hash_t global_hash;
-#endif
-
-#if ENABLE_SKIPTABLE
+extern kvs_hash_t   global_hash;
 extern kvs_skiptable_t global_skiptable;
-#endif
 
 #define READ_KEY 0
 #define READ_VALUE 1
 
-/*snap快照统一调度接口*/
+//================================
+/*aof and snap 基础框架定义*/
+//================================
+
+// snap快照统一调度接口
 typedef int (*snapshot_save_fn)(const char *filename);
 // 定义回调函数类型
 typedef int (*kv_set_fn)(void *inst, char *key, char *value);
@@ -49,7 +42,7 @@ typedef enum {
     CMD_SSET, CMD_SMOD, CMD_SDEL
 } aof_cmd_t;
 
-// 引擎配置
+// 引擎配置，和函数接口相对应
 static engine_persist_t engine_persist_table[] = {
     {"array",       save_snapshot_array},
     {"rbtree",      save_snapshot_rbtree},
@@ -58,6 +51,9 @@ static engine_persist_t engine_persist_table[] = {
     {NULL, NULL}
 };
 
+//================================
+/* mmap持久化数据加载 */
+//================================
 // mmap文件结构
 typedef struct {
     int fd;     // 文件描述符
@@ -65,12 +61,10 @@ typedef struct {
     char *data; // mmap返回的文件首地址
 } mmap_file_t;
 
+
+// 对内提供5个API接口
 #if ENABLE_MMAP
-/**
- * mmap_file_open：以只读方式打开持久化文件并映射到内存。
- * 成功后 mf->data 指向整个文件，mf->size 保存文件大小；
- * 后续读取直接通过 data + offset 完成，不再使用 stdio。
- */
+// 创建 aof文件到pagecache的映射，返回一个虚拟地址mf->data（指针）
 static int mmap_file_open(const char *filename, mmap_file_t *mf)
 {
     struct stat st;
@@ -93,7 +87,8 @@ static int mmap_file_open(const char *filename, mmap_file_t *mf)
 
     if (mf->size == 0)
         return 0;
-
+    // 把文件映射到进程的虚拟地址空间，返回
+    // 数据加载，采用只读模式
     mf->data = mmap(NULL, mf->size, PROT_READ, MAP_PRIVATE, mf->fd, 0);
     if (mf->data == MAP_FAILED) {
         int ret = -errno;
@@ -105,17 +100,14 @@ static int mmap_file_open(const char *filename, mmap_file_t *mf)
 
     return 0;
 }
-/**
- * mmap_file_close：解除文件映射并关闭文件描述符。
- * AOF 或 Snapshot 解析结束后调用，保证 mmap 区域和 fd 正确释放。
- */
+// 解除内存映射
 static void mmap_file_close(mmap_file_t *mf)
 {
     if (!mf)
         return;
 
     if (mf->data && mf->size)
-        munmap(mf->data, mf->size);
+        munmap(mf->data, mf->size); // 解除映射，从addr开始，长度len的内存映射
 
     if (mf->fd >= 0)
         close(mf->fd);
@@ -124,46 +116,33 @@ static void mmap_file_close(mmap_file_t *mf)
     mf->size = 0;
     mf->fd = -1;
 }
-/**
- * mmap_read_token：从 mmap 区域读取一个 $length\r\nvalue\r\n 格式的 token。
- * offset 表示当前解析位置，成功后自动移动到下一个 token；
- * 返回值独立分配内存，因此解除 mmap 后 key/value 仍然有效。
- */
+
+// 从mmap返回的虚拟地址拿数据，和从数组中取数据相同
+// 解析$len\r\nvalue\r\n
 static char *mmap_read_token(const char *data, size_t size, size_t *offset)
 {
     size_t pos;
     size_t len = 0;
     char *value;
+    if (!data || !offset || *offset >= size || data[*offset] != '$') return NULL;
 
-    if (!data || !offset || *offset >= size || data[*offset] != '$')
-        return NULL;
-
+    // 跳过$解析长度值
     pos = *offset + 1;
-
     while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
         len = len * 10 + (data[pos] - '0');
 
-        if (len > size)
-            return NULL;
-
+        if (len > size) return NULL;
         pos++;
     }
 
-    if (pos + 1 >= size || data[pos] != '\r' || data[pos + 1] != '\n')
-        return NULL;
-
-    pos += 2;
-
-    if (len > size - pos)
-        return NULL;
-
+    if (pos + 1 >= size || data[pos] != '\r' || data[pos + 1] != '\n') return NULL;
+    pos += 2;  // 跳过\r\n
+    // 此时应该到达value位置，value大小为len，size-len为value长度
+    if (len > size - pos) return NULL;
     value = malloc(len + 1);
-    if (!value)
-        return NULL;
-
+    if (!value) return NULL;
     memcpy(value, data + pos, len);
     value[len] = '\0';
-
     pos += len;
 
     if (pos + 1 >= size || data[pos] != '\r' || data[pos + 1] != '\n') {
@@ -171,19 +150,19 @@ static char *mmap_read_token(const char *data, size_t size, size_t *offset)
         return NULL;
     }
 
-    *offset = pos + 2;
-
+    *offset = pos + 2; // 跳过\r\n
     return value;
 }
 
 /**
  * mmap_read_command：从 mmap 区域读取 AOF 命令名，并将 offset 保持在后续 token 的 '$' 位置。
+ * aof数据格式：SET$1\r\na\r\n$1\r\n1\r\nSET$1\r\nb\r\n$1\r\n2\r\nDEL$1\r\na\r\n
  */
 static int mmap_read_command(const char *data, size_t size,
                              size_t *offset, char *cmd, size_t cmd_size)
 {
     size_t len = 0;
-
+    // 跳过换行符以及空格
     while (*offset < size &&
            (data[*offset] == '\r' ||
             data[*offset] == '\n' ||
@@ -191,14 +170,13 @@ static int mmap_read_command(const char *data, size_t size,
             data[*offset] == '\t')) {
         (*offset)++;
     }
-
+    // 没到末尾，就把cmd字符读入
     while (*offset < size &&
            data[*offset] != '$' &&
            data[*offset] != '\r' &&
            data[*offset] != '\n') {
         if (len + 1 < cmd_size)
             cmd[len++] = data[*offset];
-
         (*offset)++;
     }
 
@@ -281,6 +259,9 @@ static char* read_token(FILE *fp) {
 }
 
 #endif
+
+
+
 // ===== 写入一个 token =====
 static int write_token(FILE *fp, const char *data) {
     if (!data) return -1;
@@ -289,12 +270,6 @@ static int write_token(FILE *fp, const char *data) {
     return 0;
 }
 
-
-
-
-
-
-#if ENABLE_NEW_FUN
 static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
     if (node == T->nil || node == NULL) return;
     
@@ -305,27 +280,14 @@ static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
     
     travel_rbtree_node(T, node->right, fp);
 }
-#else
-// 递归遍历红黑树
-static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
-    if (node == T->nil || node == NULL) {
-        return; // 遇到哨兵节点或空节点则返回
-    }
-    // 1. 先遍历左子树
-    travel_rbtree_node(T, node->left, fp);
-    // 2. 保存当前节点（中序遍历的位置）
-    fprintf(fp, "%s %s\n", node->key, (char*)node->value);
-    // 3. 再遍历右子树
-    travel_rbtree_node(T, node->right, fp);
-}
-#endif
+
 
 
 
 
 /* 底层函数 */
-// 快照保存
-#if ENABLE_NEW_FUN
+// 快照保存 需要修改休🍉的地方，此处也应该改为uring的方式进行@@@@@@@@@@@@@@@@@@@@@@@@@
+#if 1
 int save_snapshot_array(const char *filename) {
     FILE *fp = fopen(filename, "a");
     if (!fp) return -1;
@@ -393,8 +355,8 @@ int save_snapshot_skiptable(const char *filename) {
     printf("Snapshot skiptable saved to %s\n", filename);
     return 0;
 }
-
-#else
+#endif 
+#if 0
 int save_snapshot_array(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) return -1;
@@ -456,15 +418,15 @@ int save_snapshot_skiptable(const char *filename) {
 
 
 
-
-#if ENABLE_NEW_FUN
+/* io_uring 功能封装*/
+#if ENABLE_URING
 
 // aof文件的fd，进程启动打开一次，且常开
 static int g_aof_fd = -1;
 // uring封装实例，管理写入队列和worker线程
 static kvs_uring_t *g_aof_uring = NULL;
 
-// 构建aof字节串
+// 1. 构建写入aof文件的resp数据
 static int build_aof_record(const char *cmd, const char *key, const char *value, char **out_buf, size_t *out_len) {
     if (!cmd || !key || !out_buf || !out_len)
         return -EINVAL;
@@ -490,7 +452,7 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     char *buf = (char *)malloc((size_t)need + 1);
     if (!buf)
         return -ENOMEM;
-
+    // 按照resp协议格式进行拼接
     if (value) {
         snprintf(buf, (size_t)need + 1,
                  "%s$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
@@ -507,11 +469,8 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     return 0;
 }
 
-// 进程启动时调用一次，初始化aof持久化的uring环境
-/**
- * 返回值：
- * 0：aof未启用/ 已经初始化过了/ 正常初始化成功
- */
+// 2. 进程启动时调用一次，初始化aof的uring环境
+// 调用方：init_kvsengine时
 int persistence_init(void)
 {
     if (!g_config.aof_enable) return 0;
@@ -549,6 +508,7 @@ int persistence_init(void)
 }
 
 /**
+ * 3. aof的异步写入
  * 业务层调用，异步写aof
  * 构造 AOF 字节串 → 入队到 io_uring → 立刻返回（不阻塞）
  */
@@ -613,36 +573,31 @@ int replay_aof(const char *filename)
     size_t offset = 0;
     int count = 0;
 
-    if (mmap_file_open(filename, &mf) < 0)
-        return -1;
+    // 打开aof文件
+    if (mmap_file_open(filename, &mf) < 0) return -1;
 
     if (mf.size == 0) {
         mmap_file_close(&mf);
         return 0;
     }
-
+    // 如果当前偏移小于文件大小，说明没读完
     while (offset < mf.size) {
         char cmd[16];
         char *key;
         char *value = NULL;
-
-        if (mmap_read_command(mf.data, mf.size,
-                              &offset, cmd, sizeof(cmd)) < 0)
+        // 读取cmd
+        if (mmap_read_command(mf.data, mf.size, &offset, cmd, sizeof(cmd)) < 0)
             break;
-
+        // 读取key
         key = mmap_read_token(mf.data, mf.size, &offset);
         if (!key) {
             printf("[AOF] ERROR: failed to read key\n");
             break;
         }
-
-        if (strcmp(cmd, "DEL") != 0 &&
-            strcmp(cmd, "RDEL") != 0 &&
-            strcmp(cmd, "HDEL") != 0 &&
-            strcmp(cmd, "SDEL") != 0) {
+        // 读value（cmd不为del，del没有value，而mod和set有）
+        if (strcmp(cmd, "DEL") != 0 && strcmp(cmd, "RDEL") != 0 && strcmp(cmd, "HDEL") != 0 && strcmp(cmd, "SDEL") != 0) {
 
             value = mmap_read_token(mf.data, mf.size, &offset);
-
             if (!value) {
                 printf("[AOF] ERROR: failed to read value\n");
                 free(key);
@@ -687,7 +642,6 @@ int replay_aof(const char *filename)
     return 0;
 }
 #else
-
 int replay_aof(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) return -1;
@@ -754,8 +708,9 @@ int replay_aof(const char *filename) {
     printf("Replayed %d entries from %s\n", count, filename);
     return 0;
 }
-
 #endif
+
+
 #else
 
 int append_aof(const char *cmd, const char *key, const char *value) {
@@ -854,7 +809,7 @@ int replay_aof(const char *filename) {
 
 
 
-#if ENABLE_NEW_FUN
+#if ENABLE_URING
 int save_snapshots() {
     // 先清空文件
     FILE *fp = fopen(SNAP_FILE, "w");
