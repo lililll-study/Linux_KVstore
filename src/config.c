@@ -7,7 +7,8 @@ kvs_config_t g_config = {
     .master_ip = "192.168.137.128",
     .master_port = 2000,
     .snap_enable = 1,      // 默认开启快照同步
-    .aof_enable = 0        // 默认关闭 AOF 同步
+    .aof_enable = 0,        // 默认关闭 AOF 同步
+    .aof_mode = AOF_MODE_EVERYSEC,
 };
 
 // ===== 去除字符串首尾空白 =====
@@ -96,8 +97,20 @@ int kvs_config_load(const char *filename) {
         } else if (subkey && strcmp(key, "aof") == 0) {
             if (strcmp(subkey, "enable") == 0) {
                 g_config.aof_enable = parse_bool(value);
+            } else if (strcmp(subkey, "mode") == 0) {
+                if (strcmp(value, "everysec") == 0) {
+                    g_config.aof_mode = AOF_MODE_EVERYSEC;
+                } else if (strcmp(value, "immediate") == 0) {
+                    g_config.aof_mode = AOF_MODE_IMMEDIATE;
+                }
             }
-        } else {
+        }
+        
+        
+        
+        
+        
+        else {
             printf("[Config] Unknown key: %s\n", key);
         }
     }
@@ -116,6 +129,7 @@ void kvs_config_print(void) {
     }
     printf("  snap.enable : %s\n", g_config.snap_enable ? "true" : "false");
     printf("  aof.enable  : %s\n", g_config.aof_enable ? "true" : "false");
+    printf("  aof.mode    : %s\n", g_config.aof_mode == AOF_MODE_EVERYSEC ? "everysec" : "immediate");
     printf("============================\n");
 }
 
