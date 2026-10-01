@@ -4,21 +4,10 @@
 
 
 
-#if ENABLE_ARRAY
 extern kvs_array_t global_array;
-#endif
-
-#if ENABLE_RBTREE
 extern kvs_rbtree_t global_rbtree;
-#endif
-
-#if ENABLE_HASH
 extern kvs_hash_t global_hash;
-#endif
-
-#if ENABLE_SKIPTABLE
 extern kvs_skiptable_t global_skiptable;
-#endif
 
 extern mempool_t *resp_pool;
 
@@ -81,6 +70,23 @@ enum {
 
 const char *response[] = {};
 
+// ===== 从机自动连接线程 =====
+static void* slave_sync_thread(void* arg) {
+    sleep(1);
+    printf("[SLAVE] Auto connecting to master %s:%d\n",
+           g_config.master_ip, g_config.master_port);
+
+    while (1) {
+        int ret = sync_from_master(g_config.master_ip, g_config.master_port);
+        if (ret == 0) {
+            printf("[SLAVE] Sync started\n");
+            break;
+        }
+        printf("[SLAVE] Sync failed, retry in 5s\n");
+        sleep(5);
+    }
+    return NULL;
+}
 
 int check_datafile_exist() {
     struct stat st = {0};
@@ -209,6 +215,11 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof("SET", key, value);  // 追加AOF
+
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("SET", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -230,6 +241,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("DEL", key, NULL);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("DEL", key, NULL);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -242,6 +257,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("MOD", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("MOD", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -263,6 +282,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof("RSET", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("RSET", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -284,6 +307,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("RDEL", key, NULL);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("RDEL", key, NULL);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -296,6 +323,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("RMOD", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("RMOD", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -317,6 +348,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("HSET", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("HSET", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -338,6 +373,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("HDEL", key, NULL);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("HDEL", key, NULL);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -349,6 +388,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("HMOD", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("HMOD", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -370,6 +413,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
                 append_aof("SSET", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("SSET", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("exist\r\n");
@@ -391,6 +438,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("SDEL", key, NULL);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("SDEL", key, NULL);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -403,6 +454,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
                 append_aof("SMOD", key, value);  // 追加AOF
+                // ===== immediate 同步 =====
+                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                    aof_master_immediate("SMOD", key, value);
+                }
                 SAFE_APPEND("ok\r\n");
             } else {
                 SAFE_APPEND("no exist\r\n");
@@ -421,25 +476,21 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #if ENABLE_PERSIST
 #if ENABLE_URING
         case KVS_CMD_SAVE:
-            // 等待所有已经提交到aof的写请求落盘
-            ret = persistence_flush();
-            if (ret != 0) {
-                printf("[SAVE] AOF flush failed: %s\n", strerror(-ret));
-                SAFE_APPEND("error\r\n");
+            // SAVE 只在 SNAP 模式有效
+            if (!g_config.snap_enable) {
+                SAFE_APPEND("error: SAVE only in SNAP mode\r\n");
+                break;
+            }
+            ret = save_snapshots();
+            // 如果是从机的 SAVE 请求，发送 SNAP
+            if (g_config.snap_enable && is_slave_save(fd)) {
+                send_file(fd, SNAP_FILE);
+                safe_send(fd, "END\n", 4);
+                SAFE_APPEND("ok\r\n");
                 break;
             }
 
-            ret = save_snapshots();
-            if (ret == 0) {
-                // 清空aof文件，并把uring的写入偏移重置
-                ret = persistence_reset_aof();
-            }
-
-            if (ret == 0) {
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("error\r\n");
-            }
+            SAFE_APPEND(ret == 0 ? "ok\r\n" : "error\r\n");
             break;
 #else
         case KVS_CMD_SAVE:
@@ -613,32 +664,34 @@ printf("------------ 2. kvs_engine created ----\n");
 
 
 #if ENABLE_PERSIST
-    // 先加载快照（只有配置开启 snap 才加载）
-    if (g_config.snap_enable) {
-        if (load_snapshots() != 0) {
-            printf("No snapshot found\n");
-        }
-        printf("------------ 3. Snapshots loaded ---\n");
+    if (g_config.role == ROLE_SLAVE) {
+        // 从机：不加载本地 SNAP/AOF（数据从主机来）
+        printf("------------ 3. SLAVE mode, skip local snapshots ---\n");
+        printf("------------ 4. SLAVE mode, skip local AOF ---\n");
     } else {
-        printf("------------ 3. Snapshots disabled, skip load ---\n");
-    }
+        // 主机：正常加载
+        if (g_config.snap_enable) {
+            if (load_snapshots() != 0) {
+                printf("No snapshot found\n");
+            }
+            printf("------------ 3. Snapshots loaded ---\n");
+        } else {
+            printf("------------ 3. Snapshots disabled ---\n");
+        }
 
-    // 再重放 AOF（只有配置开启 aof 才重放）
-    if (g_config.aof_enable) {
-        replay_aof(AOF_FILE);
-        printf("------------ 4. AOF done ---\n");
+        if (g_config.aof_enable) {
+            replay_aof(AOF_FILE);
+            printf("------------ 4. AOF done ---\n");
 #if ENABLE_URING
-        /*
-         * Recovery must finish before live AOF appends begin.
-         */
-        if (persistence_init() != 0) {
-            printf("------------ 5. AOF io_uring init FAILED ---\n");
-            return -1;
-        }
-        printf("------------ 5. AOF io_uring writer started ---\n");
+            if (persistence_init() != 0) {
+                printf("------------ 5. AOF io_uring init FAILED ---\n");
+                return -1;
+            }
+            printf("------------ 5. AOF io_uring writer started ---\n");
 #endif
-    } else {
-        printf("------------ 4. AOF disabled, skip replay ---\n");
+        } else {
+            printf("------------ 4. AOF disabled ---\n");
+        }
     }
 #endif
 
@@ -782,12 +835,16 @@ int main(int argc, char *argv[]) {
     // 用于创建kv存储全局单例内存块global_array
     init_kvengine();
 
-    // 如果是从节点：创建 CLI 线程
     if (g_config.role == ROLE_SLAVE) {
-    // ===== 创建 CLI 线程 =====
+        // 从机：启动自动同步线程
+        pthread_t sync_tid;
+        pthread_create(&sync_tid, NULL, slave_sync_thread, NULL);
+        pthread_detach(sync_tid);
+
+        // 可选：保留 CLI
         pthread_t cli_tid;
         pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
-    // =========================    
+        pthread_detach(cli_tid);
     }
 
 #if (NET_SELECT == NET_REACTOR)
