@@ -10,12 +10,12 @@ INC_DIR = include
 
 #       $(SRC_DIR)/reactor.c 
 SRCS = $(SRC_DIR)/kvstore.c \
-       $(SRC_DIR)/kvs_array.c \
-       $(SRC_DIR)/kvs_rbtree.c \
-       $(SRC_DIR)/kvs_hash.c \
-       $(SRC_DIR)/kvs_skiptable.c \
+       $(SRC_DIR)/kvs_eg_array.c \
+       $(SRC_DIR)/kvs_eg_rbtree.c \
+       $(SRC_DIR)/kvs_eg_hash.c \
+       $(SRC_DIR)/kvs_eg_skiptable.c \
        $(SRC_DIR)/kvs_persist.c \
-	   $(SRC_DIR)/kvs_uring.c \
+	   $(SRC_DIR)/uring.c \
 	   $(SRC_DIR)/resp.c \
 	   $(SRC_DIR)/kvs_mempool.c \
 	   $(SRC_DIR)/config.c \
