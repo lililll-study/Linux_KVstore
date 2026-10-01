@@ -38,7 +38,7 @@
 #define ENABLE_AOF_SYNC      1   // 开启增量同步备份
 #define ENABLE_REPBUF        1   // 启动响应缓冲区，避免响应过大溢出
 
-
+#define ENABLE_SYNC_MODIFY 1    // 修改主从同步逻辑
 
 /*
 ======================================= 底层网络架构 ======================================
@@ -372,23 +372,36 @@ int resp_buf_has_data(kvs_conn_ctx_t *ctx);
 #if ENABLE_SYNC
 #define SYNC_BUFFER_SIZE 2000
 
+// ===== 心跳（RESP 格式） =====
+#define HEARTBEAT_CMD     "*1\r\n$4\r\nPING\r\n"   // 14 字节
+#define HEARTBEAT_CMD_LEN 14
+#define HEARTBEAT_INTERVAL 5                        // 秒
+
 extern int g_is_master;
 
-// 同步函数
-int handle_sync_request(int fd);          // 主节点：处理同步
-int sync_from_master(const char *master_ip, int port);	// 由从节点发起同步
+// ======== 主从同步接口 ===========
+int handle_sync_request(int fd);                        // 主机：处理 SYNC
+int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
+
+int safe_send(int fd, const char* data, int len);
 // 主节点传输和从节点接收
 int send_file(int fd, const char *filepath);
-int recv_file(int fd, const char *save_dir);
+int recv_file_from_master(int fd, const char *save_dir);
 
-#if ENABLE_AOF_SYNC
-// 函数声明
+
+// 主从同步改造
+int aof_master_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
+void slave_handle_aof_mode(int fd); // ===== 从机：接收 mode 后分支 =====
+void slave_handle_snap_mode(int fd);
+int is_slave_save(int fd);
+
 void init_aof_sync_ctx(void);
-void disconnect_aof_sync(void);
-void* aof_master_check_thread(void* arg);
-void* aof_slave_recv_thread(void* arg);
 
-#endif
+// 线程
+void* aof_master_check_thread(void* arg);   //  主机：AOF everysec 模式
+void* aof_slave_recv_thread(void* arg);      // 从机：AOF 模式
+void* snap_slave_thread(void* arg);         // 从机：SNAP 模式
+
 
 #endif
 
@@ -396,6 +409,11 @@ void* aof_slave_recv_thread(void* arg);
 ======================================= 6.  配置config ======================================
 ==========================================================================================
 */
+
+// AOF 同步方式
+#define AOF_MODE_EVERYSEC   0
+#define AOF_MODE_IMMEDIATE  1
+
 typedef enum {
     ROLE_MASTER = 0,
     ROLE_SLAVE
@@ -409,6 +427,8 @@ typedef struct {
 
     int snap_enable;
     int aof_enable;
+
+    int aof_mode;       // 0: everysec, 1: immediate
 } kvs_config_t;
 
 extern kvs_config_t g_config;
