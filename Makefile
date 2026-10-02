@@ -63,6 +63,12 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 
+# ===== kvs_sync.o 专用规则：绕过 NtyCo hook =====
+# 注意：必须放在通用规则之后，Make 后定义的规则优先
+$(BUILD_DIR)/kvs_sync.o: $(SRC_DIR)/kvs_sync.c
+	$(CC) $(CFLAGS) -DSYNC_RAW_IO -c $< -o $@
+	@echo "Build complete (raw IO): $@"
+
 clean:
 	rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
