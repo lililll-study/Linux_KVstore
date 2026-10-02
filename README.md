@@ -107,8 +107,19 @@ aof.enable=false
 # 1. 启动主机
 ./build/kvstore --config config/master.conf
 
-# 2. 跑完整流程（内部会 sleep 等从机）
-./build/5_persist_sync_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+# 测试端：连接主机并插入5w条数据
+./build/3_sync_testcase 192.168.137.134 2000 1
+
+# 2. 启动从机
+./build/kvstore --config config/slave.conf
+
+
+# 测试端：再向主机插入5w条数据
+./build/3_sync_testcase 192.168.137.134 2000 2
+
+
+# 测试端：连从机，验证 10w
+./build/3_sync_testcase 192.168.137.135 2001 3
 ```
 
 

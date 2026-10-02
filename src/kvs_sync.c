@@ -8,6 +8,18 @@
 #include <fcntl.h>     
 #include <errno.h>
 
+/* ===== 当定义 SYNC_RAW_IO 时，绕过 NtyCo hook，直接走系统调用 ===== */
+#ifdef SYNC_RAW_IO
+#include <sys/syscall.h>
+
+#define socket(d, t, p)         syscall(SYS_socket, d, t, p)
+#define connect(f, a, l)        syscall(SYS_connect, f, a, l)
+#define send(f, b, l, g)        syscall(SYS_sendto, f, b, l, g, NULL, 0)
+#define recv(f, b, l, g)        syscall(SYS_recvfrom, f, b, l, g, NULL, NULL)
+#define select(n, r, w, e, t)   syscall(SYS_select, n, r, w, e, t)
+#define close(f)                syscall(SYS_close, f)
+#endif
+
 
 #if ENABLE_AOF_SYNC
 // AOF 文件列表（单文件）

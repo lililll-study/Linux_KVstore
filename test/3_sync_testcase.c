@@ -93,10 +93,10 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
 }
 
 /* ============================================================
- * 向指定连接插入 [start, start+count) 条数据
+ * 插入 [start, start+count)
  * ============================================================ */
 static int insert_range(int connfd, int start, int count) {
-    int cap = count * 48;
+    int cap = count * 64;
     char *batch = malloc(cap);
     char *resp  = malloc(cap);
     if (!batch || !resp) { free(batch); free(resp); return -1; }
@@ -117,7 +117,6 @@ static int insert_range(int connfd, int start, int count) {
     gettimeofday(&tv_cur, NULL);
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
-    /* 统计 ok 个数 */
     int ok_count = 0;
     char *p = resp;
     for (i = 0; i < count; i++) {
@@ -137,10 +136,10 @@ static int insert_range(int connfd, int start, int count) {
 }
 
 /* ============================================================
- * 从指定连接读取 [start, start+count) 条数据并校验
+ * 验证 [start, start+count)
  * ============================================================ */
 static int verify_range(int connfd, int start, int count) {
-    int cap = count * 48;
+    int cap = count * 64;
     char *batch = malloc(cap);
     char *resp  = malloc(cap);
     if (!batch || !resp) { free(batch); free(resp); return -1; }
@@ -189,131 +188,56 @@ static int verify_range(int connfd, int start, int count) {
 }
 
 /* ============================================================
- * 探测从机是否已完成同步：尝试 GET 第一条 key
- * 返回 1 表示同步完成（能拿到值），0 表示还没同步好
- * ============================================================ */
-static int probe_slave_synced(int connfd, int timeout_sec) {
-    char cmd[128];
-    char resp[128];
-    int cmd_len = snprintf(cmd, sizeof(cmd),
-                           "*1\r\n*2\r\n$3\r\nGET\r\n$9\r\nps_000000\r\n");
-
-    int waited = 0;
-    while (waited < timeout_sec * 10) {
-        send(connfd, cmd, cmd_len, 0);
-
-        int total = 0;
-        while (total < (int)sizeof(resp) - 1) {
-            int n = recv(connfd, resp + total, sizeof(resp) - 1 - total, 0);
-            if (n <= 0) break;
-            total += n;
-            resp[total] = '\0';
-            if (strstr(resp, "\r\n")) break;
-        }
-        if (total > 0) {
-            resp[strcspn(resp, "\r\n")] = '\0';
-            if (strncmp(resp, "val_", 4) == 0) {
-                return 1;   /* 同步完成 */
-            }
-        }
-        usleep(100 * 1000);  /* 100ms */
-        waited++;
-    }
-    return 0;
-}
-
-/* ============================================================
- * main
+ * main：3 个参数，4 个阶段
+ *   mode 1: 连主机，插入前 5w
+ *   mode 2: 连主机，插入后 5w
+ *   mode 3: 连从机，验证 10w
+ *   mode 4: 连任意一端，验证 [0, 5w) 或 [5w, 10w)（可选）
  * ============================================================ */
 int main(int argc, char *argv[]) {
-    if (argc != 6) {
-        printf("Usage: %s <master_ip> <master_port> <slave_ip> <slave_port> <mode>\n", argv[0]);
-        printf("  mode 1: 完整流程（插5w -> 等你启动从机 -> 插5w -> 验从机10w）\n");
-        printf("  mode 2: 只插前5w（然后手动启动从机）\n");
-        printf("  mode 3: 只插后5w\n");
-        printf("  mode 4: 只验证从机10w\n");
+    if (argc != 4) {
+        printf("Usage: %s <ip> <port> <mode>\n", argv[0]);
+        printf("  mode 1: 连主机，插入前 5w 条 (ps_000000 ~ ps_049999)\n");
+        printf("  mode 2: 连主机，插入后 5w 条 (ps_050000 ~ ps_099999)\n");
+        printf("  mode 3: 连从机，验证 10w 条\n");
         return -1;
     }
 
-    const char *master_ip = argv[1];
-    int master_port = atoi(argv[2]);
-    const char *slave_ip  = argv[3];
-    int slave_port  = atoi(argv[4]);
-    int mode = atoi(argv[5]);
+    const char *ip = argv[1];
+    int port = atoi(argv[2]);
+    int mode = atoi(argv[3]);
+
+    int connfd = connect_tcpserver(ip, port);
+    if (connfd < 0) {
+        printf("connect %s:%d failed\n", ip, port);
+        return -1;
+    }
 
     if (mode == 1) {
-        /* ---------- 1. 连接主机，插入前 5w ---------- */
-        int conn_master = connect_tcpserver(master_ip, master_port);
-        if (conn_master < 0) { printf("connect master failed\n"); return -1; }
-
-        printf("===== 阶段1: 向主机插入前 5w 条 =====\n");
-        insert_range(conn_master, 0, TEST_COUNT);
-
-        printf("\n>>> 现在请启动从机，从机会自动同步。\n");
-        printf(">>> 等待 10 秒后继续（可按回车提前继续）...\n");
-        sleep(10);
-
-        /* ---------- 2. 再插入后 5w ---------- */
-        printf("\n===== 阶段2: 向主机插入后 5w 条 =====\n");
-        insert_range(conn_master, TEST_COUNT, TEST_COUNT);
-
-        printf("\n>>> 再等 5 秒，让从机同步后 5w...\n");
-        sleep(5);
-
-        close(conn_master);
-
-        /* ---------- 3. 连接从机，验证 10w ---------- */
-        printf("\n===== 阶段3: 连接从机，验证 10w 条 =====\n");
-        int conn_slave = connect_tcpserver(slave_ip, slave_port);
-        if (conn_slave < 0) { printf("connect slave failed\n"); return -1; }
-
-        /* 先探测从机是否同步好 */
-        printf(">>> 探测从机同步状态...\n");
-        if (probe_slave_synced(conn_slave, 30)) {
-            printf(">>> 从机已同步\n");
-        } else {
-            printf(">>> 警告：从机 30 秒内未同步好，仍然继续验证\n");
-        }
-
-        int fail1 = verify_range(conn_slave, 0, TEST_COUNT);
-        int fail2 = verify_range(conn_slave, TEST_COUNT, TEST_COUNT);
+        printf("===== 阶段1: 向主机 %s:%d 插入前 5w 条 =====\n", ip, port);
+        int ok = insert_range(connfd, 0, TEST_COUNT);
+        printf("\n>>> 阶段1 完成（ok=%d）。请启动从机，等从机同步完成后执行 mode 2。\n", ok);
+    }
+    else if (mode == 2) {
+        printf("===== 阶段3: 向主机 %s:%d 插入后 5w 条 =====\n", ip, port);
+        int ok = insert_range(connfd, TEST_COUNT, TEST_COUNT);
+        printf("\n>>> 阶段3 完成（ok=%d）。等从机同步后，执行 mode 3 验证。\n", ok);
+    }
+    else if (mode == 3) {
+        printf("===== 阶段4: 从从机 %s:%d 验证 10w 条 =====\n", ip, port);
+        int fail1 = verify_range(connfd, 0, TEST_COUNT);
+        int fail2 = verify_range(connfd, TEST_COUNT, TEST_COUNT);
 
         printf("\n===== 结果 =====\n");
         if (fail1 == 0 && fail2 == 0)
             printf("==> ALL PASS (10w 条一致)\n");
         else
             printf("==> FAILED (前5w fail=%d, 后5w fail=%d)\n", fail1, fail2);
-
-        close(conn_slave);
     }
-    else if (mode == 2) {
-        int conn_master = connect_tcpserver(master_ip, master_port);
-        if (conn_master < 0) return -1;
-        printf("===== 插入前 5w =====\n");
-        insert_range(conn_master, 0, TEST_COUNT);
-        close(conn_master);
-        printf(">>> 现在启动从机，等同步好后跑 mode 3\n");
-    }
-    else if (mode == 3) {
-        int conn_master = connect_tcpserver(master_ip, master_port);
-        if (conn_master < 0) return -1;
-        printf("===== 插入后 5w =====\n");
-        insert_range(conn_master, TEST_COUNT, TEST_COUNT);
-        close(conn_master);
-        printf(">>> 等从机同步好，跑 mode 4\n");
-    }
-    else if (mode == 4) {
-        int conn_slave = connect_tcpserver(slave_ip, slave_port);
-        if (conn_slave < 0) return -1;
-        printf("===== 验证从机 10w =====\n");
-        int fail1 = verify_range(conn_slave, 0, TEST_COUNT);
-        int fail2 = verify_range(conn_slave, TEST_COUNT, TEST_COUNT);
-        if (fail1 == 0 && fail2 == 0)
-            printf("==> ALL PASS\n");
-        else
-            printf("==> FAILED (fail1=%d, fail2=%d)\n", fail1, fail2);
-        close(conn_slave);
+    else {
+        printf("Unknown mode: %d\n", mode);
     }
 
+    close(connfd);
     return 0;
 }
