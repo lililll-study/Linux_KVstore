@@ -381,27 +381,31 @@ extern int g_is_master;
 
 // ======== 主从同步接口 ===========
 int handle_sync_request(int fd);                        // 主机：处理 SYNC
-int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
+
 
 int safe_send(int fd, const char* data, int len);
 // 主节点传输和从节点接收
-int send_file(int fd, const char *filepath);
+int send_file_to_slave(int fd, const char *filepath);
 int recv_file_from_master(int fd, const char *save_dir);
 
 
 // 主从同步改造
-int aof_master_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
-void slave_handle_aof_mode(int fd); // ===== 从机：接收 mode 后分支 =====
-void slave_handle_snap_mode(int fd);
+
 int is_slave_save(int fd);
 
 void init_aof_sync_ctx(void);
 
-// 线程
-void* aof_master_check_thread(void* arg);   //  主机：AOF everysec 模式
-void* aof_slave_recv_thread(void* arg);      // 从机：AOF 模式
-void* snap_slave_thread(void* arg);         // 从机：SNAP 模式
+// 主节点同步模式及线程函数
+void* master_aof_everysec_thread(void* arg);   //  主机：AOF everysec 模式
+int master_aof_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
 
+
+// 从节点处理同步数据线程，以及接口函数
+void* slave_aof_recv_thread(void* arg); 
+void* slave_snap_recv_thread(void* arg); 
+void slave_handle_aof_mode(int fd); 
+void slave_handle_snap_mode(int fd);
+int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 
 #endif
 
