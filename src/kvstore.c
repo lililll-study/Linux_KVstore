@@ -510,7 +510,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
 #if ENABLE_SYNC
         case KVS_CMD_SYNC:
-            printf("sync now\n");
+            printf("[SYNC] begin\n");
             if (g_is_master) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
@@ -829,9 +829,9 @@ int main(int argc, char *argv[]) {
         pthread_detach(sync_tid);
 
         // 可选：保留 CLI
-        pthread_t cli_tid;
-        pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
-        pthread_detach(cli_tid);
+        // pthread_t cli_tid;
+        // pthread_create(&cli_tid, NULL, cli_thread, &g_is_master);
+        // pthread_detach(cli_tid);
     }
 
 #if (NET_SELECT == NET_REACTOR)
