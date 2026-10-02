@@ -41,9 +41,9 @@ make
 
 
 
-## 持久化
+# 持久化
 
-### 1 增量持久化
+## 1 增量持久化
 
 配置文件master.conf
 
@@ -70,7 +70,7 @@ aof.enable=true
 
 
 
-### 2 全量持久化
+## 2 全量持久化
 
 配置文件master.conf
 
@@ -96,6 +96,20 @@ aof.enable=false
 ```
 
 
+
+
+
+# 主从同步
+
+
+
+```bash
+# 1. 启动主机
+./build/kvstore --config config/master.conf
+
+# 2. 跑完整流程（内部会 sleep 等从机）
+./build/5_persist_sync_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+```
 
 
 
