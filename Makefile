@@ -1,12 +1,17 @@
 
 CC = gcc
 TARGET = build/kvstore
-TESTCASE_TARGET = build/testcase
-SNAP_AOF_TARGET = build/snap_aof_test
 BUILD_DIR = build
 SRC_DIR = src
 TEST_DIR = test
 INC_DIR = include
+
+# 测试用例列表（每个独立编译）
+TEST_SRCS = $(TEST_DIR)/2_presist_testcase.c \
+			$(TEST_DIR)/1_RESP_testcase.c \
+            $(TEST_DIR)/aof_snap_test.c
+# ===== 每个测试用例对应的可执行文件 =====
+TEST_TARGETS = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_SRCS))
 
 #       $(SRC_DIR)/reactor.c 
 SRCS = $(SRC_DIR)/kvstore.c \
@@ -33,8 +38,8 @@ LIBS = -L ./NtyCo/lib/ -lntyco -lpthread -ldl
 TEST_LIBS = -lpthread -ldl
 CFLAGS = -Wall -g $(INC)
 
-# 默认目标
-all: dirs $(TARGET) $(TESTCASE_TARGET) $(SNAP_AOF_TARGET)
+# 默认目标：服务端 + 所有测试端
+all: dirs $(TARGET) $(TEST_TARGETS)
 
 # 创建必要的目录
 dirs:
@@ -46,15 +51,10 @@ $(TARGET): $(OBJS)
 	$(CC) -no-pie -o $@ $(OBJS) $(LIBS)
 	@echo "Build complete: $(TARGET)"
 
-# ===== 编译测试端 1：testcase =====
-$(TESTCASE_TARGET): $(TEST_DIR)/testcase.c
-	$(CC) -no-pie $(CFLAGS) -o $@ $< $(TEST_LIBS)
-	@echo "Build complete: $(TESTCASE_TARGET)"
-
-# ===== 编译测试端 2：snap_aof_test =====
-$(SNAP_AOF_TARGET): $(TEST_DIR)/snap_aof_test.c
-	$(CC) -no-pie $(CFLAGS) -o $@ $< $(TEST_LIBS)
-	@echo "Build complete: $(SNAP_AOF_TARGET)"
+# ===== 编译测试端：链接 config.o（读配置用） =====
+$(BUILD_DIR)/%: $(TEST_DIR)/%.c $(BUILD_DIR)/config.o
+	$(CC) -no-pie $(CFLAGS) -o $@ $< $(BUILD_DIR)/config.o $(TEST_LIBS)
+	@echo "Build complete: $@"
 
 
 # ===== 编译 src/ 下的 .c =====
@@ -62,13 +62,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 
-# 清理
 clean:
-	rm -rf $(OBJS) $(TARGET) $(TESTCASE_TARGET) $(SNAP_AOF_TARGET)
+	rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
-cleanall: clean
-	rm -rf $(BUILD_DIR)
-	@echo "Clean all complete"
 
-.PHONY: all clean cleanall dirs $(SUBDIR)
+.PHONY: all clean cleanall dirs
