@@ -13,13 +13,39 @@ make
 
 
 
+# 批处理
+
+
+
+```bash
+# 全部 QPS 测试（推荐）
+
+./build/1_RESP_testcase 127.0.0.1 2000 5
+
+# 或者单独跑
+./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
+
+./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
+
+./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
+
+./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
+
+
+错误格式检测
+./build/1_RESP_testcase 127.0.0.1 2000 10（存在bug）
+批量发送10w条set，最后一条99999号，会无法写入内存
+```
+
+
+
 
 
 ## 持久化
 
 ### 1 增量持久化
 
-master.conf
+配置文件master.conf
 
 ```bash
 # 主节点配置
@@ -31,9 +57,22 @@ snap.enable=false
 aof.enable=true
 ```
 
+测试
+
+```bash
+# AOF 测试
+./build/2_presist_testcase 192.168.137.128 2000 1
+# 插入完成后，重启服务端
+./build/kvstore --config master.conf
+# 测试端读取aof加载的数据
+./build/2_presist_testcase 192.168.137.128 2000 2
+```
+
 
 
 ### 2 全量持久化
+
+配置文件master.conf
 
 ```bash
 # 主节点配置
@@ -45,34 +84,18 @@ snap.enable=true
 aof.enable=false
 ```
 
-
-
-### 3 功能测试
-
-aof
-
-```bash
-# AOF 测试
-./build/snap_aof_test 192.168.137.128 2000 1
-# 插入完成后，重启服务端
-./build/kvstore --config master.conf
-# 测试端读取aof加载的数据
-./build/snap_aof_test 192.168.137.128 2000 2
-
-```
-
-
-
-snap
+测试
 
 ```bash
 # SNAP 测试
-./build/snap_aof_test 192.168.137.128 2000 3
+./build/2_presist_testcase 192.168.137.128 2000 3
 # 插入完成后，重启服务端
 ./build/kvstore --config master.conf
 # 测试端读取aof加载的数据
-./build/snap_aof_test 192.168.137.128 2000 4
+./build/2_presist_testcase 192.168.137.128 2000 4
 ```
+
+
 
 
 
