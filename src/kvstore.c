@@ -218,7 +218,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("SET", key, value);
+                    master_aof_immediate("SET", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -243,7 +243,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("DEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("DEL", key, NULL);
+                    master_aof_immediate("DEL", key, NULL);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -259,7 +259,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("MOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("MOD", key, value);
+                    master_aof_immediate("MOD", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -284,7 +284,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("RSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("RSET", key, value);
+                    master_aof_immediate("RSET", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -309,7 +309,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("RDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("RDEL", key, NULL);
+                    master_aof_immediate("RDEL", key, NULL);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -325,7 +325,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("RMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("RMOD", key, value);
+                    master_aof_immediate("RMOD", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -350,7 +350,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("HSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("HSET", key, value);
+                    master_aof_immediate("HSET", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -375,7 +375,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("HDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("HDEL", key, NULL);
+                    master_aof_immediate("HDEL", key, NULL);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -390,7 +390,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("HMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("HMOD", key, value);
+                    master_aof_immediate("HMOD", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -415,7 +415,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("SSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("SSET", key, value);
+                    master_aof_immediate("SSET", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -440,7 +440,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("SDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("SDEL", key, NULL);
+                    master_aof_immediate("SDEL", key, NULL);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -456,7 +456,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 append_aof("SMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    aof_master_immediate("SMOD", key, value);
+                    master_aof_immediate("SMOD", key, value);
                 }
                 SAFE_APPEND("ok\r\n");
             } else {
@@ -484,7 +484,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             ret = save_snapshots();
             // 如果是从机的 SAVE 请求，发送 SNAP
             if (g_config.snap_enable && is_slave_save(fd)) {
-                send_file(fd, SNAP_FILE);
+                send_file_to_slave(fd, SNAP_FILE);
                 safe_send(fd, "END\n", 4);
                 SAFE_APPEND("ok\r\n");
                 break;
@@ -515,21 +515,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
                 break;
-        // 并且会发送 AOF_SYNC_OK 确认
-            } else {
-                // 从节点：发起同步
-                if (count < 3) {
-                    SAFE_APPEND("error: need master_ip, port\r\n");
-                    break;
-                }
-                char *maser_ip = tokens[1];
-                int port = atoi(tokens[2]);
-                ret = sync_from_master(maser_ip, port);
-                if (ret < 0) {
-                    SAFE_APPEND("error\r\n");
-                } else if (ret == 0) {
-                    SAFE_APPEND("ok\r\n");
-                }
+            // 并且会发送 AOF_SYNC_OK 确认
             }
             break;
 #endif
@@ -807,7 +793,7 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
- //  ./kvstore --config master.conf
+/*=====================加载配置========================*/
     const char *config_file = NULL;
     int i = 0;
     for (i = 1; i < argc; i++) {
@@ -823,6 +809,7 @@ int main(int argc, char *argv[]) {
     if (kvs_config_load(config_file) < 0) {
         return -1;
     }
+    // 打印配置
     kvs_config_print();
     // 设置全局角色
     g_is_master = (g_config.role == ROLE_MASTER);
