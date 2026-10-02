@@ -488,7 +488,8 @@ void* slave_snap_recv_thread(void* arg) {
         sleep(10);
 
         // 1. 发 SAVE 给主机（SAVE 本身即心跳）
-        if (safe_send(fd, "*1\r\n$4\r\nSAVE\r\n", 14) < 0) break;
+        const char *save_cmd = "*1\r\n*1\r\n$4\r\nSAVE\r\n";
+        if (safe_send(fd, save_cmd, strlen(save_cmd)) < 0) break;
 
         // 2. 接收 SNAP 文件
         while (1) {
@@ -618,7 +619,12 @@ int sync_from_master(const char *master_ip, int port) {
 
     printf("Connected to master\n");
 
-    safe_send(fd, "SYNC\n", 5);
+    const char *sync_cmd = "*1\r\n*1\r\n$4\r\nSYNC\r\n";
+    if (safe_send(fd, sync_cmd, strlen(sync_cmd)) < 0) {
+        perror("send SYNC");
+        close(fd);
+        return -1;
+    }
 
     // 接收 mode
     char mode[16] = {0};
