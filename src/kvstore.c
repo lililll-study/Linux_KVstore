@@ -153,7 +153,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
     // 解析到错误token后，应该打印错误的token信息，然后跳过这条cmd命令，继续执行后续的。
     if (cmd >= KVS_CMD_COUNT) {
-        printf("[ERROR] unknown command token: '%s'\n", tokens[0]);
+        // printf("[ERROR] unknown command token: '%s'\n", tokens[0]);
 
         const char *err = "error: unknown command\r\n";
         int err_len = strlen(err);

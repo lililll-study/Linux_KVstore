@@ -365,14 +365,42 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                     }
                     exec_ret = kvs_filter_protocol(fd, tokens, i, NULL);
                 }
+                #if 0
                 // ===== 命令执行失败：跳过当前命令 =====
                 if (exec_ret < 0) {
                     printf("[RESP] skip bad cmd: start=%d, end=%d, remain=%d\n",
                         ctx->resp_cmd_start, processed_data,
                         ctx->cmd_buffer_len - processed_data);
                     resp_reset_and_consume(ctx, processed_data);
-                    return 0;
+                    continue;
                 }
+                #else
+                if (exec_ret < 0) {
+                    int bad_cmd_len = processed_data - ctx->resp_cmd_start;
+                    printf("[RESP] skip bad cmd: start=%d, end=%d, cmd_len=%d, tokens='%s'\n",
+                        ctx->resp_cmd_start, processed_data, bad_cmd_len,
+                        ctx->resp_temp_buffer ? ctx->resp_temp_buffer : "(null)");
+                    
+                    // 重置状态机
+                    ctx->resp_state = RESP_TOTAL_HEAD;
+                    ctx->resp_cmd_num = 0;
+                    ctx->resp_cmd_idx = 0;
+                    ctx->resp_scmd_unit_num = 0;
+                    ctx->resp_scmd_unit_idx = 0;
+                    ctx->resp_token_len = 0;
+                    ctx->resp_cmd_start = 0;
+                    
+                    if (ctx->resp_temp_buffer) {
+                        free(ctx->resp_temp_buffer);
+                        ctx->resp_temp_buffer = NULL;
+                        ctx->resp_temp_buffer_cap = 0;
+                    }
+                    
+                    // 不 consume，继续循环
+                    continue;
+                }
+                #endif
+
                 // 释放 resp_temp_buffer
                 if (ctx->resp_temp_buffer) {
                     free(ctx->resp_temp_buffer);
