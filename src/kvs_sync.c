@@ -289,7 +289,7 @@ int is_slave_save(int fd) {
 
 // ===== 主机：处理 SYNC 请求 =====
 int handle_sync_request(int fd) {
-    printf("Handling SYNC request on fd %d\n", fd);
+    // printf("Handling SYNC request on fd %d\n", fd);
 
     // 1. 发送模式
     if (g_config.aof_enable) {
@@ -617,8 +617,9 @@ int sync_from_master(const char *master_ip, int port) {
         return -1;
     }
 
-    printf("Connected to master\n");
+    printf("!! Connected !!\n");
 
+    // 发送SYNC命令到master，开始同步
     const char *sync_cmd = "*1\r\n*1\r\n$4\r\nSYNC\r\n";
     if (safe_send(fd, sync_cmd, strlen(sync_cmd)) < 0) {
         perror("send SYNC");

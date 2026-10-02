@@ -373,8 +373,8 @@ int resp_buf_has_data(kvs_conn_ctx_t *ctx);
 #define SYNC_BUFFER_SIZE 2000
 
 // ===== 心跳（RESP 格式） =====
-#define HEARTBEAT_CMD     "*1\r\n$4\r\nPING\r\n"   // 14 字节
-#define HEARTBEAT_CMD_LEN 14
+#define HEARTBEAT_CMD     "*1\r\n*1\r\n$4\r\nPING\r\n"   // 14 字节
+#define HEARTBEAT_CMD_LEN 18
 #define HEARTBEAT_INTERVAL 5                        // 秒
 
 extern int g_is_master;
