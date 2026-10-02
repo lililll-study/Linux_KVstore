@@ -55,12 +55,12 @@ int safe_send(int fd, const char* data, int len) {
 }
 
 
-// ===== 带超时的 recv =====
+// ===== 从节点接收aof--超时5s自动发心跳 =====
+static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
 // 返回：
 //   > 0 ：收到数据
 //   = 0 ：超时
 //   < 0 ：错误
-static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
     fd_set rfds;
     struct timeval tv;
 
@@ -82,38 +82,7 @@ static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
     return recv(fd, buf, len, 0);
 }
 
-// ===== 发送单个文件 =====
-int send_file(int fd, const char *filepath) {
-    if (!filepath) return -1;
-    struct stat st;
-    if (stat(filepath, &st) != 0) {
-        perror("stat");
-        return -1;
-    }
-
-    size_t file_size = st.st_size;
-    printf("Sending: %s -- %zu bytes\n", filepath, file_size);
-
-    char header[512];
-    snprintf(header, sizeof(header), "%s|%zu\n", filepath, file_size);
-
-    if (safe_send(fd, header, strlen(header)) < 0) return -1;
-
-    FILE *fp = fopen(filepath, "rb");
-    if (!fp) return -1;
-
-    char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (safe_send(fd, buf, n) < 0) {
-            fclose(fp);
-            return -1;
-        }
-    }
-    fclose(fp);
-    return 0;
-}
-// ===== 从机接收文件 =====
+// ===== 从节点接收文件 =====
 int recv_file_from_master(int fd, const char *save_dir) {
     char header[512];
     char buf[8192];
@@ -171,6 +140,38 @@ int recv_file_from_master(int fd, const char *save_dir) {
     return (received == size) ? 0 : -1;
 }
 
+// ===== 主节点发送文件 =====
+int send_file_to_slave(int fd, const char *filepath) {
+    if (!filepath) return -1;
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        perror("stat");
+        return -1;
+    }
+
+    size_t file_size = st.st_size;
+    printf("Sending: %s -- %zu bytes\n", filepath, file_size);
+
+    char header[512];
+    snprintf(header, sizeof(header), "%s|%zu\n", filepath, file_size);
+
+    if (safe_send(fd, header, strlen(header)) < 0) return -1;
+
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return -1;
+
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        if (safe_send(fd, buf, n) < 0) {
+            fclose(fp);
+            return -1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 #if 0
 // 主节点
 int send_all_files(int fd) {
@@ -208,10 +209,16 @@ int send_all_files(int fd) {
 }
 #endif
 
+/**
+ * @func 主节点收到sync，根据同步模式分发数据
+ * aof：
+ *      立即同步：每条cmd执行aof_master_immediate
+ *      定时同步：5s检查aof文件，并发送
+ * snap：
+ */
 
-// aof模式
-// ===== 主节点：5s检查aof文件并发送（everysec） =====
-void* aof_master_check_thread(void* arg) {
+// ===== 主节点：定时同步（everysec） =====
+void* master_aof_everysec_thread(void* arg) {
     while (g_aof_ctx.is_active && g_aof_ctx.fd > 0) {
         sleep(5);
 
@@ -246,8 +253,9 @@ cleanup:
     printf("[AOF Sync] Master check thread exiting\n");
     return NULL;
 }
-// ===== 主节点：立即同步/immediate 同步 =====
-int aof_master_immediate(const char *cmd, const char *key, const char *value) {
+
+// ===== 主节点：立即同步 (immediate) =====
+int master_aof_immediate(const char *cmd, const char *key, const char *value) {
     if (g_config.aof_mode != AOF_MODE_IMMEDIATE) return 0;
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
@@ -262,111 +270,11 @@ int aof_master_immediate(const char *cmd, const char *key, const char *value) {
     return safe_send(g_aof_ctx.fd, buf, len);
 }
 
-// ===== 从节点：接收 AOF 增量数据（修复半包/粘包问题） =====
-void* aof_slave_recv_thread(void* arg) {
-    aof_sync_ctx_t* ctx = (aof_sync_ctx_t*)arg;
-    int fd = ctx->fd;
-
-    char buf[4096];
-    int bytes_since_reload = 0;
-
-    printf("[AOF Sync] Slave receive thread started on fd %d\n", fd);
-
-    while (ctx->is_active && fd > 0) {
-        int n = recv_with_timeout(fd, buf, sizeof(buf), HEARTBEAT_INTERVAL);
-
-        if (n > 0) {
-            // 写 AOF
-            FILE *fp = fopen(AOF_FILE, "a");
-            if (fp) {
-                fwrite(buf, 1, n, fp);
-                fclose(fp);
-            }
-            bytes_since_reload += n;
-
-            // 每 1MB 重新加载并 SAVE
-            if (bytes_since_reload >= 1024 * 1024) {
-                replay_aof(AOF_FILE);
-                save_snapshots();
-                FILE *fp = fopen(AOF_FILE, "w");
-                if (fp) fclose(fp);
-                bytes_since_reload = 0;
-                printf("[AOF Sync] Reloaded and saved snapshot\n");
-            }
-        } else if (n == 0) {
-            // 5s 超时，发心跳
-            if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) {
-                printf("[Heartbeat] Send failed\n");
-                break;
-            }
-        } else {
-            // 错误
-            printf("[AOF Sync] Master connection closed\n");
-            break;
-        }
-    }
-
-    ctx->is_active = 0;
-    if (fd > 0) {
-        close(fd);
-        ctx->fd = -1;
-    }
-    printf("[AOF Sync] Slave receive thread exiting\n");
-    return NULL;
-}
-// ===== 从机：处理 AOF 模式 =====
-void slave_handle_aof_mode(int fd) {
-    // 1. 接收全量 SNAP
-    printf("[SYNC] Receiving SNAP...\n");
-    while (1) {
-        int ret = recv_file_from_master(fd, "data");
-        if (ret == -1) {
-            char buf[16];
-            int n = recv(fd, buf, sizeof(buf) - 1, 0);
-            if (n > 0) {
-                buf[n] = '\0';
-                if (strcmp(buf, "END\n") == 0) break;
-            }
-            if (n <= 0) {
-                close(fd);
-                return;
-            }
-        }
-    }
-    load_snapshots();
-    printf("[SYNC] SNAP loaded\n");
-
-    // 2. 接收 AOF_SYNC_OK
-    char ack[32];
-    int n = recv(fd, ack, sizeof(ack) - 1, 0);
-    if (n <= 0) {
-        close(fd);
-        return;
-    }
-    ack[n] = '\0';
-    if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
-        printf("[SYNC] AOF sync rejected: %s\n", ack);
-        close(fd);
-        return;
-    }
-
-    // 3. 启动 AOF 接收线程（含心跳）
-    init_aof_sync_ctx();
-    g_aof_ctx.fd = fd;
-    g_aof_ctx.is_active = 1;
-    pthread_create(&g_aof_ctx.recv_thread, NULL, aof_slave_recv_thread, &g_aof_ctx);
-    pthread_detach(g_aof_ctx.recv_thread);
-
-    printf("[SYNC] AOF receive thread started\n");
-}
-
-
-// snap模式
-
 // ===== 主节点：判断是不是从机的 SAVE 请求 =====
 int is_slave_save(int fd) {
     return (g_snap_ctx.is_active && g_snap_ctx.fd == fd);
 }
+
 // ===== 主机：处理 SYNC 请求 =====
 int handle_sync_request(int fd) {
     printf("Handling SYNC request on fd %d\n", fd);
@@ -386,31 +294,28 @@ int handle_sync_request(int fd) {
     if (g_config.aof_enable) {
         printf("[SYNC] AOF mode\n");
 
-        // 2.1 先发全量 SNAP
-        save_snapshots();
-        send_file(fd, SNAP_FILE);
-        safe_send(fd, "END\n", 4);
+        // 2.1 初始化上下文
+        init_aof_sync_ctx();
+        g_aof_ctx.fd = fd;
+        g_aof_ctx.is_active = 1;
 
-        // 2.2 记录 AOF 当前大小
+        // 2.2 记录 AOF 当前大小(发送前)
         struct stat st;
         if (stat(AOF_FILE, &st) == 0) {
             g_aof_ctx.last_size[0] = st.st_size;
         } else {
             g_aof_ctx.last_size[0] = 0;
         }
+        // 2.3 发 AOF 文件
+        send_file_to_slave(fd, AOF_FILE);
+        safe_send(fd, "END\n", 4);
 
-        // 2.3 发送 AOF_SYNC_OK
+        // 2.4 发送 AOF_SYNC_OK
         safe_send(fd, "AOF_SYNC_OK\n", 12);
-
-        // 2.4 初始化上下文
-        init_aof_sync_ctx();
-        g_aof_ctx.fd = fd;
-        g_aof_ctx.is_active = 1;
 
         // 2.5 everysec 模式启动检测线程
         if (g_config.aof_mode == AOF_MODE_EVERYSEC) {
-            pthread_create(&g_aof_ctx.check_thread, NULL,
-                           aof_master_check_thread, NULL);
+            pthread_create(&g_aof_ctx.check_thread, NULL, master_aof_everysec_thread, NULL);
             pthread_detach(g_aof_ctx.check_thread);
         }
 
@@ -427,50 +332,7 @@ int handle_sync_request(int fd) {
     return 0;
 }
 
-// ===== 从节点：SNAP 接收线程（每 10s 发 SAVE）=====
-void* snap_slave_thread(void* arg) {
-    snap_sync_ctx_t* ctx = (snap_sync_ctx_t*)arg;
-    int fd = ctx->fd;
 
-    printf("[SNAP Sync] Slave thread started on fd %d\n", fd);
-
-    while (ctx->is_active && fd > 0) {
-        sleep(10);
-
-        // 1. 发 SAVE 给主机（SAVE 本身即心跳）
-        if (safe_send(fd, "*1\r\n$4\r\nSAVE\r\n", 14) < 0) break;
-
-        // 2. 接收 SNAP 文件
-        while (1) {
-            int ret = recv_file_from_master(fd, "data");
-            if (ret == -1) {
-                // 检查 END
-                char buf[16];
-                int n = recv(fd, buf, sizeof(buf) - 1, 0);
-                if (n > 0) {
-                    buf[n] = '\0';
-                    if (strcmp(buf, "END\n") == 0) break;
-                }
-                if (n <= 0) goto cleanup;
-            } else if (ret == 0) {
-                continue;
-            }
-        }
-
-        // 3. 加载 SNAP
-        load_snapshots();
-        printf("[SNAP Sync] SNAP loaded\n");
-    }
-
-cleanup:
-    ctx->is_active = 0;
-    if (fd > 0) {
-        close(fd);
-        ctx->fd = -1;
-    }
-    printf("[SNAP Sync] Slave thread exiting\n");
-    return NULL;
-}
 
 #if 0
 // ===== 从节点：解析并执行一条同步命令 =====
@@ -544,7 +406,157 @@ static void aof_slave_exec_line(const char *line)
 }
 #endif
 #if ENABLE_SYNC_MODIFY
-// ===== 从机：处理 SNAP 模式 =====
+
+/**
+ * @func 从节点发起sync同步, 根据master的模式进行数据备份
+ * aof：全量接收命令，replay后，save落盘
+ * snap：全量接收数据，落盘，再load加载
+ */
+// ===== 从节点：接收 AOF 增量数据（修复半包/粘包问题） =====
+void* slave_aof_recv_thread(void* arg) {
+    aof_sync_ctx_t* ctx = (aof_sync_ctx_t*)arg;
+    int fd = ctx->fd;
+
+    char buf[4096];
+    int bytes_since_reload = 0;
+
+    printf("[AOF Sync] Slave receive thread started on fd %d\n", fd);
+
+    while (ctx->is_active && fd > 0) {
+        int n = recv_with_timeout(fd, buf, sizeof(buf), HEARTBEAT_INTERVAL);
+
+        if (n > 0) {
+            // 写 AOF
+            FILE *fp = fopen(AOF_FILE, "a");
+            if (fp) {
+                fwrite(buf, 1, n, fp);
+                fclose(fp);
+            }
+            bytes_since_reload += n;
+
+            // 每 1MB 重新加载并 SAVE
+            if (bytes_since_reload >= 1024 * 1024) {
+                replay_aof(AOF_FILE);
+                save_snapshots();
+                FILE *fp = fopen(AOF_FILE, "w");
+                if (fp) fclose(fp);
+                bytes_since_reload = 0;
+                printf("[AOF Sync] Reloaded and saved snapshot\n");
+            }
+        } else if (n == 0) {
+            // 5s 超时，发心跳
+            if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) {
+                printf("[Heartbeat] Send failed\n");
+                break;
+            }
+        } else {
+            // 错误
+            printf("[AOF Sync] Master connection closed\n");
+            break;
+        }
+    }
+
+    ctx->is_active = 0;
+    if (fd > 0) {
+        close(fd);
+        ctx->fd = -1;
+    }
+    printf("[AOF Sync] Slave receive thread exiting\n");
+    return NULL;
+}
+
+// ===== 从节点：SNAP 接收线程（每 10s 发 SAVE）=====
+void* slave_snap_recv_thread(void* arg) {
+    snap_sync_ctx_t* ctx = (snap_sync_ctx_t*)arg;
+    int fd = ctx->fd;
+
+    printf("[SNAP Sync] Slave thread started on fd %d\n", fd);
+
+    while (ctx->is_active && fd > 0) {
+        sleep(10);
+
+        // 1. 发 SAVE 给主机（SAVE 本身即心跳）
+        if (safe_send(fd, "*1\r\n$4\r\nSAVE\r\n", 14) < 0) break;
+
+        // 2. 接收 SNAP 文件
+        while (1) {
+            int ret = recv_file_from_master(fd, "data");
+            if (ret == -1) {
+                char buf[4];
+                int n = recv(fd, buf, 4, 0);   // ← 只读 4 字节
+                if (n == 4 && strncmp(buf, "END\n", 4) == 0) break;
+                if (n <= 0) goto cleanup;
+            } else if (ret == 0) {
+                continue;
+            }
+        }
+
+        // 3. 加载 SNAP 到内存中
+        load_snapshots();
+        printf("[SNAP Sync] SNAP loaded\n");
+    }
+
+cleanup:
+    ctx->is_active = 0;
+    if (fd > 0) {
+        close(fd);
+        ctx->fd = -1;
+    }
+    printf("[SNAP Sync] Slave thread exiting\n");
+    return NULL;
+}
+
+// ===== 从节点：处理主机发来的aof命令 =====
+void slave_handle_aof_mode(int fd) {
+    // ===== 1. 接收 AOF 文件（全量） =====
+    printf("[SYNC] Receiving AOF...\n");
+    while (1) {
+        int ret = recv_file_from_master(fd, "data");
+        if (ret == -1) {
+            // 可能是 END，也可能是错误
+            char buf[4];
+            int n = recv(fd, buf, 4, 0);   // ← 只读 4 字节
+            if (n == 4 && strncmp(buf, "END\n", 4) == 0) break;
+            if (n <= 0) {
+                close(fd);
+                return;
+            }
+        }
+        // ret == 0：文件接收成功，继续
+    }
+    // ===== 2. 执行 AOF 里的所有命令 =====
+    printf("[SYNC] Replaying AOF...\n");
+    replay_aof(AOF_FILE);
+
+    // ===== 3. 生成从机的 SNAP =====
+    printf("[SYNC] Saving snapshot...\n");
+    save_snapshots();
+
+    // ===== 4. 接收 AOF_SYNC_OK =====
+    char ack[32];
+    int n = recv(fd, ack, sizeof(ack) - 1, 0);
+    if (n <= 0) {
+        close(fd);
+        return;
+    }
+    ack[n] = '\0';
+    if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
+        printf("[SYNC] AOF sync rejected: %s\n", ack);
+        close(fd);
+        return;
+    }
+
+    // ===== 5. 启动 AOF 接收线程（接收后续增量） =====
+    init_aof_sync_ctx();
+    g_aof_ctx.fd = fd;
+    g_aof_ctx.is_active = 1;
+    pthread_create(&g_aof_ctx.recv_thread, NULL, slave_aof_recv_thread, &g_aof_ctx);
+    pthread_detach(g_aof_ctx.recv_thread);
+
+    printf("[SYNC] AOF receive thread started\n");
+}
+
+// ===== 从节点：主机发来的snap数据 =====
 void slave_handle_snap_mode(int fd) {
     char ack[32];
     int n = recv(fd, ack, sizeof(ack) - 1, 0);
@@ -561,13 +573,13 @@ void slave_handle_snap_mode(int fd) {
 
     g_snap_ctx.fd = fd;
     g_snap_ctx.is_active = 1;
-    pthread_create(&g_snap_ctx.recv_thread, NULL, snap_slave_thread, &g_snap_ctx);
+    pthread_create(&g_snap_ctx.recv_thread, NULL, slave_snap_recv_thread, &g_snap_ctx);
     pthread_detach(g_snap_ctx.recv_thread);
 
     printf("[SYNC] SNAP receive thread started\n");
 }
 
-// ===== 从节点：发起 SYNC ============
+// ===== 从节点：建立连接，并发起SYNC同步 ============
 int sync_from_master(const char *master_ip, int port) {
     printf("Connecting to master %s:%d\n", master_ip, port);
 
