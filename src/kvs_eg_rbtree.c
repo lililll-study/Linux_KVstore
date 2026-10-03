@@ -540,7 +540,12 @@ int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) {
     strcpy(node->value, value);
     
     rbtree_insert(inst, node);
-	// printf("  insert done\n");
+    /* ===== 每 1w 条打印一次 ===== */
+    static int insert_count = 0;	// 只在程序启动时初始化一次
+    insert_count++;
+    if (insert_count % 10000 == 0) {
+        printf("[Rbtree]    Progress: %d nodes inserted\n", insert_count);
+    }
     return 0;
 }
 

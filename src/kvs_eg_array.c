@@ -117,7 +117,7 @@ static int kvs_array_expand(kvs_array_t *inst) {
     inst->table = new_table;
     inst->capacity = new_cap;
     
-    printf("[Array] Expanded from %d to %d slots\n", inst->capacity / 2, new_cap);
+    printf("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
     return 0;
 }
 

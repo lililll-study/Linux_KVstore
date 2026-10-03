@@ -64,11 +64,11 @@ int safe_send(int fd, const char* data, int len) {
                 usleep(1000);
                 continue;      // 流控，正常，不打印
             }
-            printf("[safe_send] fd=%d errno=%d (%s)\n", fd, errno, strerror(errno));
+            SYNC_ERR("safe_send fd=%d errno=%d (%s)", fd, errno, strerror(errno));
             return -1;
         }
         if (n == 0) {
-            printf("[safe_send] fd=%d peer closed\n", fd);
+            SYNC_ERR("safe_send fd=%d peer closed", fd);
             return -1;
         }
         total += n;
@@ -110,7 +110,7 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
 
     struct stat st;
     if (stat(filepath, &st) != 0) {
-        printf("[SYNC] stat %s failed\n", filepath);
+        SYNC_ERR("stat %s failed", filepath);
         return -1;
     }
 
@@ -118,7 +118,7 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
     if (max_bytes > 0 && max_bytes < to_send) to_send = max_bytes;
     if (to_send > 0) {
         FILE *fp = fopen(filepath, "rb");
-        if (!fp) { printf("[SYNC] open %s failed\n", filepath); return -1; }
+        if (!fp) { SYNC_ERR("open %s failed", filepath); return -1; }
 
         char buf[1024];
         long sent_total = 0;
@@ -127,18 +127,18 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
                (n = fread(buf, 1, (to_send - sent_total) < (long)sizeof(buf)
                                  ? (size_t)(to_send - sent_total) : sizeof(buf), fp)) > 0) {
             if (safe_send(fd, buf, n) < 0) {
-                printf("[SYNC] send content failed\n");
+                SYNC_ERR("send content failed");
                 fclose(fp);
                 return -1;
             }
             sent_total += n;
         }
         fclose(fp);
-        printf("[SYNC] Sent %ld bytes from %s (limit=%ld)\n", sent_total, filepath, to_send);
+        SYNC_LOG_M("Sent %ld bytes from %s (limit=%ld)", sent_total, filepath, to_send);
     }
 
     if (safe_send(fd, end_marker, strlen(end_marker)) < 0) {
-        printf("[SYNC] send marker failed\n");
+        SYNC_ERR("send marker failed");
         return -1;
     }
     return 0;
@@ -150,7 +150,7 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
 
     FILE *fp = fopen(filepath, "wb");
     if (!fp) {
-        printf("[SYNC] open %s failed\n", filepath);
+        SYNC_ERR("open %s failed", filepath);
         return -1;
     }
 
@@ -162,7 +162,7 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
     int end_len = strlen(end_marker);
 
     if (end_len >= (int)sizeof(tail)) {
-        printf("[SYNC] end_marker too long\n");
+        SYNC_ERR("end_marker too long");
         fclose(fp);
         return -1;
     }
@@ -170,7 +170,7 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
     while (!end_received) {
         int n = recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) {
-            printf("[SYNC] recv failed or peer closed\n");
+            SYNC_ERR("recv failed or peer closed");
             fclose(fp);
             return -1;
         }
@@ -204,7 +204,7 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
         truncate(filepath, st.st_size - end_len);
     }
 
-    printf("[SYNC] Received %d bytes, saved to %s\n", total - end_len, filepath);
+    SYNC_LOG_S("Received %d bytes, saved to %s", total - end_len, filepath);
     return 0;
 }
 
@@ -283,7 +283,7 @@ void* master_aof_everysec_thread(void* arg) {
         }
         fclose(fp);
         g_aof_ctx.last_size[0] = start + sent;
-        printf("[AOF Sync] Sent [%ld, %ld) = %ld bytes\n", start, start + sent, sent);
+        SYNC_LOG_M("AOF everysec: sent [%ld, %ld) = %ld bytes", start, start + sent, sent);
     }
 cleanup:
     g_aof_ctx.is_active = 0;
@@ -334,7 +334,8 @@ int handle_sync_request(int fd) {
 
     // 2. 根据模式处理
     if (g_config.aof_enable) {
-        printf("[SYNC] AOF mode\n");
+        SYNC_LOG_M("handle SYNC request on fd=%d, mode=%s", fd,
+           g_config.aof_enable ? "aof" : (g_config.snap_enable ? "snap" : "none"));
 
         init_aof_sync_ctx();
         g_aof_ctx.fd = fd;
@@ -347,7 +348,7 @@ int handle_sync_request(int fd) {
 
         // 只发送 snap_size 字节，末尾加 marker
         if (send_file_content(fd, AOF_FILE, snap_size, "AOF_SYNC_OK\n") < 0) {
-            printf("[SYNC] send AOF content failed\n");
+            SYNC_ERR("send AOF content failed");
             close(fd);
             return -1;
         }
@@ -361,7 +362,7 @@ int handle_sync_request(int fd) {
         }
 
     } else if (g_config.snap_enable) {
-        printf("[SYNC] SNAP mode\n");
+        SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
 
         // 记录从机 fd，等从机发 SAVE
         g_snap_ctx.fd = fd;
@@ -511,7 +512,7 @@ void* slave_snap_recv_thread(void* arg) {
     snap_sync_ctx_t* ctx = (snap_sync_ctx_t*)arg;
     int fd = ctx->fd;
 
-    printf("[SNAP Sync] Slave thread started on fd %d\n", fd);
+    SYNC_LOG_S("SNAP recv thread started, fd=%d", fd);
 
     while (ctx->is_active && fd > 0) {
         sleep(10);
@@ -523,42 +524,42 @@ void* slave_snap_recv_thread(void* arg) {
 
         /* 2. 接收 SNAP 内容并写入 SNAP_FILE */
         if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
-            printf("[SNAP Sync] recv content failed\n");
+            SYNC_ERR("SNAP recv content failed");
             break;
         }
         load_snapshots();
-        printf("[SNAP Sync] SNAP loaded\n");
+        SYNC_LOG_S("SNAP loaded");
     }
     ctx->is_active = 0;
     if (fd > 0) {
         close(fd);
         ctx->fd = -1;
     }
-    printf("[SNAP Sync] Slave thread exiting\n");
+    SYNC_LOG_S("SNAP recv thread exiting");
     return NULL;
 }
 
 // ===== 从节点：处理主机发来的aof命令 =====
 void slave_handle_aof_mode(int fd) {
     // ===== 1. 接收 AOF 文件（全量） =====
-    printf("[SYNC 1] Receiving AOF command stream...\n");
+    SYNC_LOG_S("receiving AOF full stream...");
 
     /* 接收 AOF 内容并写入本地 AOF */
     if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
-        printf("[SYNC] recv AOF content failed\n");
+        SYNC_ERR("recv AOF content failed");
         close(fd);
         return;
     }
 
     // ===== 2. 执行 AOF 里的所有命令 =====
-    printf("[SYNC 2] AOF command stream done, replaying...\n");
+    SYNC_LOG_S("AOF stream received, replaying...");
     long consumed = replay_aof_from(AOF_FILE, 0);
     if (consumed < 0) {
-        printf("[SYNC] replay_aof_from failed\n");
+        SYNC_ERR("replay_aof_from failed");
         close(fd);
         return;
     }
-    printf("[SYNC 3] consumed = %ld\n", consumed);
+    SYNC_LOG_S("AOF replayed, consumed_offset=%ld", consumed);
 
 
     // 启动 AOF 增量接收线程（后续主机每 5s 发的新增命令）
@@ -569,7 +570,7 @@ void slave_handle_aof_mode(int fd) {
     pthread_create(&g_aof_ctx.recv_thread, NULL, slave_aof_recv_thread, &g_aof_ctx);
     pthread_detach(g_aof_ctx.recv_thread);
 
-    printf("[SYNC] AOF receive thread started, consumed_offset=%ld\n", consumed);
+    SYNC_LOG_S("AOF incremental recv thread started");
 }
 
 // ===== 从节点：主机发来的snap数据 =====
@@ -588,7 +589,7 @@ void slave_handle_snap_mode(int fd) {
         ack_len++;
     }
     if (strcmp(ack, "SNAP_SYNC_OK\n") != 0) {
-        printf("[SYNC] SNAP sync rejected: %s\n", ack);
+        SYNC_ERR("SNAP sync rejected: %s", ack);
         close(fd);
         return;
     }
@@ -598,12 +599,12 @@ void slave_handle_snap_mode(int fd) {
     pthread_create(&g_snap_ctx.recv_thread, NULL, slave_snap_recv_thread, &g_snap_ctx);
     pthread_detach(g_snap_ctx.recv_thread);
 
-    printf("[SYNC] SNAP receive thread started\n");
+    SYNC_LOG_S("SNAP recv thread started");
 }
 
 // ===== 从节点：建立连接，并发起SYNC同步 ============
 int sync_from_master(const char *master_ip, int port) {
-    printf("Connecting to master %s:%d\n", master_ip, port);
+    SYNC_LOG_S("connecting to master %s:%d", master_ip, port);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -626,7 +627,7 @@ int sync_from_master(const char *master_ip, int port) {
         return -1;
     }
 
-    printf("!! Connected !!\n");
+    SYNC_LOG_S("connected to master");
 
     // 发送SYNC命令到master，开始同步
     const char *sync_cmd = "*1\r\n*1\r\n$4\r\nSYNC\r\n";
@@ -652,14 +653,14 @@ int sync_from_master(const char *master_ip, int port) {
         mode_len++;
     }
     mode[strcspn(mode, "\r\n")] = '\0';
-    printf("[SYNC] Master mode: %s\n", mode);
+    SYNC_LOG_S("master mode: %s", mode);
 
     if (strcmp(mode, "aof") == 0) {
         slave_handle_aof_mode(fd);
     } else if (strcmp(mode, "snap") == 0) {
         slave_handle_snap_mode(fd);
     } else {
-        printf("Unknown mode: %s\n", mode);
+        SYNC_ERR("unknown mode: %s", mode);
         close(fd);
         return -1;
     }

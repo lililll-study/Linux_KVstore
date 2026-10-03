@@ -168,6 +168,9 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
         for (i = inst->level +1; i<=level; i++) {
             update[i] = inst->header;
         }
+        // ===== 新增：跳表层数增长打印 =====
+        printf("[Skiptable] Level up: %d -> %d (key=%s)\n",
+               inst->level, level, key);
         inst->level = level;
     }
     // 5. 创建并插入节点
