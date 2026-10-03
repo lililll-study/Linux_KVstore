@@ -17,12 +17,24 @@
  * ============================================================ */
 static int connect_tcpserver(const char *ip, unsigned short port) {
     int connfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (connfd < 0) {
+        perror("socket");
+        return -1;
+    }
+
     struct sockaddr_in servaddr;
-    memset(&servaddr, 0, sizeof(struct sockaddr_in));
+    memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(port);
-    if (0 != connect(connfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr_in))) {
+
+    /* ← 关键：用传入的 ip */
+    if (inet_pton(AF_INET, ip, &servaddr.sin_addr) <= 0) {
+        perror("inet_pton");
+        close(connfd);
+        return -1;
+    }
+
+    if (connect(connfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
         perror("connect");
         close(connfd);
         return -1;
