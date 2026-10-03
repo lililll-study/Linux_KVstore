@@ -212,7 +212,7 @@ int load_snapshots();
 // AOF
 int append_aof(const char *cmd, const char *key, const char *value);
 int replay_aof(const char *filename);
-
+long replay_aof_from(const char *filename, long start_offset);
 /* io_uring-backed AOF lifecycle */
 int persistence_init(void);
 int persistence_flush(void);
@@ -385,8 +385,8 @@ int handle_sync_request(int fd);                        // 主机：处理 SYNC
 
 int safe_send(int fd, const char* data, int len);
 // 主节点传输和从节点接收
-int send_file_to_slave(int fd, const char *filepath);
-int recv_file_from_master(int fd, const char *save_dir);
+int send_file_content(int fd, const char *filepath, long max_bytes, const char *end_marker);
+int recv_file_content(int fd, const char *filepath, const char *end_marker);
 
 
 // 主从同步改造
