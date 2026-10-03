@@ -34,6 +34,7 @@ typedef struct {
     time_t last_heartbeat;     // 上次心跳时间
     pthread_t recv_thread;     // 从节点接收线程
     pthread_t check_thread;    // 主节点检测线程
+    long consumed_offset;      // ← 新增：从机已 replay 到的 AOF 偏移
 } aof_sync_ctx_t;
 
 static aof_sync_ctx_t g_aof_ctx = {0};
@@ -60,7 +61,18 @@ int safe_send(int fd, const char* data, int len) {
     int total = 0;
     while (total < len) {
         int n = send(fd, data + total, len - total, 0);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;      // 流控，正常，不打印
+            }
+            printf("[safe_send] fd=%d errno=%d (%s)\n", fd, errno, strerror(errno));
+            return -1;
+        }
+        if (n == 0) {
+            printf("[safe_send] fd=%d peer closed\n", fd);
+            return -1;
+        }
         total += n;
     }
     return total;
@@ -94,95 +106,110 @@ static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
     return recv(fd, buf, len, 0);
 }
 
-// ===== 从节点接收文件 =====
-int recv_file_from_master(int fd, const char *save_dir) {
-    char header[512];
-    char buf[8192];
+// ===== 主节点：把本地文件内容循环发送给 fd，末尾追加 end_marker =====
+int send_file_content(int fd, const char *filepath, long max_bytes, const char *end_marker) {
+    if (!filepath || !end_marker) return -1;
 
-    // peek 4 字节检查 END
-    char peek_buf[4];
-    int n = recv(fd, peek_buf, 4, MSG_PEEK);
-    if (n <= 0) return -1;
-
-    if (n == 4 && strncmp(peek_buf, "END\n", 4) == 0) {
-        return -1;   // END
-    }
-
-    // 读 header（逐字节）
-    int header_len = 0;
-    char ch;
-    while (header_len < sizeof(header) - 1) {
-        n = recv(fd, &ch, 1, 0);
-        if (n <= 0) return -1;
-        if (ch == '\n') break;
-        header[header_len++] = ch;
-    }
-    header[header_len] = '\0';
-    if (header_len == 0) return -1;
-
-    // 解析 header
-    char *name = header;
-    char *size_str = strchr(header, '|');
-    if (!size_str) return -1;
-    *size_str = '\0';
-    size_str++;
-    size_t size = atol(size_str);
-
-    char *base = strrchr(name, '/');
-    if (base) base++; else base = name;
-
-    char save_path[512];
-    snprintf(save_path, sizeof(save_path), "%s/%s", save_dir, base);
-
-    printf("Receiving: %s (%zu bytes)\n", save_path, size);
-
-    FILE *fp = fopen(save_path, "wb");
-    if (!fp) return -1;
-
-    size_t received = 0;
-    while (received < size) {
-        size_t to_read = (size - received > sizeof(buf)) ? sizeof(buf) : size - received;
-        n = recv(fd, buf, to_read, 0);
-        if (n <= 0) break;
-        fwrite(buf, 1, n, fp);
-        received += n;
-    }
-
-    fclose(fp);
-    return (received == size) ? 0 : -1;
-}
-
-// ===== 主节点发送文件 =====
-int send_file_to_slave(int fd, const char *filepath) {
-    if (!filepath) return -1;
     struct stat st;
     if (stat(filepath, &st) != 0) {
-        perror("stat");
+        printf("[SYNC] stat %s failed\n", filepath);
         return -1;
     }
 
-    size_t file_size = st.st_size;
-    printf("Sending: %s -- %zu bytes\n", filepath, file_size);
+    long to_send = st.st_size;
+    if (max_bytes > 0 && max_bytes < to_send) to_send = max_bytes;
+    if (to_send > 0) {
+        FILE *fp = fopen(filepath, "rb");
+        if (!fp) { printf("[SYNC] open %s failed\n", filepath); return -1; }
 
-    char header[512];
-    snprintf(header, sizeof(header), "%s|%zu\n", filepath, file_size);
+        char buf[1024];
+        long sent_total = 0;
+        size_t n;
+        while (sent_total < to_send &&
+               (n = fread(buf, 1, (to_send - sent_total) < (long)sizeof(buf)
+                                 ? (size_t)(to_send - sent_total) : sizeof(buf), fp)) > 0) {
+            if (safe_send(fd, buf, n) < 0) {
+                printf("[SYNC] send content failed\n");
+                fclose(fp);
+                return -1;
+            }
+            sent_total += n;
+        }
+        fclose(fp);
+        printf("[SYNC] Sent %ld bytes from %s (limit=%ld)\n", sent_total, filepath, to_send);
+    }
 
-    if (safe_send(fd, header, strlen(header)) < 0) return -1;
+    if (safe_send(fd, end_marker, strlen(end_marker)) < 0) {
+        printf("[SYNC] send marker failed\n");
+        return -1;
+    }
+    return 0;
+}
 
-    FILE *fp = fopen(filepath, "rb");
-    if (!fp) return -1;
+// ===== 从节点：循环接收内容写入 filepath，遇到 end_marker 停止并截断 =====
+int recv_file_content(int fd, const char *filepath, const char *end_marker) {
+    if (!filepath || !end_marker) return -1;
+
+    FILE *fp = fopen(filepath, "wb");
+    if (!fp) {
+        printf("[SYNC] open %s failed\n", filepath);
+        return -1;
+    }
 
     char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (safe_send(fd, buf, n) < 0) {
+    int total = 0;
+    int end_received = 0;
+    char tail[64] = {0};
+    int tail_len = 0;
+    int end_len = strlen(end_marker);
+
+    if (end_len >= (int)sizeof(tail)) {
+        printf("[SYNC] end_marker too long\n");
+        fclose(fp);
+        return -1;
+    }
+
+    while (!end_received) {
+        int n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            printf("[SYNC] recv failed or peer closed\n");
             fclose(fp);
             return -1;
         }
+
+        fwrite(buf, 1, n, fp);
+        total += n;
+
+        int i;
+        for (i = 0; i < n; i++) {
+            if (tail_len < (int)sizeof(tail) - 1) {
+                tail[tail_len++] = buf[i];
+                tail[tail_len] = '\0';
+            } else {
+                memmove(tail, tail + 1, sizeof(tail) - 2);
+                tail[sizeof(tail) - 2] = buf[i];
+                tail[sizeof(tail) - 1] = '\0';
+            }
+            if (tail_len >= end_len &&
+                strcmp(tail + tail_len - end_len, end_marker) == 0) {
+                end_received = 1;
+                break;
+            }
+        }
     }
+
     fclose(fp);
+
+    /* 截掉末尾的 end_marker */
+    struct stat st;
+    if (stat(filepath, &st) == 0 && st.st_size >= end_len) {
+        truncate(filepath, st.st_size - end_len);
+    }
+
+    printf("[SYNC] Received %d bytes, saved to %s\n", total - end_len, filepath);
     return 0;
 }
+
 
 #if 0
 // 主节点
@@ -233,36 +260,35 @@ int send_all_files(int fd) {
 void* master_aof_everysec_thread(void* arg) {
     while (g_aof_ctx.is_active && g_aof_ctx.fd > 0) {
         sleep(5);
+        struct stat st;
+        if (stat(AOF_FILE, &st) != 0) continue;
+        long start = g_aof_ctx.last_size[0];
+        long to_send = st.st_size - start;
+        if (to_send <= 0) continue;
 
-        int i = 0;
-        for (i = 0; i < AOF_FILE_COUNT; i++) {
-            struct stat st;
-            if (stat(aof_files[i], &st) != 0) continue;
-            if (st.st_size <= g_aof_ctx.last_size[i]) continue;
+        FILE* fp = fopen(AOF_FILE, "r");
+        if (!fp) continue;
+        fseek(fp, start, SEEK_SET);
 
-            FILE* fp = fopen(aof_files[i], "r");
-            if (!fp) continue;
-
-            fseek(fp, g_aof_ctx.last_size[i], SEEK_SET);
-
-            char buf[4096];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-                if (safe_send(g_aof_ctx.fd, buf, n) < 0) {
-                    fclose(fp);
-                    goto cleanup;
-                }
+        char buf[4096];
+        long sent = 0;
+        size_t n;
+        while (sent < to_send &&
+               (n = fread(buf, 1,
+                   (to_send - sent) < (long)sizeof(buf) ?
+                   (size_t)(to_send - sent) : sizeof(buf), fp)) > 0) {
+            if (safe_send(g_aof_ctx.fd, buf, n) < 0) {
+                fclose(fp);
+                goto cleanup;
             }
-            fclose(fp);
-
-            g_aof_ctx.last_size[i] = st.st_size;
-            printf("[AOF Sync] Sent %ld bytes\n", st.st_size);
+            sent += n;
         }
+        fclose(fp);
+        g_aof_ctx.last_size[0] = start + sent;
+        printf("[AOF Sync] Sent [%ld, %ld) = %ld bytes\n", start, start + sent, sent);
     }
-
 cleanup:
     g_aof_ctx.is_active = 0;
-    printf("[AOF Sync] Master check thread exiting\n");
     return NULL;
 }
 
@@ -272,13 +298,19 @@ int master_aof_immediate(const char *cmd, const char *key, const char *value) {
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
     char buf[4096];
-    int len = snprintf(buf, sizeof(buf), "%s$%zu\r\n%s\r\n",
-                       cmd, strlen(key), key);
+    int len = 0;
     if (value) {
-        len += snprintf(buf + len, sizeof(buf) - len,
-                        "$%zu\r\n%s\r\n", strlen(value), value);
+        len = snprintf(buf, sizeof(buf),
+                       "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       strlen(cmd), cmd,
+                       strlen(key), key,
+                       strlen(value), value);
+    } else {
+        len = snprintf(buf, sizeof(buf),
+                       "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       strlen(cmd), cmd,
+                       strlen(key), key);
     }
-
     return safe_send(g_aof_ctx.fd, buf, len);
 }
 
@@ -306,26 +338,25 @@ int handle_sync_request(int fd) {
     if (g_config.aof_enable) {
         printf("[SYNC] AOF mode\n");
 
-        // 2.1 初始化上下文
         init_aof_sync_ctx();
         g_aof_ctx.fd = fd;
         g_aof_ctx.is_active = 1;
 
-        // 2.2 记录 AOF 当前大小(发送前)
+        // ★ 记录发送开始时的文件大小，作为快照边界
         struct stat st;
-        if (stat(AOF_FILE, &st) == 0) {
-            g_aof_ctx.last_size[0] = st.st_size;
-        } else {
-            g_aof_ctx.last_size[0] = 0;
+        long snap_size = 0;
+        if (stat(AOF_FILE, &st) == 0) snap_size = st.st_size;
+
+        // 只发送 snap_size 字节，末尾加 marker
+        if (send_file_content(fd, AOF_FILE, snap_size, "AOF_SYNC_OK\n") < 0) {
+            printf("[SYNC] send AOF content failed\n");
+            close(fd);
+            return -1;
         }
-        // 2.3 发 AOF 文件
-        send_file_to_slave(fd, AOF_FILE);
-        safe_send(fd, "END\n", 4);
 
-        // 2.4 发送 AOF_SYNC_OK
-        safe_send(fd, "AOF_SYNC_OK\n", 12);
+        // ★ 关键：last_size = snap_size，而不是发送后的文件大小
+        g_aof_ctx.last_size[0] = snap_size;
 
-        // 2.5 everysec 模式启动检测线程
         if (g_config.aof_mode == AOF_MODE_EVERYSEC) {
             pthread_create(&g_aof_ctx.check_thread, NULL, master_aof_everysec_thread, NULL);
             pthread_detach(g_aof_ctx.check_thread);
@@ -430,39 +461,39 @@ void* slave_aof_recv_thread(void* arg) {
     int fd = ctx->fd;
 
     char buf[4096];
-    int bytes_since_reload = 0;
 
     printf("[AOF Sync] Slave receive thread started on fd %d\n", fd);
 
     while (ctx->is_active && fd > 0) {
-        int n = recv_with_timeout(fd, buf, sizeof(buf), HEARTBEAT_INTERVAL);
+        /* 1 秒超时：有数据就 append，超时后统一 replay + 发心跳 */
+        int n = recv_with_timeout(fd, buf, sizeof(buf), 1);
 
         if (n > 0) {
-            // 写 AOF
+            /* 只 append，不 replay */
             FILE *fp = fopen(AOF_FILE, "a");
             if (fp) {
                 fwrite(buf, 1, n, fp);
                 fclose(fp);
+            } else {
+                printf("[AOF Sync] open %s for append failed\n", AOF_FILE);
             }
-            bytes_since_reload += n;
 
-            // 每 1MB 重新加载并 SAVE
-            if (bytes_since_reload >= 1024 * 1024) {
-                replay_aof(AOF_FILE);
-                save_snapshots();
-                FILE *fp = fopen(AOF_FILE, "w");
-                if (fp) fclose(fp);
-                bytes_since_reload = 0;
-                printf("[AOF Sync] Reloaded and saved snapshot\n");
-            }
         } else if (n == 0) {
-            // 5s 超时，发心跳
+            /* 超时：把当前攒下的数据一次性 replay */
+            struct stat st;
+            if (stat(AOF_FILE, &st) == 0 && st.st_size > ctx->consumed_offset) {
+                long new_offset = replay_aof_from(AOF_FILE, ctx->consumed_offset);
+                if (new_offset > ctx->consumed_offset) {
+                    ctx->consumed_offset = new_offset;
+                }
+            }
+
+            /* 发心跳 */
             if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) {
                 printf("[Heartbeat] Send failed\n");
                 break;
             }
         } else {
-            // 错误
             printf("[AOF Sync] Master connection closed\n");
             break;
         }
@@ -491,25 +522,15 @@ void* slave_snap_recv_thread(void* arg) {
         const char *save_cmd = "*1\r\n*1\r\n$4\r\nSAVE\r\n";
         if (safe_send(fd, save_cmd, strlen(save_cmd)) < 0) break;
 
-        // 2. 接收 SNAP 文件
-        while (1) {
-            int ret = recv_file_from_master(fd, "data");
-            if (ret == -1) {
-                char buf[4];
-                int n = recv(fd, buf, 4, 0);   // ← 只读 4 字节
-                if (n == 4 && strncmp(buf, "END\n", 4) == 0) break;
-                if (n <= 0) goto cleanup;
-            } else if (ret == 0) {
-                continue;
-            }
-        }
 
-        // 3. 加载 SNAP 到内存中
+        /* 2. 接收 SNAP 内容并写入 SNAP_FILE */
+        if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
+            printf("[SNAP Sync] recv content failed\n");
+            break;
+        }
         load_snapshots();
         printf("[SNAP Sync] SNAP loaded\n");
     }
-
-cleanup:
     ctx->is_active = 0;
     if (fd > 0) {
         close(fd);
@@ -522,62 +543,52 @@ cleanup:
 // ===== 从节点：处理主机发来的aof命令 =====
 void slave_handle_aof_mode(int fd) {
     // ===== 1. 接收 AOF 文件（全量） =====
-    printf("[SYNC] Receiving AOF...\n");
-    while (1) {
-        int ret = recv_file_from_master(fd, "data");
-        if (ret == -1) {
-            // 可能是 END，也可能是错误
-            char buf[4];
-            int n = recv(fd, buf, 4, 0);   // ← 只读 4 字节
-            if (n == 4 && strncmp(buf, "END\n", 4) == 0) break;
-            if (n <= 0) {
-                close(fd);
-                return;
-            }
-        }
-        // ret == 0：文件接收成功，继续
+    printf("[SYNC 1] Receiving AOF command stream...\n");
+
+    /* 接收 AOF 内容并写入本地 AOF */
+    if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
+        printf("[SYNC] recv AOF content failed\n");
+        close(fd);
+        return;
     }
+
     // ===== 2. 执行 AOF 里的所有命令 =====
-    printf("[SYNC] Replaying AOF...\n");
-    replay_aof(AOF_FILE);
-
-    // ===== 3. 生成从机的 SNAP =====
-    printf("[SYNC] Saving snapshot...\n");
-    save_snapshots();
-
-    // ===== 4. 接收 AOF_SYNC_OK =====
-    char ack[32];
-    int n = recv(fd, ack, sizeof(ack) - 1, 0);
-    if (n <= 0) {
+    printf("[SYNC 2] AOF command stream done, replaying...\n");
+    long consumed = replay_aof_from(AOF_FILE, 0);
+    if (consumed < 0) {
+        printf("[SYNC] replay_aof_from failed\n");
         close(fd);
         return;
     }
-    ack[n] = '\0';
-    if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
-        printf("[SYNC] AOF sync rejected: %s\n", ack);
-        close(fd);
-        return;
-    }
+    printf("[SYNC 3] consumed = %ld\n", consumed);
 
-    // ===== 5. 启动 AOF 接收线程（接收后续增量） =====
+
+    // 启动 AOF 增量接收线程（后续主机每 5s 发的新增命令）
     init_aof_sync_ctx();
     g_aof_ctx.fd = fd;
     g_aof_ctx.is_active = 1;
+    g_aof_ctx.consumed_offset = consumed;
     pthread_create(&g_aof_ctx.recv_thread, NULL, slave_aof_recv_thread, &g_aof_ctx);
     pthread_detach(g_aof_ctx.recv_thread);
 
-    printf("[SYNC] AOF receive thread started\n");
+    printf("[SYNC] AOF receive thread started, consumed_offset=%ld\n", consumed);
 }
 
 // ===== 从节点：主机发来的snap数据 =====
 void slave_handle_snap_mode(int fd) {
-    char ack[32];
-    int n = recv(fd, ack, sizeof(ack) - 1, 0);
-    if (n <= 0) {
-        close(fd);
-        return;
+    char ack[32] = {0};
+    int ack_len = 0;
+    while (ack_len < (int)sizeof(ack) - 1) {
+        int n = recv(fd, ack + ack_len, 1, 0);
+        if (n <= 0) {
+            close(fd);
+            return;
+        }
+        if (ack[ack_len] == '\n') {
+            break;
+        }
+        ack_len++;
     }
-    ack[n] = '\0';
     if (strcmp(ack, "SNAP_SYNC_OK\n") != 0) {
         printf("[SYNC] SNAP sync rejected: %s\n", ack);
         close(fd);
@@ -627,13 +638,20 @@ int sync_from_master(const char *master_ip, int port) {
         return -1;
     }
 
-    // 接收 mode
+    // 接收 mode（逐字节读，避免吞掉后续的 AOF 内容）
     char mode[16] = {0};
-    int n = recv(fd, mode, sizeof(mode) - 1, 0);
-    if (n <= 0) {
-        printf("Failed to receive mode\n");
-        close(fd);
-        return -1;
+    int mode_len = 0;
+    while (mode_len < (int)sizeof(mode) - 1) {
+        int n = recv(fd, mode + mode_len, 1, 0);
+        if (n <= 0) {
+            printf("Failed to receive mode\n");
+            close(fd);
+            return -1;
+        }
+        if (mode[mode_len] == '\n') {
+            break;
+        }
+        mode_len++;
     }
     mode[strcspn(mode, "\r\n")] = '\0';
     printf("[SYNC] Master mode: %s\n", mode);
