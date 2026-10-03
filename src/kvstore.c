@@ -475,7 +475,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             // 如果是从机的 SAVE 请求，发送 SNAP
             if (g_config.snap_enable && is_slave_save(fd)) {
                 send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
-                SAFE_APPEND("ok\r\n");
+                // SAFE_APPEND("ok\r\n");
                 break;
             }
 

@@ -22,8 +22,6 @@
 
 
 #if ENABLE_AOF_SYNC
-// AOF 文件列表（单文件）
-static const char* aof_files[] = { AOF_FILE};
 #define AOF_FILE_COUNT 1
 
 // AOF 增量同步上下文（长连接）
