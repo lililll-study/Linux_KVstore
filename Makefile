@@ -39,6 +39,12 @@ LIBS = -L ./NtyCo/lib/ -lntyco -lpthread -ldl
 TEST_LIBS = -lpthread -ldl
 CFLAGS = -Wall -g $(INC)
 
+
+# 持久化数据文件
+DATA_DIR  = data
+AOF_FILE  = $(DATA_DIR)/data_aof.aof
+SNAP_FILE = $(DATA_DIR)/data_snap.snap
+
 # 默认目标：服务端 + 所有测试端
 all: dirs $(TARGET) $(TEST_TARGETS)
 
@@ -68,6 +74,14 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 $(BUILD_DIR)/kvs_sync.o: $(SRC_DIR)/kvs_sync.c
 	$(CC) $(CFLAGS) -DSYNC_RAW_IO -c $< -o $@
 	@echo "Build complete (raw IO): $@"
+
+# ===== 清空持久化数据文件（保留 data/ 目录） =====
+cleandata:
+	@mkdir -p $(DATA_DIR)
+	@: > $(AOF_FILE)      # 清空 AOF（truncate 到 0 字节，文件保留）
+	@: > $(SNAP_FILE)     # 清空 SNAP
+	@echo "Data files cleared:"
+	@ls -l $(AOF_FILE) $(SNAP_FILE)
 
 clean:
 	rm -rf $(BUILD_DIR)
