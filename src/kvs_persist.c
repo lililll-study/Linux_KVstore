@@ -11,8 +11,6 @@ extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t   global_hash;
 extern kvs_skiptable_t global_skiptable;
 
-#define READ_KEY 0
-#define READ_VALUE 1
 
 //================================
 /*aof and snap 基础框架定义*/
@@ -20,8 +18,6 @@ extern kvs_skiptable_t global_skiptable;
 
 // snap快照统一调度接口
 typedef int (*snapshot_save_fn)(const char *filename);
-// 定义回调函数类型
-typedef int (*kv_set_fn)(void *inst, char *key, char *value);
 
 
 int save_snapshot_array(const char *filename);
@@ -35,12 +31,7 @@ typedef struct engine_persist_s {
     snapshot_save_fn save_fn;
 } engine_persist_t;
 
-typedef enum {
-    CMD_SET, CMD_MOD, CMD_DEL,
-    CMD_RSET, CMD_RMOD, CMD_RDEL,
-    CMD_HSET, CMD_HMOD, CMD_HDEL,
-    CMD_SSET, CMD_SMOD, CMD_SDEL
-} aof_cmd_t;
+
 
 // 引擎配置，和函数接口相对应
 static engine_persist_t engine_persist_table[] = {
@@ -154,38 +145,6 @@ static char *mmap_read_token(const char *data, size_t size, size_t *offset)
     return value;
 }
 
-/**
- * mmap_read_command：从 mmap 区域读取 AOF 命令名，并将 offset 保持在后续 token 的 '$' 位置。
- * aof数据格式：SET$1\r\na\r\n$1\r\n1\r\nSET$1\r\nb\r\n$1\r\n2\r\nDEL$1\r\na\r\n
- */
-static int mmap_read_command(const char *data, size_t size,
-                             size_t *offset, char *cmd, size_t cmd_size)
-{
-    size_t len = 0;
-    // 跳过换行符以及空格
-    while (*offset < size &&
-           (data[*offset] == '\r' ||
-            data[*offset] == '\n' ||
-            data[*offset] == ' ' ||
-            data[*offset] == '\t')) {
-        (*offset)++;
-    }
-    // 没到末尾，就把cmd字符读入
-    while (*offset < size &&
-           data[*offset] != '$' &&
-           data[*offset] != '\r' &&
-           data[*offset] != '\n') {
-        if (len + 1 < cmd_size)
-            cmd[len++] = data[*offset];
-        (*offset)++;
-    }
-
-    if (len == 0 || *offset >= size || data[*offset] != '$')
-        return -1;
-
-    cmd[len] = '\0';
-    return 0;
-}
 
 /**
  * mmap_read_line：从 mmap 区域读取一行文本。
@@ -215,6 +174,92 @@ static int mmap_read_line(const char *data, size_t size,
 
     return 0;
 }
+
+static int mmap_parse_resp_command(const char *data, size_t size,
+                                   size_t *offset,
+                                   char **tokens, int *token_count) {
+    size_t start = *offset;
+    size_t p = *offset;
+    char line[256];
+
+    /* 辅助宏：从 p 读一行（到 \r 或 \n），跳过行尾 \r\n */
+#define READ_LINE(dst, dst_size) do {                                   \
+        size_t li = 0;                                                  \
+        while (p < size && data[p] != '\r' && data[p] != '\n') {        \
+            if (li + 1 < (dst_size)) dst[li++] = data[p];               \
+            p++;                                                        \
+        }                                                               \
+        if (p >= size) return 0;      /* 数据不够 */                    \
+        dst[li] = '\0';                                                 \
+        if (p + 1 < size && data[p] == '\r' && data[p+1] == '\n') {     \
+            p += 2;                                                     \
+        } else if (data[p] == '\n') {                                   \
+            p += 1;                                                     \
+        } else {                                                        \
+            return -1;                                                  \
+        }                                                               \
+    } while (0)
+
+    /* 1. 外层 *N\r\n */
+    if (p >= size) return 0;
+    if (data[p] != '*') return -1;
+    READ_LINE(line, sizeof(line));
+    int outer = atoi(line + 1);
+    if (outer != 1) return -1;
+
+    /* 2. 内层 *M\r\n */
+    if (p >= size) return 0;
+    if (data[p] != '*') return -1;
+    READ_LINE(line, sizeof(line));
+    int inner = atoi(line + 1);
+    if (inner <= 0 || inner > KVS_MAX_TOKENS) return -1;
+
+    /* 3. 读 M 个 token */
+    int i;
+    for (i = 0; i < inner; i++) {
+        if (p >= size) goto not_enough;
+        if (data[p] != '$') goto format_err;
+        READ_LINE(line, sizeof(line));
+        int len = atoi(line + 1);
+        if (len < 0) goto format_err;
+
+        /* 剩余够不够 len + 2（\r\n） */
+        if (p + (size_t)len + 2 > size) goto not_enough;
+
+        char *tok = malloc((size_t)len + 1);
+        if (!tok) goto format_err;
+        memcpy(tok, data + p, (size_t)len);
+        tok[len] = '\0';
+        p += (size_t)len;
+
+        if (data[p] != '\r' || data[p+1] != '\n') {
+            free(tok);
+            goto format_err;
+        }
+        p += 2;
+
+        tokens[i] = tok;
+    }
+
+    *token_count = inner;
+    *offset = p;
+    return (int)(p - start);
+
+not_enough:
+    for (i = 0; i < KVS_MAX_TOKENS; i++) {
+        if (tokens[i]) { free(tokens[i]); tokens[i] = NULL; }
+    }
+    return 0;
+
+format_err:
+    for (i = 0; i < KVS_MAX_TOKENS; i++) {
+        if (tokens[i]) { free(tokens[i]); tokens[i] = NULL; }
+    }
+    return -1;
+
+#undef READ_LINE
+}
+
 #else
 // ===== 读取一个 token =====
 static char* read_token(FILE *fp) {
@@ -419,7 +464,6 @@ int save_snapshot_skiptable(const char *filename) {
 
 
 /* io_uring 功能封装*/
-#if ENABLE_URING
 
 // aof文件的fd，进程启动打开一次，且常开
 static int g_aof_fd = -1;
@@ -434,16 +478,18 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     int need;
     // 如果没有value表示是删除del等cmd，有value表示是set等
     if (value) {
-        // 用snprintf预计算长度，计算aof record需要的字节数
-        // 此时str==null&&size==0，不写入如任何东西
+        // *1\r\n*3\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n$LEN(value)\r\nVALUE\r\n
         need = snprintf(NULL, 0,
-                        "%s$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                        cmd, strlen(key), key,
+                        "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        strlen(cmd), cmd,
+                        strlen(key), key,
                         strlen(value), value);
     } else {
+        // *1\r\n*2\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n
         need = snprintf(NULL, 0,
-                        "%s$%zu\r\n%s\r\n",
-                        cmd, strlen(key), key);
+                        "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        strlen(cmd), cmd,
+                        strlen(key), key);
     }
 
     if (need < 0)
@@ -455,13 +501,15 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     // 按照resp协议格式进行拼接
     if (value) {
         snprintf(buf, (size_t)need + 1,
-                 "%s$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                 cmd, strlen(key), key,
-                 strlen(value), value);
+                "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                strlen(cmd), cmd,
+                strlen(key), key,
+                strlen(value), value);
     } else {
         snprintf(buf, (size_t)need + 1,
-                 "%s$%zu\r\n%s\r\n",
-                 cmd, strlen(key), key);
+                "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                strlen(cmd), cmd,
+                strlen(key), key);
     }
 
     *out_buf = buf;
@@ -562,251 +610,67 @@ void persistence_shutdown(void)
     }
 }
 
-#if ENABLE_MMAP
-/**
- * replay_aof：使用 mmap 一次性映射整个 AOF 文件，
- * 通过 offset 顺序解析 command、key、value，并调用现有 KV 引擎恢复数据。
- */
-int replay_aof(const char *filename)
-{
-    mmap_file_t mf;
-    size_t offset = 0;
-    int count = 0;
 
-    // 打开aof文件
-    if (mmap_file_open(filename, &mf) < 0) return -1;
+long replay_aof_from(const char *filename, long start_offset) {
+    mmap_file_t mf;
+    size_t offset = (size_t)start_offset;
+    int count = 0;
+    long ret = start_offset;
+
+    if (mmap_file_open(filename, &mf) < 0) {
+        printf("[AOF] mmap_file_open failed: %s\n", filename);
+        return -1;
+    }
 
     if (mf.size == 0) {
         mmap_file_close(&mf);
-        return 0;
+        return start_offset;
     }
-    // 如果当前偏移小于文件大小，说明没读完
+
+    if (offset > mf.size) {
+        mmap_file_close(&mf);
+        return -1;
+    }
+
     while (offset < mf.size) {
-        char cmd[16];
-        char *key;
-        char *value = NULL;
-        // 读取cmd
-        if (mmap_read_command(mf.data, mf.size, &offset, cmd, sizeof(cmd)) < 0)
-            break;
-        // 读取key
-        key = mmap_read_token(mf.data, mf.size, &offset);
-        if (!key) {
-            printf("[AOF] ERROR: failed to read key\n");
+        char *tokens[KVS_MAX_TOKENS] = {0};
+        int token_count = 0;
+
+        int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
+                                               tokens, &token_count);
+        if (consumed < 0) {
+            printf("[AOF] FORMAT ERROR at offset=%zu\n", offset);
             break;
         }
-        // 读value（cmd不为del，del没有value，而mod和set有）
-        if (strcmp(cmd, "DEL") != 0 && strcmp(cmd, "RDEL") != 0 && strcmp(cmd, "HDEL") != 0 && strcmp(cmd, "SDEL") != 0) {
-
-            value = mmap_read_token(mf.data, mf.size, &offset);
-            if (!value) {
-                printf("[AOF] ERROR: failed to read value\n");
-                free(key);
-                break;
-            }
+        if (consumed == 0) {
+            /* 末尾半条命令，停在这里 */
+            break;
         }
 
-        if (strcmp(cmd, "SET") == 0)
-            kvs_array_set(&global_array, key, value);
-        else if (strcmp(cmd, "DEL") == 0)
-            kvs_array_del(&global_array, key);
-        else if (strcmp(cmd, "MOD") == 0)
-            kvs_array_mod(&global_array, key, value);
-        else if (strcmp(cmd, "RSET") == 0)
-            kvs_rbtree_set(&global_rbtree, key, value);
-        else if (strcmp(cmd, "RDEL") == 0)
-            kvs_rbtree_del(&global_rbtree, key);
-        else if (strcmp(cmd, "RMOD") == 0)
-            kvs_rbtree_mod(&global_rbtree, key, value);
-        else if (strcmp(cmd, "HSET") == 0)
-            kvs_hash_set(&global_hash, key, value);
-        else if (strcmp(cmd, "HDEL") == 0)
-            kvs_hash_del(&global_hash, key);
-        else if (strcmp(cmd, "HMOD") == 0)
-            kvs_hash_mod(&global_hash, key, value);
-        else if (strcmp(cmd, "SSET") == 0)
-            kvs_skiptable_set(&global_skiptable, key, value);
-        else if (strcmp(cmd, "SDEL") == 0)
-            kvs_skiptable_del(&global_skiptable, key);
-        else if (strcmp(cmd, "SMOD") == 0)
-            kvs_skiptable_mod(&global_skiptable, key, value);
+        /* 执行命令（fd=-1：不写 AOF、不回响应） */
+        kvs_filter_protocol(-1, tokens, token_count, NULL);
 
-        free(key);
-        free(value);
+        int i;
+        for (i = 0; i < token_count; i++) free(tokens[i]);
         count++;
     }
+
+    ret = (long)offset;
 
     mmap_file_close(&mf);
 
-    printf("Replayed %d entries from %s\n", count, filename);
-
-    return 0;
+    printf("Replayed %d entries, offset %ld -> %ld\n",
+           count, start_offset, ret);
+    return ret;
 }
-#else
+
+/**
+ * replay_aof：兼容旧接口，从 0 开始 replay。
+ */
 int replay_aof(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) return -1;
-
-    int count = 0;
-    int ch;
-
-    while ((ch = fgetc(fp)) != EOF) {
-        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
-
-        char cmd[16];
-        int i = 0;
-        while (ch != EOF && ch != '$' && ch != '\n' && ch != '\r') {
-            if (i < (int)sizeof(cmd) - 1) cmd[i++] = (char)ch;
-            ch = fgetc(fp);
-        }
-        cmd[i] = '\0';
-
-        if (ch == EOF) break;
-        if (i == 0) continue;
-
-        if (ch == '$') ungetc(ch, fp);
-
-        char *key = read_token(fp);
-        if (!key) {
-            printf("[AOF] ERROR: failed to read key\n");
-            break;
-        }
-
-        char *value = NULL;
-        int has_value = (strcmp(cmd, "DEL") != 0 &&
-                         strcmp(cmd, "RDEL") != 0 &&
-                         strcmp(cmd, "HDEL") != 0 &&
-                         strcmp(cmd, "SDEL") != 0);
-
-        if (has_value) {
-            value = read_token(fp);
-            if (!value) {
-                printf("[AOF] ERROR: failed to read value\n");
-                free(key);
-                break;
-            }
-        }
-
-        if (strcmp(cmd, "SET") == 0)       kvs_array_set(&global_array, key, value);
-        else if (strcmp(cmd, "DEL") == 0)  kvs_array_del(&global_array, key);
-        else if (strcmp(cmd, "MOD") == 0)  kvs_array_mod(&global_array, key, value);
-        else if (strcmp(cmd, "RSET") == 0) kvs_rbtree_set(&global_rbtree, key, value);
-        else if (strcmp(cmd, "RDEL") == 0) kvs_rbtree_del(&global_rbtree, key);
-        else if (strcmp(cmd, "RMOD") == 0) kvs_rbtree_mod(&global_rbtree, key, value);
-        else if (strcmp(cmd, "HSET") == 0) kvs_hash_set(&global_hash, key, value);
-        else if (strcmp(cmd, "HDEL") == 0) kvs_hash_del(&global_hash, key);
-        else if (strcmp(cmd, "HMOD") == 0) kvs_hash_mod(&global_hash, key, value);
-        else if (strcmp(cmd, "SSET") == 0) kvs_skiptable_set(&global_skiptable, key, value);
-        else if (strcmp(cmd, "SDEL") == 0) kvs_skiptable_del(&global_skiptable, key);
-        else if (strcmp(cmd, "SMOD") == 0) kvs_skiptable_mod(&global_skiptable, key, value);
-
-        free(key);
-        if (value) free(value);
-        count++;
-    }
-
-    fclose(fp);
-    printf("Replayed %d entries from %s\n", count, filename);
-    return 0;
+    long ret = replay_aof_from(filename, 0);
+    return (ret < 0) ? -1 : 0;
 }
-#endif
-
-
-#else
-
-int append_aof(const char *cmd, const char *key, const char *value) {
-    FILE *fp = fopen(AOF_FILE, "a");
-    if (!fp) return -1;
-    
-    // 写命令（不带空格）
-    fprintf(fp, "%s", cmd);
-    
-    // 写 key（直接连在一起）
-    write_token(fp, key);
-    
-    // 写 value（如果有，直接连在一起）
-    if (value) {
-        write_token(fp, value);
-    }
-    
-    fclose(fp);
-    return 0;
-}
-
-int replay_aof(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) return -1;
-    
-    int count = 0;
-    int ch;
-    
-    while ((ch = fgetc(fp)) != EOF) {
-        // 跳过换行符和空格
-        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
-        
-        // ===== 读取命令名（到 $ 或换行为止） =====
-        char cmd[16];
-        int i = 0;
-        while (ch != EOF && ch != '$' && ch != '\n' && ch != '\r') {
-            if (i < sizeof(cmd) - 1) cmd[i++] = ch;
-            ch = fgetc(fp);
-        }
-        cmd[i] = '\0';
-        
-        if (ch == EOF) break;
-        if (i == 0) continue;
-        
-        // 把 $ 放回
-        if (ch == '$') ungetc(ch, fp);
-        
-        // ===== 读取 key =====
-        char *key = read_token(fp);
-        if (!key) {
-            printf("[AOF] ERROR: failed to read key\n");
-            break;
-        }
-        
-        // ===== 判断是不是删除cmd=====
-        char *value = NULL;
-        int has_value = (strcmp(cmd, "DEL") != 0 &&
-                        strcmp(cmd, "RDEL") != 0 &&
-                        strcmp(cmd, "HDEL") != 0 &&
-                        strcmp(cmd, "SDEL") != 0);
-        // 不读，value = NULL
-        if (has_value) {
-            value = read_token(fp);
-            if (!value) {
-                printf("[AOF] ERROR: failed to read value\n");
-                free(key);
-                break;
-            }
-        }
-        
-        // ===== 分发 =====
-        if (strcmp(cmd, "SET") == 0)       kvs_array_set(&global_array, key, value);
-        else if (strcmp(cmd, "DEL") == 0)  kvs_array_del(&global_array, key);
-        else if (strcmp(cmd, "MOD") == 0)  kvs_array_mod(&global_array, key, value);
-        else if (strcmp(cmd, "RSET") == 0) kvs_rbtree_set(&global_rbtree, key, value);
-        else if (strcmp(cmd, "RDEL") == 0) kvs_rbtree_del(&global_rbtree, key);
-        else if (strcmp(cmd, "RMOD") == 0) kvs_rbtree_mod(&global_rbtree, key, value);
-        else if (strcmp(cmd, "HSET") == 0) kvs_hash_set(&global_hash, key, value);
-        else if (strcmp(cmd, "HDEL") == 0) kvs_hash_del(&global_hash, key);
-        else if (strcmp(cmd, "HMOD") == 0) kvs_hash_mod(&global_hash, key, value);
-        else if (strcmp(cmd, "SSET") == 0) kvs_skiptable_set(&global_skiptable, key, value);
-        else if (strcmp(cmd, "SDEL") == 0) kvs_skiptable_del(&global_skiptable, key);
-        else if (strcmp(cmd, "SMOD") == 0) kvs_skiptable_mod(&global_skiptable, key, value);
-        
-        free(key);
-        if (value) free(value);
-        count++;
-    }
-    
-    fclose(fp);
-    printf("Replayed %d entries from %s\n", count, filename);
-    return 0;
-}
-#endif
-
-
 
 
 #if ENABLE_URING
