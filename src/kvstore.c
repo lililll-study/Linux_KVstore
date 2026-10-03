@@ -72,16 +72,16 @@ enum {
 // ===== 从机自动连接线程 =====
 static void* slave_sync_thread(void* arg) {
     sleep(1);
-    printf("[SLAVE] Auto connecting to master %s:%d\n",
+    SYNC_LOG_S("auto connecting to master %s:%d",
            g_config.master_ip, g_config.master_port);
 
     while (1) {
         int ret = sync_from_master(g_config.master_ip, g_config.master_port);
         if (ret == 0) {
-            printf("[SLAVE] Sync started\n");
+            SYNC_LOG_S("sync started");
             break;
         }
-        printf("[SLAVE] Sync failed, retry in 5s\n");
+        SYNC_ERR("sync failed, retry in 5s");
         sleep(5);
     }
     return NULL;
@@ -499,7 +499,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
 #if ENABLE_SYNC
         case KVS_CMD_SYNC:
-            printf("[SYNC] begin\n");
+            SYNC_LOG("SYNC cmd received on fd=%d, role=%s", fd, g_is_master ? "master" : "slave");
             if (g_is_master) {
                 // 主节点：则处理同步请求
                 ret = handle_sync_request(fd);
@@ -641,8 +641,7 @@ printf("------------ 2. kvs_engine created ----\n");
 #if ENABLE_PERSIST
     if (g_config.role == ROLE_SLAVE) {
         // 从机：不加载本地 SNAP/AOF（数据从主机来）
-        printf("------------ 3. SLAVE mode, skip local snapshots ---\n");
-        printf("------------ 4. SLAVE mode, skip local AOF ---\n");
+        printf("=== [INIT] SLAVE mode: skip local snap/AOF ===\n");
     } else {
         // 主机：正常加载
         if (g_config.snap_enable) {

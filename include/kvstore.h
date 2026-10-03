@@ -40,6 +40,26 @@
 
 #define ENABLE_SYNC_MODIFY 1    // 修改主从同步逻辑
 
+/* ===== 统一同步日志宏 ===== */
+#define SYNC_LOG(fmt, ...) \
+    printf("[SYNC] " fmt "\n", ##__VA_ARGS__)
+
+#define SYNC_LOG_M(fmt, ...) \
+    printf("[SYNC][MASTER] " fmt "\n", ##__VA_ARGS__)
+
+#define SYNC_LOG_S(fmt, ...) \
+    printf("[SYNC][SLAVE] " fmt "\n", ##__VA_ARGS__)
+
+#define SYNC_ERR(fmt, ...) \
+    printf("[SYNC][ERROR] " fmt "\n", ##__VA_ARGS__)
+/* ===== 主机工作标记 ===== */
+#define MASTER_WORKING(fd, cmd, key) do {                       \
+    if (g_is_master && (fd) >= 0) {                             \
+        printf("[MASTER] working now~  fd=%d cmd=%s key=%s\n",  \
+               (fd), (cmd), (key));                             \
+    }                                                           \
+} while (0)
+
 /*
 ======================================= 底层网络架构 ======================================
 ==========================================================================================
