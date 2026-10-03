@@ -68,7 +68,6 @@ enum {
 
 };
 
-const char *response[] = {};
 
 // ===== 从机自动连接线程 =====
 static void* slave_sync_thread(void* arg) {
@@ -180,31 +179,22 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
      // 安全的追加宏 - 修复了 new_size 的问题
     #define SAFE_APPEND(fmt, ...) do { \
-        int need = snprintf(NULL, 0, fmt, ##__VA_ARGS__) + 1; \
-        if (len + need >= resp_cap) { \
-            int new_cap = resp_cap; \
-            while (new_cap < len + need + 1024) new_cap *= 2; \
-            char *new_buf = NULL; \
-            \
-            /* 尝试从内存池分配更大的块 */ \
-            new_buf = (char*)kvs_mempool_alloc(resp_pool, new_cap); \
-            if (!new_buf) { \
-                new_buf = (char*)kvs_malloc(new_cap); \
-            } \
-            if (new_buf) { \
-                memcpy(new_buf, single_resp, len); \
-                /* 释放旧缓冲区 */ \
-                if (single_resp) { \
-                    kvs_mempool_free(resp_pool, single_resp); \
-                } \
+        if (!is_aof_sync) { \
+            int need = snprintf(NULL, 0, fmt, ##__VA_ARGS__) + 1; \
+            if (len + need >= resp_cap) { \
+                int new_cap = resp_cap > 0 ? resp_cap : BUFFER_LENGTH; \
+                while (new_cap < len + need + 1024) new_cap *= 2; \
+                char *new_buf = (char*)kvs_mempool_alloc(resp_pool, new_cap); \
+                if (!new_buf) new_buf = (char*)kvs_malloc(new_cap); \
+                if (!new_buf) break; \
+                if (single_resp && len > 0) memcpy(new_buf, single_resp, len); \
+                if (single_resp) kvs_mempool_free(resp_pool, single_resp); \
                 single_resp = new_buf; \
                 resp_cap = new_cap; \
-            } else { \
-                break; \
             } \
+            len += snprintf(single_resp + len, resp_cap - len, fmt, ##__VA_ARGS__); \
         } \
-        len += snprintf(single_resp + len, resp_cap - len, fmt, ##__VA_ARGS__); \
-    } while(0)
+    } while (0)
 
 
     switch (cmd) {
@@ -214,7 +204,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof("SET", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("SET", key, value);  // 追加AOF
 
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
@@ -240,7 +230,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("DEL", key, NULL);  // 追加AOF
+                if (!is_aof_sync) append_aof("DEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("DEL", key, NULL);
@@ -256,7 +246,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("MOD", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("MOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("MOD", key, value);
@@ -281,7 +271,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof("RSET", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("RSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("RSET", key, value);
@@ -306,7 +296,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("RDEL", key, NULL);  // 追加AOF
+                if (!is_aof_sync) append_aof("RDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("RDEL", key, NULL);
@@ -322,7 +312,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("RMOD", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("RMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("RMOD", key, value);
@@ -347,7 +337,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("HSET", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("HSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HSET", key, value);
@@ -372,7 +362,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("HDEL", key, NULL);  // 追加AOF
+                if (!is_aof_sync) append_aof("HDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HDEL", key, NULL);
@@ -387,7 +377,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("HMOD", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("HMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HMOD", key, value);
@@ -412,7 +402,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("set error\r\n");
             } else if (ret == 0) {
-                append_aof("SSET", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("SSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SSET", key, value);
@@ -437,7 +427,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("SDEL", key, NULL);  // 追加AOF
+                if (!is_aof_sync) append_aof("SDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SDEL", key, NULL);
@@ -453,7 +443,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (ret < 0) {
                 SAFE_APPEND("error\r\n");
             } else if (ret == 0) {
-                append_aof("SMOD", key, value);  // 追加AOF
+                if (!is_aof_sync) append_aof("SMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SMOD", key, value);
@@ -484,8 +474,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             ret = save_snapshots();
             // 如果是从机的 SAVE 请求，发送 SNAP
             if (g_config.snap_enable && is_slave_save(fd)) {
-                send_file_to_slave(fd, SNAP_FILE);
-                safe_send(fd, "END\n", 4);
+                send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
                 SAFE_APPEND("ok\r\n");
                 break;
             }

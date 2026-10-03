@@ -46,7 +46,6 @@
 */
 
 extern  const char *command[];
-extern const char *response[];
 
 #define KVS_MAX_TOKENS 128
 
