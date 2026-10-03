@@ -124,6 +124,56 @@ aof.enable=false
 
 
 
+
+
+# 性能测试
+
+
+
+
+
+不开主从同步，单机批量插入和批量查询：
+
+```bash
+lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 3
+===== 批量 SET 5w =====
+[Batch  SET] Array      50000: 7675 ms, qps=6514
+[Batch  SET] Rbtree     50000: 315 ms, qps=158730
+[Batch  SET] Hash       50000: 616 ms, qps=81168
+[Batch  SET] Skiptable  50000: 597 ms, qps=83752
+lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 4
+===== 批量 GET 5w =====
+[Batch  GET] Array      50000: 5867 ms, qps=8522
+[Batch  GET] Rbtree     50000: 257 ms, qps=194552
+[Batch  GET] Hash       50000: 562 ms, qps=88967
+[Batch  GET] Skiptable  50000: 462 ms, qps=108225
+
+```
+
+
+
+开启主从同步（定时aof同步），批量插入和查询：
+
+```bash
+
+lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 3
+===== 批量 SET 5w =====
+[Batch  SET] Array      50000: 7692 ms, qps=6500
+[Batch  SET] Rbtree     50000: 274 ms, qps=182481
+[Batch  SET] Hash       50000: 857 ms, qps=58343
+[Batch  SET] Skiptable  50000: 852 ms, qps=58685
+lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 4
+===== 批量 GET 5w =====
+[Batch  GET] Array      50000: 5570 ms, qps=8976
+[Batch  GET] Rbtree     50000: 253 ms, qps=197628
+[Batch  GET] Hash       50000: 563 ms, qps=88809
+[Batch  GET] Skiptable  50000: 434 ms, qps=115207
+```
+
+性能几乎不损失
+
+
+
 ---
 
 # 基于C的仿Redis数据库实现（KV存储）
@@ -540,3 +590,5 @@ snap有一种同步方式：
 另外在config中加入一个是否为调试状态的开关
 
 打开后，终端有输出
+
+
