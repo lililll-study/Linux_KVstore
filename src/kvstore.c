@@ -611,6 +611,32 @@ int init_kvengine(void) {
     }
     printf("********----  1. Memory-pools init success!  ----********\n");
 #endif
+
+#if ENABLE_CRC
+    /* ★ CRC 列表：必须在任何持久化加载之前初始化 */
+    crc_list_create(&g_crc_list_snap);
+    crc_list_create(&g_crc_list_aof);
+
+    if (g_config.role == ROLE_MASTER) {
+        /* 主机：恢复历史 CRC，保证重启后 seq 不断档 */
+        if (access(CRC_LIST_SNAP_FILE, F_OK) != 0) {
+            printf("[CRC] no snap crc file\n");
+        }
+        if (access(CRC_LIST_AOF_FILE, F_OK) != 0) {
+            printf("[CRC] no aof crc file\n");
+        }
+        crc_list_load(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
+        crc_list_load(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+        SYNC_LOG("[CRC] master loaded snap=%d aof=%d",
+                 g_crc_list_snap.count, g_crc_list_aof.count);
+    } else {
+        /* 从机：数据来自主机，列表清空 */
+        crc_list_reset(&g_crc_list_snap);
+        crc_list_reset(&g_crc_list_aof);
+        SYNC_LOG("[CRC] slave lists reset");
+    }
+#endif
+
 #if ENABLE_ARRAY
     memset(&global_array, 0, sizeof(kvs_array_t));
     kvs_array_create(&global_array);
@@ -648,13 +674,30 @@ printf("------------ 2. kvs_engine created ----\n");
             if (load_snapshots() != 0) {
                 printf("No snapshot found\n");
             }
+#if ENABLE_CRC
+            /* ★ 主机启动：加载 SNAP 后强制重建 SNAP CRC，保证一致 */
+            crc_rebuild_snap_list();
+            SYNC_LOG("[CRC] master SNAP crc rebuilt: %d entries",
+                    g_crc_list_snap.count);
+#endif
             printf("------------ 3. Snapshots loaded ---\n");
         } else {
             printf("------------ 3. Snapshots disabled ---\n");
         }
 
         if (g_config.aof_enable) {
+#if ENABLE_CRC
+            /* ★ 主机启动：replay AOF 时同步重建 AOF CRC */
+            crc_list_reset(&g_crc_list_aof);
+            long consumed = replay_aof_from_with_crc(AOF_FILE, 0, &g_crc_list_aof);
+            if (consumed > 0) {
+                crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+                SYNC_LOG("[CRC] master AOF replay rebuilt crc=%d",
+                        g_crc_list_aof.count);
+            }
+#else
             replay_aof(AOF_FILE);
+#endif
             printf("------------ 4. AOF done ---\n");
 #if ENABLE_URING
             if (persistence_init() != 0) {
@@ -673,6 +716,12 @@ printf("------------ 2. kvs_engine created ----\n");
 }
 
 void dest_kvengine(void) {
+#if ENABLE_CRC
+    crc_list_save(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
+    crc_list_save(&g_crc_list_aof,  CRC_LIST_AOF_FILE);
+    crc_list_destroy(&g_crc_list_snap);
+    crc_list_destroy(&g_crc_list_aof);
+#endif
 #if ENABLE_PERSIST
     /* Drain/stop AOF before destroying the KV engine. */
     persistence_shutdown();
@@ -693,6 +742,7 @@ void dest_kvengine(void) {
     // 最后销毁内存池
     dest_mempools();
 #endif
+
 }
 
 
