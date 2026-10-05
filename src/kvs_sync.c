@@ -451,7 +451,7 @@ static void aof_slave_exec_line(const char *line)
 
 /**
  * @func 从节点发起sync同步, 根据master的模式进行数据备份
- * aof：全量接收命令，replay后，save落盘
+ * aof：全量接收命令，replay_aof_from加载到内存
  * snap：全量接收数据，落盘，再load加载
  */
 // ===== 从节点：接收 AOF 增量数据（修复半包/粘包问题） =====
@@ -481,10 +481,20 @@ void* slave_aof_recv_thread(void* arg) {
             /* 超时：把当前攒下的数据一次性 replay */
             struct stat st;
             if (stat(AOF_FILE, &st) == 0 && st.st_size > ctx->consumed_offset) {
+#if ENABLE_CRC
+                /*  从 consumed_offset 起，只处理新增部分 */
+                long new_offset = replay_aof_from_with_crc(
+                    AOF_FILE, ctx->consumed_offset, &g_crc_list_aof);
+                if (new_offset > ctx->consumed_offset) {
+                    ctx->consumed_offset = new_offset;
+                    crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+                }
+#else
                 long new_offset = replay_aof_from(AOF_FILE, ctx->consumed_offset);
                 if (new_offset > ctx->consumed_offset) {
                     ctx->consumed_offset = new_offset;
                 }
+#endif
             }
 
             /* 发心跳 */
@@ -529,6 +539,9 @@ void* slave_snap_recv_thread(void* arg) {
         }
         load_snapshots();
         SYNC_LOG_S("SNAP loaded");
+#if ENABLE_CRC
+        crc_rebuild_snap_list();
+#endif
     }
     ctx->is_active = 0;
     if (fd > 0) {
@@ -550,10 +563,21 @@ void slave_handle_aof_mode(int fd) {
         close(fd);
         return;
     }
+#if ENABLE_CRC
+    /*  从机清空本地 CRC 列表（对齐主机的全量快照点） */
+    crc_list_reset(&g_crc_list_aof);
+#endif
 
-    // ===== 2. 执行 AOF 里的所有命令 =====
     SYNC_LOG_S("AOF stream received, replaying...");
+#if ENABLE_CRC
+    long consumed = replay_aof_from_with_crc(AOF_FILE, 0, &g_crc_list_aof);
+    if (consumed >= 0) {
+        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+        SYNC_LOG_S("AOF full replay done, crc=%d", g_crc_list_aof.count);
+    }
+#else
     long consumed = replay_aof_from(AOF_FILE, 0);
+#endif
     if (consumed < 0) {
         SYNC_ERR("replay_aof_from failed");
         close(fd);
