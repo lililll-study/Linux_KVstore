@@ -27,7 +27,8 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(SRC_DIR)/config.c \
 	   $(SRC_DIR)/reactor.c \
        $(SRC_DIR)/kvs_sync.c \
-	   $(SRC_DIR)/ntyco.c 
+	   $(SRC_DIR)/ntyco.c \
+	   $(SRC_DIR)/crc.c
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
@@ -44,6 +45,8 @@ CFLAGS = -Wall -g $(INC)
 DATA_DIR  = data
 AOF_FILE  = $(DATA_DIR)/data_aof.aof
 SNAP_FILE = $(DATA_DIR)/data_snap.snap
+CRC_AOF   = $(DATA_DIR)/crc_aof.dat
+CRC_SNAP  = $(DATA_DIR)/crc_snap.dat
 
 # 默认目标：服务端 + 所有测试端
 all: dirs $(TARGET) $(TEST_TARGETS)
@@ -75,17 +78,17 @@ $(BUILD_DIR)/kvs_sync.o: $(SRC_DIR)/kvs_sync.c
 	$(CC) $(CFLAGS) -DSYNC_RAW_IO -c $< -o $@
 	@echo "Build complete (raw IO): $@"
 
-# ===== 清空持久化数据文件（保留 data/ 目录） =====
-cleandata:
-	@mkdir -p $(DATA_DIR)
-	@: > $(AOF_FILE)      # 清空 AOF（truncate 到 0 字节，文件保留）
-	@: > $(SNAP_FILE)     # 清空 SNAP
-	@echo "Data files cleared:"
-	@ls -l $(AOF_FILE) $(SNAP_FILE)
+
 
 clean:
 	rm -rf $(BUILD_DIR)
+	@mkdir -p $(DATA_DIR)
+	@: > $(AOF_FILE)      # 清空 AOF
+	@: > $(SNAP_FILE)     # 清空 SNAP
+	@: > $(CRC_AOF)       # 清空 CRC-AOF
+	@: > $(CRC_SNAP)      # 清空 CRC-SNAP
+	@echo "Data files cleared:"
+	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP)
 	@echo "Clean complete"
-
 
 .PHONY: all clean cleanall dirs
