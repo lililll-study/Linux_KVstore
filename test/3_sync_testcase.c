@@ -198,7 +198,53 @@ static int verify_range(int connfd, int start, int count) {
     free(resp);
     return fail;
 }
+/* ============================================================
+ * 插入少量数据：key = ps_small_%02d
+ * 用于快速验证 CRC 对比逻辑
+ * ============================================================ */
+static int insert_small(int connfd, int count) {
+    int cap = count * 64;
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    if (!batch || !resp) { free(batch); free(resp); return -1; }
 
+    int blen = 0, i;
+    for (i = 0; i < count; i++) {
+        char key[32], value[32];
+        snprintf(key, sizeof(key), "ps_small_%02d", i);
+        snprintf(value, sizeof(value), "small_val_%02d", i);
+        blen = append_set(batch, blen, key, value);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+
+    int total = send_and_recv(connfd, batch, blen, resp, cap, count);
+
+    gettimeofday(&tv_cur, NULL);
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+    int ok_count = 0;
+    char *p = resp;
+    for (i = 0; i < count; i++) {
+        char *line_end = strstr(p, "\r\n");
+        if (!line_end) break;
+        *line_end = '\0';
+        if (strcmp(p, "ok") == 0) ok_count++;
+        p = line_end + 2;
+    }
+
+    printf("[Insert-Small] count=%d, resp=%d bytes, ok=%d, time=%d ms\n",
+           count, total, ok_count, time_used);
+
+    for (i = 0; i < count; i++) {
+        printf("    ps_small_%02d = small_val_%02d\n", i, i);
+    }
+
+    free(batch);
+    free(resp);
+    return ok_count;
+}
 /* ============================================================
  * main：3 个参数，4 个阶段
  *   mode 1: 连主机，插入前 5w
@@ -212,6 +258,7 @@ int main(int argc, char *argv[]) {
         printf("  mode 1: 连主机，插入前 5w 条 (ps_000000 ~ ps_049999)\n");
         printf("  mode 2: 连主机，插入后 5w 条 (ps_050000 ~ ps_099999)\n");
         printf("  mode 3: 连从机，验证 10w 条\n");
+        printf("  mode 10: 向主机插入 5 条小数据 (ps_small_00 ~ ps_small_04)\n");
         return -1;
     }
 
@@ -245,6 +292,13 @@ int main(int argc, char *argv[]) {
             printf("==> ALL PASS (10w 条一致)\n");
         else
             printf("==> FAILED (前5w fail=%d, 后5w fail=%d)\n", fail1, fail2);
+    }    else if (mode == 10) {
+        printf("===== mode 10: 向 %s:%d 插入 5 条小数据 =====\n", ip, port);
+        int ok = insert_small(connfd, 5);
+        printf("\n>>> 插入完成 (ok=%d) 。\n", ok);
+        printf(">>> 现在可以把主/从的 crc_aof.dat 拷出来对比。\n");
+        printf(">>> 主机: data/crc_aof.dat\n");
+        printf(">>> 从机: test/crc_aof.dat\n");
     }
     else {
         printf("Unknown mode: %d\n", mode);
