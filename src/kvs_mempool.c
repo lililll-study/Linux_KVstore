@@ -2,13 +2,9 @@
 
 
 #if ENABLE_MEMPOOL
-#define KVS_POOL_NODE_COUNT   100000
-#define KVS_POOL_STRING_COUNT 200000
 
 // 响应缓冲池
 mempool_t *resp_pool = NULL;
-#define RESP_POOL_BLOCK_SIZE 4096   // 每个响应块 4KB
-#define RESP_POOL_BLOCK_COUNT 1024  // 总共 1024 个块
 
 // 定义内存池
  mempool_t *array_item_pool = NULL;     // 数组节点池

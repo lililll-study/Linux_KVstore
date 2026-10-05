@@ -61,11 +61,11 @@ aof.enable=true
 
 ```bash
 # AOF 测试
-./build/2_presist_testcase 192.168.137.128 2000 1
+./build/2_presist_testcase 127.0.0.1 2000 1
 # 插入完成后，重启服务端
 ./build/kvstore --config master.conf
 # 测试端读取aof加载的数据
-./build/2_presist_testcase 192.168.137.128 2000 2
+./build/2_presist_testcase 127.0.0.1 2000 2
 ```
 
 
@@ -88,11 +88,11 @@ aof.enable=false
 
 ```bash
 # SNAP 测试
-./build/2_presist_testcase 192.168.137.128 2000 3
+./build/2_presist_testcase 127.0.0.1 2000 3
 # 插入完成后，重启服务端
 ./build/kvstore --config master.conf
 # 测试端读取aof加载的数据
-./build/2_presist_testcase 192.168.137.128 2000 4
+./build/2_presist_testcase 127.0.0.1 2000 4
 ```
 
 
