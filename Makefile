@@ -7,10 +7,12 @@ TEST_DIR = test
 INC_DIR = include
 
 # 测试用例列表（每个独立编译）
-TEST_SRCS = $(TEST_DIR)/3_sync_testcase.c \
+TEST_SRCS = $(TEST_DIR)/5_crc_testcase.c \
+			$(TEST_DIR)/3_sync_testcase.c \
 			$(TEST_DIR)/2_presist_testcase.c \
 			$(TEST_DIR)/1_RESP_testcase.c \
             $(TEST_DIR)/aof_snap_test.c
+
 # ===== 每个测试用例对应的可执行文件 =====
 TEST_TARGETS = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_SRCS))
 
