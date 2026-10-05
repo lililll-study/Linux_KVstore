@@ -124,6 +124,32 @@ aof.enable=false
 
 
 
+# 数据校验
+
+```bash
+# 1. 启动主机
+./build/kvstore --config config/master.conf
+
+# 测试端：连接主机并插入5条数据
+./build/3_sync_testcase 192.168.137.134 2000 10
+
+# 2. 启动从机
+./build/kvstore --config config/slave.conf
+
+
+# 3. 对比主从机的crc列表
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+
+
+# 4. 修改从机数据
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
+
+# 5. 再次对比 
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+```
+
+
+
 
 
 # 性能测试
