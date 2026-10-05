@@ -563,6 +563,15 @@ int persistence_init(void)
 int append_aof(const char *cmd, const char *key, const char *value)
 {
     if (!g_config.aof_enable) return 0;
+#if ENABLE_CRC
+    /*  AOF 每写一条命令，就追加一条 CRC */
+    crc_list_append(&g_crc_list_aof, cmd, key, value);
+
+    /* 每 128 条落一次盘，避免崩溃丢太多 */
+    if ((g_crc_list_aof.count & 0x7F) == 0) {
+        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+    }
+#endif
     if (!g_aof_uring) return -ESHUTDOWN;    //返回-108：未初始化
 
     char *record = NULL;
@@ -672,6 +681,56 @@ int replay_aof(const char *filename) {
     return (ret < 0) ? -1 : 0;
 }
 
+#if ENABLE_CRC
+long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_t *crc_out) {
+    mmap_file_t mf;
+    size_t offset = (size_t)start_offset;
+    int count = 0;
+    long ret = start_offset;
+
+    if (mmap_file_open(filename, &mf) < 0) {
+        printf("[AOF] mmap_file_open failed: %s\n", filename);
+        return -1;
+    }
+    if (mf.size == 0) { mmap_file_close(&mf); return start_offset; }
+    if (offset > mf.size) { mmap_file_close(&mf); return -1; }
+
+    while (offset < mf.size) {
+        char *tokens[KVS_MAX_TOKENS] = {0};
+        int token_count = 0;
+
+        int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
+                                               tokens, &token_count);
+        if (consumed < 0) {
+            printf("[AOF] FORMAT ERROR at offset=%zu\n", offset);
+            break;
+        }
+        if (consumed == 0) break;   /* 半条命令，等下次 */
+
+#if ENABLE_CRC
+        /* ★ 先追加 CRC，再执行命令 */
+        if (crc_out && token_count >= 2) {
+            const char *cmd   = tokens[0];
+            const char *key   = tokens[1];
+            const char *value = (token_count >= 3) ? tokens[2] : NULL;
+            crc_list_append(crc_out, cmd, key, value);
+        }
+#endif
+
+        kvs_filter_protocol(-1, tokens, token_count, NULL);
+
+        int i;
+        for (i = 0; i < token_count; i++) free(tokens[i]);
+        count++;
+    }
+
+    ret = (long)offset;
+    mmap_file_close(&mf);
+    printf("[AOF] replayed(crc) %d entries, offset %ld -> %ld\n",
+           count, start_offset, ret);
+    return ret;
+}
+#endif
 
 #if ENABLE_URING
 int save_snapshots() {
@@ -688,8 +747,15 @@ int save_snapshots() {
             ret = -1;
         }
     }
+
+#if ENABLE_CRC
+    if (ret == 0) crc_rebuild_snap_list();
+#endif
     return ret;
 }
+
+
+
 
 
 #if ENABLE_MMAP
@@ -907,5 +973,79 @@ int load_snapshots() {
 
 
 
+#if ENABLE_CRC
+/* ===== rbtree 中序回调 ===== */
+typedef void (*rbtree_visit_fn)(rbtree_node *node, void *arg);
+
+static void rbtree_inorder_cb(rbtree *T, rbtree_node *node,
+                              rbtree_visit_fn cb, void *arg)
+{
+    if (node == T->nil || node == NULL) return;
+    rbtree_inorder_cb(T, node->left,  cb, arg);
+    cb(node, arg);
+    rbtree_inorder_cb(T, node->right, cb, arg);
+}
+
+static void rbtree_crc_visit(rbtree_node *node, void *arg)
+{
+    crc_list_t *list = (crc_list_t *)arg;
+    crc_list_append(list, "SNAP", node->key, (char *)node->value);
+}
+
+/* 重建 SNAP CRC 列表并落盘到 CRC_LIST_SNAP_FILE
+ * 内部流程：reset 全局 g_crc_list_snap → 遍历四引擎 → save
+ * 主机 SAVE 后、从机 load_snapshots 后都调它 */
+int crc_rebuild_snap_list(void)
+{
+    crc_list_reset(&g_crc_list_snap);
+
+#if ENABLE_ARRAY
+    {
+        int i;
+        for (i = 0; i < global_array.total; i++) {
+            if (global_array.table[i].key != NULL) {
+                crc_list_append(&g_crc_list_snap, "SNAP",
+                                global_array.table[i].key,
+                                global_array.table[i].value);
+            }
+        }
+    }
+#endif
+
+#if ENABLE_RBTREE
+    rbtree_inorder_cb(&global_rbtree, global_rbtree.root,
+                      rbtree_crc_visit, &g_crc_list_snap);
+#endif
+
+#if ENABLE_HASH
+    {
+        int i;
+        for (i = 0; i < global_hash.max_slots; i++) {
+            hashnode_t *node = global_hash.nodes[i];
+            while (node != NULL) {
+                crc_list_append(&g_crc_list_snap, "SNAP",
+                                node->key, node->value);
+                node = node->next;
+            }
+        }
+    }
+#endif
+
+#if ENABLE_SKIPTABLE
+    {
+        kvs_node_t *curr = global_skiptable.header->forward[0];
+        while (curr != NULL) {
+            crc_list_append(&g_crc_list_snap, "SNAP",
+                            curr->key, curr->value);
+            curr = curr->forward[0];
+        }
+    }
+#endif
+
+    crc_list_save(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
+    SYNC_LOG("[CRC] SNAP list rebuilt: %d entries", g_crc_list_snap.count);
+    return 0;
+}
+#endif
 
 
