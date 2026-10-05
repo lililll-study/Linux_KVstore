@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdint.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -39,6 +40,9 @@
 #define ENABLE_REPBUF        1   // 启动响应缓冲区，避免响应过大溢出
 
 #define ENABLE_SYNC_MODIFY 1    // 修改主从同步逻辑
+
+#define ENABLE_CRC          1   // 打开crc校验功能
+
 
 /* ===== 统一同步日志宏 ===== */
 #define SYNC_LOG(fmt, ...) \
@@ -429,7 +433,60 @@ int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 #endif
 
 /*
-======================================= 6.  配置config ======================================
+======================================= 6.  CRC校验 ======================================
+==========================================================================================
+*/
+#if ENABLE_CRC
+
+#define CRC_LIST_SNAP_FILE  "data/crc_snap.dat"
+#define CRC_LIST_AOF_FILE   "data/crc_aof.dat"
+
+// CRC单元：单条CRC记录
+typedef struct {
+    uint32_t crc;   // 本条记录的内容指纹：CRC32(cmd+key+value) 或 CRC32(key+value)
+    uint64_t seq;   // 全局递增序列号，用于对齐
+} crc_uint_t;
+
+uint32_t crc32_calc(const char *data, size_t len);
+uint32_t crc32_calc_snap(const char *key, const char *value);
+uint32_t crc32_calc_aof(const char *cmd, const char *key, const char *value);
+
+// 整个CRC列表容器
+typedef struct {
+    crc_uint_t *units;  // 指向堆上的动态数组，存储所有crc单元
+    int     count;  // 当前有多少个单元
+    int     cap;    // 数组容量
+    uint64_t next_seq;  // 下个单元应该分配哪个 seq
+    pthread_mutex_t  lock;  // 多线程保护
+} crc_list_t;
+
+/* 主机/从机全局列表（在 crc.c 中定义） */
+extern crc_list_t g_crc_list_snap;
+extern crc_list_t g_crc_list_aof;
+
+// 生命周期
+int crc_list_create(crc_list_t *list);
+void crc_list_destroy(crc_list_t *list);
+void crc_list_reset(crc_list_t *list);
+
+// 追加记录
+int crc_list_append(crc_list_t *list, const char *type, const char *key, const char *value);
+
+// 持久化
+int crc_list_save(crc_list_t *list, const char *filename);
+int crc_list_load(crc_list_t *list, const char *filename);
+/* 便利封装：直接落盘到默认文件 */
+int crc_save_snap(void);
+int crc_save_aof(void);
+
+
+int crc_rebuild_snap_list(void);
+long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_t *crc_out);
+#endif
+
+
+/*
+======================================= 7.  配置config ======================================
 ==========================================================================================
 */
 
