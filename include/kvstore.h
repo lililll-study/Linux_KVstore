@@ -280,8 +280,8 @@ int replay_aof(const char *filename);
 */
 #if ENABLE_MEMPOOL
 
-#define KVS_POOL_NODE_COUNT     100000
-#define KVS_POOL_STRING_COUNT   200000
+#define KVS_POOL_NODE_COUNT     200000
+#define KVS_POOL_STRING_COUNT   400000
 #define RESP_POOL_BLOCK_SIZE    4096
 #define RESP_POOL_BLOCK_COUNT   1024
 

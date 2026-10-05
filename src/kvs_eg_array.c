@@ -72,6 +72,37 @@ void kvs_array_destory(kvs_array_t *inst) {
 }
 
 // ===== 扩容函数 =====
+
+#if 0
+static int kvs_array_expand(kvs_array_t *inst) {
+    int new_cap = inst->capacity * KVS_ARRAY_GROW_FACTOR;
+    size_t new_size = sizeof(kvs_array_item_t) * new_cap;
+
+    /* ★ 变长表统一 malloc：池块固定大小，装不下翻倍的表 */
+    kvs_array_item_t *new_table = (kvs_array_item_t *)kvs_malloc(new_size);
+    if (!new_table) {
+        printf("[Array] Expand failed: out of memory\n");
+        return -1;
+    }
+
+    memcpy(new_table, inst->table, sizeof(kvs_array_item_t) * inst->capacity);
+
+    int i = 0;
+    for (i = inst->capacity; i < new_cap; i++) {
+        new_table[i].key = NULL;
+        new_table[i].value = NULL;
+    }
+
+    /* ★ 与分配严格配对 */
+    kvs_free(inst->table);
+
+    inst->table = new_table;
+    inst->capacity = new_cap;
+
+    printf("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
+    return 0;
+}
+#else
 static int kvs_array_expand(kvs_array_t *inst) {
     int new_cap = inst->capacity * KVS_ARRAY_GROW_FACTOR;
     size_t new_size = sizeof(kvs_array_item_t) * new_cap;
@@ -120,7 +151,7 @@ static int kvs_array_expand(kvs_array_t *inst) {
     printf("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
     return 0;
 }
-
+#endif
 
 // 实现五个接口
 

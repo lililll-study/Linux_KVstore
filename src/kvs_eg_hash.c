@@ -37,7 +37,7 @@ static int _hash(char *key, int size) {
 }
 
 hashnode_t *_create_node(char *key, char *value) {
-#if ENABLE_MEMPOOL
+#if ENABLE_MEMPOOL  
 	hashnode_t *node = (hashnode_t*)kvs_mempool_alloc(hash_node_pool, sizeof(hashnode_t));
 #else
 	hashnode_t *node = (hashnode_t*)kvs_malloc(sizeof(hashnode_t));
@@ -46,7 +46,7 @@ hashnode_t *_create_node(char *key, char *value) {
 	
 #if ENABLE_KEY_POINTER
 
-#if ENABLE_MEMPOOL
+#if ENABLE_MEMPOOL  
 	char *kcopy = kvs_mempool_alloc(hash_string_pool,  strlen(key) + 1);
 	if (kcopy == NULL) {
 		kvs_mempool_free(hash_node_pool, node);
@@ -92,7 +92,7 @@ hashnode_t *_create_node(char *key, char *value) {
 }
 
 static void _free_node(hashnode_t *node) {
-#if ENABLE_MEMPOOL
+#if ENABLE_MEMPOOL  
     kvs_mempool_free(hash_string_pool, node->key);
     kvs_mempool_free(hash_string_pool, node->value);
     kvs_mempool_free(hash_node_pool, node);
@@ -109,6 +109,8 @@ int kvs_hash_create(kvs_hash_t *hash) {
 
 	hash->nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * MAX_TABLE_SIZE);
 	if (!hash->nodes) return -1;
+
+	memset(hash->nodes, 0, sizeof(hashnode_t*) * MAX_TABLE_SIZE);   // ★ 加这行
 
 	hash->max_slots = MAX_TABLE_SIZE;
 	hash->count = 0; 
@@ -170,6 +172,8 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 #endif
 
 	hashnode_t *new_node = _create_node(key, value);
+	if (!new_node) return -1;              // 顺便补上失败检查
+
 	new_node->next = hash->nodes[idx];
 	hash->nodes[idx] = new_node;
 	
@@ -226,7 +230,7 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 	}
 
 	// node --> 
-#if ENABLE_MEMPOOL
+#if ENABLE_MEMPOOL  
     // 释放旧 value
     kvs_mempool_free(hash_string_pool, node->value);
     
