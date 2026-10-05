@@ -567,10 +567,10 @@ int append_aof(const char *cmd, const char *key, const char *value)
     /*  AOF 每写一条命令，就追加一条 CRC */
     crc_list_append(&g_crc_list_aof, cmd, key, value);
 
-    /* 每 128 条落一次盘，避免崩溃丢太多 */
-    if ((g_crc_list_aof.count & 0x7F) == 0) {
-        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-    }
+    /* 每 1 条落一次盘，避免崩溃丢太多 */
+    // if ((g_crc_list_aof.count & 0x7F) == 0) {
+    crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+    // }
 #endif
     if (!g_aof_uring) return -ESHUTDOWN;    //返回-108：未初始化
 
