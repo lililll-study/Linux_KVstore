@@ -6,6 +6,8 @@
 
 #include "kvstore.h"
 
+#if ENABLE_CRC
+
 #define CRC_MAGIC 0x43524331u
 
 /* ---------------- CRC 文件加载 ---------------- */
@@ -321,3 +323,11 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 }
+
+#else
+
+int main() {
+    printf("crc is not work\n");
+}
+
+#endif
