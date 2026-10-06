@@ -15,6 +15,14 @@
 #include <pthread.h>   
 #include <unistd.h>    
 
+#define ENABLE_PRINTF       1       // 终端打印开关
+
+#if ENABLE_PRINTF
+    #define KVS_PRINTF(...)   printf(__VA_ARGS__)
+#else
+    #define KVS_PRINTF(...)   ((void)0)
+#endif
+
 #define ENABLE_MMAP         1   // 持久化数据加载
 #define ENABLE_URING        1   // 持久化数据落盘
 #define NET_REACTOR     0
@@ -44,23 +52,12 @@
 #define ENABLE_CRC          1   // 打开crc校验功能
 
 
-/* ===== 统一同步日志宏 ===== */
-#define SYNC_LOG(fmt, ...) \
-    printf("[SYNC] " fmt "\n", ##__VA_ARGS__)
 
-#define SYNC_LOG_M(fmt, ...) \
-    printf("[SYNC][MASTER] " fmt "\n", ##__VA_ARGS__)
-
-#define SYNC_LOG_S(fmt, ...) \
-    printf("[SYNC][SLAVE] " fmt "\n", ##__VA_ARGS__)
-
-#define SYNC_ERR(fmt, ...) \
-    printf("[SYNC][ERROR] " fmt "\n", ##__VA_ARGS__)
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
     if (g_is_master && (fd) >= 0) {                             \
-        printf("[MASTER] working now~  fd=%d cmd=%s key=%s\n",  \
-               (fd), (cmd), (key));                             \
+        LOG_DEBUG("[MASTER] working now~ fd=%d cmd=%s key=%s",  \
+                  (fd), (cmd), (key));                          \
     }                                                           \
 } while (0)
 
@@ -518,9 +515,47 @@ void kvs_config_print(void);
 
 
 
+/*
+======================================= 8.  日志功能 ======================================
+==========================================================================================
+*/
+/* ===== 日志级别 ===== */
+typedef enum {
+    LOG_LEVEL_DEBUG = 0,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARN,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_FATAL
+} log_level_t;
+
+int  kvs_log_init(const char *filename, log_level_t min_level);
+void kvs_log_fini(void);
+void kvs_log_set_level(log_level_t level);
+log_level_t kvs_log_get_level(void);
+
+void kvs_log_write(log_level_t level,
+                   const char *file, int line,
+                   const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+#define LOG_DEBUG(fmt, ...) \
+    kvs_log_write(LOG_LEVEL_DEBUG, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  \
+    kvs_log_write(LOG_LEVEL_INFO,  __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  \
+    kvs_log_write(LOG_LEVEL_WARN,  __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) \
+    kvs_log_write(LOG_LEVEL_ERROR, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define LOG_FATAL(fmt, ...) \
+    kvs_log_write(LOG_LEVEL_FATAL, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 
 void kvs_free(void *ptr);
 void *kvs_malloc (size_t size);
 
 
+/* ===== 统一同步日志宏（走 logger） ===== */
+#define SYNC_LOG(fmt, ...)   LOG_INFO ("[SYNC] " fmt, ##__VA_ARGS__)
+#define SYNC_LOG_M(fmt, ...) LOG_INFO ("[SYNC][MASTER] " fmt, ##__VA_ARGS__)
+#define SYNC_LOG_S(fmt, ...) LOG_INFO ("[SYNC][SLAVE] " fmt, ##__VA_ARGS__)
+#define SYNC_ERR(fmt, ...)   LOG_ERROR("[SYNC] " fmt, ##__VA_ARGS__)
 #endif
