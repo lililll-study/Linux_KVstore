@@ -172,7 +172,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 2. 如果没检测到直接break，说明数据不够，等更多数据再检测（防止分包粘包问题）
             if (left < 4) break;
             if (p[0] != '*') {//如果起始不是*说明数据错误
-                printf("[RESP1] ERROR: cmd_total_head is wrong");
+                LOG_INFO("[RESP1] ERROR: cmd_total_head is wrong");
                 resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
@@ -188,7 +188,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
 
             // 如果没有cmd长度，报错并停止循环
             if (num_len == 0) {
-                printf("[RESP1] ERROR: cmd_num is null\n");
+                LOG_INFO("[RESP1] ERROR: cmd_num is null\n");
                 break;
             }
 
@@ -223,7 +223,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 5. 如果没找到也break等数据
             if (left < 4) break; // 如果剩余数据少于4个，那么继续攒数据
             if (p[0] != '*') {//如果起始不是*说明数据错误
-                printf("[RESP2] ERROR: cmd_head is wrong");
+                LOG_INFO("[RESP2] ERROR: cmd_head is wrong");
                 resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
@@ -240,7 +240,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
 
             // 如果没有cmd长度，报错并停止循环
             if (num_len == 0) {
-                printf("[RESP2] ERROR: cmd_unit num is wrong");
+                LOG_INFO("[RESP2] ERROR: cmd_unit num is wrong");
                 break;
             }
 
@@ -280,7 +280,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             left = remain - processed_data;
             if (left < 4) break; // 如果剩余数据少于4个，那么继续攒数据
             if (p[0] != '$') {//如果起始不是$说明数据错误
-                printf("[RESP2] ERROR: token_head is wrong");
+                LOG_INFO("[RESP2] ERROR: token_head is wrong");
                 resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
@@ -292,7 +292,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                 p++;
             }
             if (num_len == 0) {
-                printf("[RESP3] ERROR: token_len is null\n");
+                LOG_INFO("[RESP3] ERROR: token_len is null\n");
                 break;
             }
             if (p >= data + remain || *p != '\r') break;
@@ -377,7 +377,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                 #else
                 if (exec_ret < 0) {
                     int bad_cmd_len = processed_data - ctx->resp_cmd_start;
-                    printf("[RESP] skip bad cmd: start=%d, end=%d, cmd_len=%d, tokens='%s'\n",
+                    LOG_INFO("[RESP] skip bad cmd: start=%d, end=%d, cmd_len=%d, tokens='%s'\n",
                         ctx->resp_cmd_start, processed_data, bad_cmd_len,
                         ctx->resp_temp_buffer ? ctx->resp_temp_buffer : "(null)");
                     

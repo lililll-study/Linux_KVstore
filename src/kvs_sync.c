@@ -461,7 +461,7 @@ void* slave_aof_recv_thread(void* arg) {
 
     char buf[4096];
 
-    printf("[AOF Sync] Slave receive thread started on fd %d\n", fd);
+    LOG_INFO("[AOF Sync] Slave receive thread started on fd %d\n", fd);
 
     while (ctx->is_active && fd > 0) {
         /* 1 秒超时：有数据就 append，超时后统一 replay + 发心跳 */
@@ -474,7 +474,7 @@ void* slave_aof_recv_thread(void* arg) {
                 fwrite(buf, 1, n, fp);
                 fclose(fp);
             } else {
-                printf("[AOF Sync] open %s for append failed\n", AOF_FILE);
+                LOG_ERROR("[AOF Sync] open %s for append failed\n", AOF_FILE);
             }
 
         } else if (n == 0) {
@@ -499,11 +499,11 @@ void* slave_aof_recv_thread(void* arg) {
 
             /* 发心跳 */
             if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) {
-                printf("[Heartbeat] Send failed\n");
+                LOG_ERROR("[Heartbeat] Send failed\n");
                 break;
             }
         } else {
-            printf("[AOF Sync] Master connection closed\n");
+            LOG_WARN("[AOF Sync] Master connection closed\n");
             break;
         }
     }
@@ -513,7 +513,7 @@ void* slave_aof_recv_thread(void* arg) {
         close(fd);
         ctx->fd = -1;
     }
-    printf("[AOF Sync] Slave receive thread exiting\n");
+    LOG_INFO("[AOF Sync] Slave receive thread exiting\n");
     return NULL;
 }
 
@@ -667,7 +667,7 @@ int sync_from_master(const char *master_ip, int port) {
     while (mode_len < (int)sizeof(mode) - 1) {
         int n = recv(fd, mode + mode_len, 1, 0);
         if (n <= 0) {
-            printf("Failed to receive mode\n");
+            LOG_ERROR("Failed to receive mode\n");
             close(fd);
             return -1;
         }

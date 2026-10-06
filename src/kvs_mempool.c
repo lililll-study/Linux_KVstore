@@ -183,7 +183,7 @@ int init_mempools(void) {
     // 创建响应缓冲池
     resp_pool = kvs_mempool_create(RESP_POOL_BLOCK_SIZE, RESP_POOL_BLOCK_COUNT);
     if (!resp_pool) {
-        printf("Failed to create response pool\n");
+        LOG_INFO("Failed to create response pool\n");
         return -1;
     }
     

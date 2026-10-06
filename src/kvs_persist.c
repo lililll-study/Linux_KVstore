@@ -347,7 +347,7 @@ int save_snapshot_array(const char *filename) {
     }
     
     fclose(fp);
-    printf("Snapshot array saved to %s\n", filename);
+    LOG_INFO("Snapshot array saved to %s\n", filename);
     return 0;
 }
 
@@ -359,7 +359,7 @@ int save_snapshot_rbtree(const char *filename) {
     travel_rbtree_node(&global_rbtree, global_rbtree.root, fp);
     
     fclose(fp);
-    printf("Snapshot rbtree saved to %s\n", filename);
+    LOG_INFO("Snapshot rbtree saved to %s\n", filename);
     return 0;
 }
 
@@ -379,7 +379,7 @@ int save_snapshot_hash(const char *filename) {
     }
     
     fclose(fp);
-    printf("Snapshot hash saved to %s\n", filename);
+    LOG_INFO("Snapshot hash saved to %s\n", filename);
     return 0;
 }
 
@@ -397,7 +397,7 @@ int save_snapshot_skiptable(const char *filename) {
     }
     
     fclose(fp);
-    printf("Snapshot skiptable saved to %s\n", filename);
+    LOG_INFO("Snapshot skiptable saved to %s\n", filename);
     return 0;
 }
 #endif 
@@ -527,7 +527,7 @@ int persistence_init(void)
     // 打开aof文件获得fd    读写模式    不存在则创建 exec 时自动关闭
     g_aof_fd = open(AOF_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (g_aof_fd < 0) {
-        printf("[AOF] open %s failed: %s\n", AOF_FILE, strerror(errno));
+        LOG_ERROR("[AOF] open %s failed: %s\n", AOF_FILE, strerror(errno));
         return -errno;
     }
 
@@ -543,14 +543,14 @@ int persistence_init(void)
     // 初始化uring子系统，失败就清理fd
     int ret = kvs_uring_init(&g_aof_uring, g_aof_fd, st.st_size);
     if (ret < 0) {
-        printf("[AOF] io_uring init failed: %s\n",
+        LOG_ERROR("[AOF] io_uring init failed: %s\n",
                strerror(-ret));
         close(g_aof_fd);
         g_aof_fd = -1;
         return ret;
     }
 
-    printf("[AOF] io_uring writer started, offset=%lld\n", (long long)st.st_size);
+    LOG_INFO("[AOF] io_uring writer started, offset=%lld\n", (long long)st.st_size);
 
     return 0;
 }
@@ -567,10 +567,10 @@ int append_aof(const char *cmd, const char *key, const char *value)
     /*  AOF 每写一条命令，就追加一条 CRC */
     crc_list_append(&g_crc_list_aof, cmd, key, value);
 
-    /* 每 1 条落一次盘，避免崩溃丢太多 */
-    // if ((g_crc_list_aof.count & 0x7F) == 0) {
-    crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-    // }
+    /* 每 128 条落一次盘，避免崩溃丢太多 128=0x7F 1024=0x3FF */
+    if ((g_crc_list_aof.count & 0x3FF) == 0) {
+        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
+    }
 #endif
     if (!g_aof_uring) return -ESHUTDOWN;    //返回-108：未初始化
 
@@ -627,7 +627,7 @@ long replay_aof_from(const char *filename, long start_offset) {
     long ret = start_offset;
 
     if (mmap_file_open(filename, &mf) < 0) {
-        printf("[AOF] mmap_file_open failed: %s\n", filename);
+        LOG_ERROR("[AOF] mmap_file_open failed: %s\n", filename);
         return -1;
     }
 
@@ -648,7 +648,7 @@ long replay_aof_from(const char *filename, long start_offset) {
         int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
                                                tokens, &token_count);
         if (consumed < 0) {
-            printf("[AOF] FORMAT ERROR at offset=%zu\n", offset);
+            LOG_ERROR("[AOF] FORMAT ERROR at offset=%zu\n", offset);
             break;
         }
         if (consumed == 0) {
@@ -668,7 +668,7 @@ long replay_aof_from(const char *filename, long start_offset) {
 
     mmap_file_close(&mf);
 
-    printf("Replayed %d entries, offset %ld -> %ld\n",
+    LOG_INFO("Replayed %d entries, offset %ld -> %ld\n",
            count, start_offset, ret);
     return ret;
 }
@@ -689,7 +689,7 @@ long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_
     long ret = start_offset;
 
     if (mmap_file_open(filename, &mf) < 0) {
-        printf("[AOF] mmap_file_open failed: %s\n", filename);
+        LOG_ERROR("[AOF] mmap_file_open failed: %s\n", filename);
         return -1;
     }
     if (mf.size == 0) { mmap_file_close(&mf); return start_offset; }
@@ -702,7 +702,7 @@ long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_
         int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
                                                tokens, &token_count);
         if (consumed < 0) {
-            printf("[AOF] FORMAT ERROR at offset=%zu\n", offset);
+            LOG_ERROR("[AOF] FORMAT ERROR at offset=%zu\n", offset);
             break;
         }
         if (consumed == 0) break;   /* 半条命令，等下次 */
@@ -726,7 +726,7 @@ long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_
 
     ret = (long)offset;
     mmap_file_close(&mf);
-    printf("[AOF] replayed(crc) %d entries, offset %ld -> %ld\n",
+    LOG_INFO("[AOF] replayed(crc) %d entries, offset %ld -> %ld\n",
            count, start_offset, ret);
     return ret;
 }
@@ -743,7 +743,7 @@ int save_snapshots() {
     int ret = 0, i = 0;
     for (i = 0; engine_persist_table[i].name != NULL; i++) {
         if (engine_persist_table[i].save_fn(SNAP_FILE) != 0) {
-            printf("failed to save %s snap\n", engine_persist_table[i].name);
+            LOG_ERROR("failed to save %s snap\n", engine_persist_table[i].name);
             ret = -1;
         }
     }
@@ -772,7 +772,7 @@ int load_snapshots()
     int current_engine = -1;
 
     if (mmap_file_open(SNAP_FILE, &mf) < 0) {
-        printf("No snapshot file: %s\n", SNAP_FILE);
+        LOG_INFO("No snapshot file: %s\n", SNAP_FILE);
         return -1;
     }
 
@@ -818,7 +818,7 @@ int load_snapshots()
                 mf.data, mf.size, &offset);
 
             if (!key) {
-                printf("[Snap] ERROR: failed to read key\n");
+                LOG_ERROR("[Snap] ERROR: failed to read key\n");
                 break;
             }
 
@@ -826,7 +826,7 @@ int load_snapshots()
                 mf.data, mf.size, &offset);
 
             if (!value) {
-                printf("[Snap] ERROR: failed to read value\n");
+                LOG_ERROR("[Snap] ERROR: failed to read value\n");
                 free(key);
                 break;
             }
@@ -850,7 +850,7 @@ int load_snapshots()
                 break;
 
             default:
-                printf("[Snap] ERROR: unknown engine\n");
+                LOG_WARN("[Snap] ERROR: unknown engine\n");
                 free(key);
                 free(value);
                 mmap_file_close(&mf);
@@ -867,7 +867,7 @@ int load_snapshots()
 
     mmap_file_close(&mf);
 
-    printf("Loaded %d entries from %s\n",
+    LOG_INFO("Loaded %d entries from %s\n",
            count, SNAP_FILE);
 
     return 0;

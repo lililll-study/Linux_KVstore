@@ -331,7 +331,7 @@ void rbtree_traversal(rbtree *T, rbtree_node *node) {
 	if (node != T->nil) {
 		rbtree_traversal(T, node->left);
 #if ENABLE_KEY_CHAR 
-		printf("key:%s, value:%s\n", node->key, (char*)node->value);
+		LOG_INFO("key:%s, value:%s\n", node->key, (char*)node->value);
 #else 
 		printf("key:%d, color:%d\n", node->key, node->color);
 #endif
@@ -482,7 +482,7 @@ int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) {
 	// printf("  rbtree_string_pool: free_blocks=%zu, total_blocks=%zu\n",  rbtree_string_pool->free_blocks, rbtree_string_pool->total_blocks);
 	rbtree_node *exist = rbtree_search(inst, key);
 	if (exist != inst->nil) {
-		printf("node exist\n");
+		LOG_INFO("node exist\n");
         return 1;  // 已存在
     }
 
@@ -517,7 +517,7 @@ int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) {
         kvs_mempool_free(rbtree_node_pool, node);
         return -2;
     }
-	// printf("  value allocated at %p\n", node->value);
+	// LOG_INFO("  value allocated at %p\n", node->value);
 #else
     rbtree_node *node = (rbtree_node*)kvs_malloc(sizeof(rbtree_node));
     if (!node) return -1;
@@ -544,7 +544,7 @@ int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) {
     static int insert_count = 0;	// 只在程序启动时初始化一次
     insert_count++;
     if (insert_count % 10000 == 0) {
-        printf("[Rbtree]    Progress: %d nodes inserted\n", insert_count);
+        LOG_INFO("[Rbtree]    Progress: %d nodes inserted\n", insert_count);
     }
     return 0;
 }

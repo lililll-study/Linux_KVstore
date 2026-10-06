@@ -90,7 +90,7 @@ static void* slave_sync_thread(void* arg) {
 int check_datafile_exist() {
     struct stat st = {0};
     if (stat("data", &st) == -1) {
-        printf("Error: data directory not exist. Please create it.\n");
+        LOG_INFO("Error: data directory not exist. Please create it.\n");
         return -1;
     }
     return 0;
@@ -509,7 +509,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 #endif
         default:
-            printf("[ERROR] unhandled cmd=%d, token='%s'\n", cmd, tokens[0]);
+            LOG_INFO("[ERROR] unhandled cmd=%d, token='%s'\n", cmd, tokens[0]);
             // 发送错误响应给客户端
             if (ctx != NULL) {
                 const char *err = "error: unhandled command\r\n";
@@ -606,10 +606,10 @@ int init_kvengine(void) {
     // 先初始化内存池
     // printf("Initializing memory pools...\n");
     if (init_mempools() != 0) {
-        printf("Failed to init memory pools\n");
+        LOG_INFO("Failed to init memory pools\n");
         return -1;
     }
-    printf("********----  1. Memory-pools init success!  ----********\n");
+    LOG_INFO("********----  1. Memory-pools init success!  ----********\n");
 #endif
 
 #if ENABLE_CRC
@@ -620,10 +620,10 @@ int init_kvengine(void) {
     if (g_config.role == ROLE_MASTER) {
         /* 主机：恢复历史 CRC，保证重启后 seq 不断档 */
         if (access(CRC_LIST_SNAP_FILE, F_OK) != 0) {
-            printf("[CRC] no snap crc file\n");
+            LOG_INFO("[CRC] no snap crc file\n");
         }
         if (access(CRC_LIST_AOF_FILE, F_OK) != 0) {
-            printf("[CRC] no aof crc file\n");
+            LOG_INFO("[CRC] no aof crc file\n");
         }
         crc_list_load(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
         crc_list_load(&g_crc_list_aof, CRC_LIST_AOF_FILE);
@@ -661,18 +661,18 @@ int init_kvengine(void) {
     // printf("Rbtree created\n");
 #endif
 
-printf("------------ 2. kvs_engine created ----\n");
+LOG_INFO("------------ 2. kvs_engine created ----\n");
 
 
 #if ENABLE_PERSIST
     if (g_config.role == ROLE_SLAVE) {
         // 从机：不加载本地 SNAP/AOF（数据从主机来）
-        printf("=== [INIT] SLAVE mode: skip local snap/AOF ===\n");
+        LOG_INFO("=== [INIT] SLAVE mode: skip local snap/AOF ===\n");
     } else {
         // 主机：正常加载
         if (g_config.snap_enable) {
             if (load_snapshots() != 0) {
-                printf("No snapshot found\n");
+                LOG_INFO("No snapshot found\n");
             }
 #if ENABLE_CRC
             /* ★ 主机启动：加载 SNAP 后强制重建 SNAP CRC，保证一致 */
@@ -680,9 +680,9 @@ printf("------------ 2. kvs_engine created ----\n");
             SYNC_LOG("[CRC] master SNAP crc rebuilt: %d entries",
                     g_crc_list_snap.count);
 #endif
-            printf("------------ 3. Snapshots loaded ---\n");
+            LOG_INFO("------------ 3. Snapshots loaded ---\n");
         } else {
-            printf("------------ 3. Snapshots disabled ---\n");
+            LOG_INFO("------------ 3. Snapshots disabled ---\n");
         }
 
         if (g_config.aof_enable) {
@@ -698,16 +698,16 @@ printf("------------ 2. kvs_engine created ----\n");
 #else
             replay_aof(AOF_FILE);
 #endif
-            printf("------------ 4. AOF done ---\n");
+            LOG_INFO("------------ 4. AOF done ---\n");
 #if ENABLE_URING
             if (persistence_init() != 0) {
-                printf("------------ 5. AOF io_uring init FAILED ---\n");
+                LOG_INFO("------------ 5. AOF io_uring init FAILED ---\n");
                 return -1;
             }
-            printf("------------ 5. AOF io_uring writer started ---\n");
+            LOG_INFO("------------ 5. AOF io_uring writer started ---\n");
 #endif
         } else {
-            printf("------------ 4. AOF disabled ---\n");
+            LOG_INFO("------------ 4. AOF disabled ---\n");
         }
     }
 #endif
@@ -753,19 +753,19 @@ void* cli_thread(void* arg) {
     char input[256];
     int is_master = *(int*)arg;
     
-    printf("\n=== KVS CLI ===\n");
+    LOG_INFO("\n=== KVS CLI ===\n");
     if (is_master) {
-        printf("Mode: MASTER\n");
+        LOG_INFO("Mode: MASTER\n");
     } else {
-        printf("Mode: SLAVE\n");
-        printf("  sync <ip> <port>  - Sync from master\n");
+        LOG_INFO("Mode: SLAVE\n");
+        LOG_INFO("  sync <ip> <port>  - Sync from master\n");
     }
-    printf("  help              - Show this help\n");
-    printf("  exit              - Exit\n");
-    printf("================\n\n");
+    LOG_INFO("  help              - Show this help\n");
+    LOG_INFO("  exit              - Exit\n");
+    LOG_INFO("================\n\n");
     
     while (1) {
-        printf("kvs> ");
+        LOG_INFO("kvs> ");
         fflush(stdout);
         
         if (!fgets(input, sizeof(input), stdin)) {
@@ -787,38 +787,38 @@ void* cli_thread(void* arg) {
                 char *port_str = strtok(NULL, " ");
                 if (ip && port_str) {
                     int master_port = atoi(port_str);
-                    printf("\n>>> Syncing from %s:%d...\n", ip, master_port);
+                    LOG_INFO("\n>>> Syncing from %s:%d...\n", ip, master_port);
                     fflush(stdout);
                     
                     // 执行同步
                     int ret = sync_from_master(ip, master_port);
                     if (ret == 0) {
-                        printf(">>> Sync completed successfully!\n");
+                        LOG_INFO(">>> Sync completed successfully!\n");
                     } else {
-                        printf(">>> Sync failed!\n");
+                        LOG_INFO(">>> Sync failed!\n");
                     }
                     fflush(stdout);
                 } else {
-                    printf("Usage: sync <master_ip> <port>\n");
+                    LOG_INFO("Usage: sync <master_ip> <port>\n");
                 }
             } else {
-                printf("Master node doesn't need to sync\n");
+                LOG_INFO("Master node doesn't need to sync\n");
             }
         }
         else if (strcmp(cmd, "help") == 0) {
-            printf("Commands:\n");
+            LOG_INFO("Commands:\n");
             if (!is_master) {
-                printf("  sync <ip> <port>  - Sync data from master\n");
+                LOG_INFO("  sync <ip> <port>  - Sync data from master\n");
             }
-            printf("  help              - Show this help\n");
-            printf("  exit              - Exit program\n");
+            LOG_INFO("  help              - Show this help\n");
+            LOG_INFO("  exit              - Exit program\n");
         }
         else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
-            printf("Exiting...\n");
+            LOG_INFO("Exiting...\n");
             exit(0);
         }
         else {
-            printf("Unknown command: %s. Type 'help' for available commands.\n", cmd);
+            LOG_INFO("Unknown command: %s. Type 'help' for available commands.\n", cmd);
         }
     }
     return NULL;
@@ -831,6 +831,7 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    kvs_log_init("logs/kvs.log", LOG_LEVEL_INFO);
 /*=====================加载配置========================*/
     const char *config_file = NULL;
     int i = 0;
@@ -840,7 +841,7 @@ int main(int argc, char *argv[]) {
         }
     }
     if (!config_file) {
-        printf("Usage: ./kvstore --config <config_file>\n");
+        LOG_INFO("Usage: ./kvstore --config <config_file>\n");
         return -1;
     }
     // 加载配置
@@ -880,5 +881,8 @@ int main(int argc, char *argv[]) {
     proactor_start(port, kvs_protocol);
 #endif
     dest_kvengine();
+    
+    LOG_INFO("kvstore stopped");   /* ★ 可选：退出前打一条 */
+    kvs_log_fini();                /* ★ 关闭日志，刷盘 */
     return 0;
 }

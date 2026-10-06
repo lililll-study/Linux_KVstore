@@ -9,7 +9,7 @@ kvs_array_t global_array = {0};
 int kvs_array_create(kvs_array_t *inst) {
     if (!inst) return -1;
     if (inst->table) {
-        printf("table has alloc\n");
+        LOG_INFO("table has alloc\n");
         return -1;
     }
     inst->capacity = KVS_ARRAY_INIT_SIZE;
@@ -81,7 +81,7 @@ static int kvs_array_expand(kvs_array_t *inst) {
     /* ★ 变长表统一 malloc：池块固定大小，装不下翻倍的表 */
     kvs_array_item_t *new_table = (kvs_array_item_t *)kvs_malloc(new_size);
     if (!new_table) {
-        printf("[Array] Expand failed: out of memory\n");
+        LOG_INFO("[Array] Expand failed: out of memory\n");
         return -1;
     }
 
@@ -99,7 +99,7 @@ static int kvs_array_expand(kvs_array_t *inst) {
     inst->table = new_table;
     inst->capacity = new_cap;
 
-    printf("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
+    LOG_INFO("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
     return 0;
 }
 #else
@@ -116,15 +116,15 @@ static int kvs_array_expand(kvs_array_t *inst) {
         // 内存池分配失败，降级到 malloc
         new_table = (kvs_array_item_t *)kvs_malloc(new_size);
         if (!new_table) {
-            printf("[Array] Expand failed: out of memory\n");
+            LOG_INFO("[Array] Expand failed: out of memory\n");
             return -1;
         }
-        printf("[Array] Expand: using malloc fallback\n");
+        LOG_INFO("[Array] Expand: using malloc fallback\n");
     }
 #else
     new_table = (kvs_array_item_t *)kvs_malloc(new_size);
     if (!new_table) {
-        printf("[Array] Expand failed: out of memory\n");
+        LOG_INFO("[Array] Expand failed: out of memory\n");
         return -1;
     }
 #endif
@@ -148,7 +148,7 @@ static int kvs_array_expand(kvs_array_t *inst) {
     inst->table = new_table;
     inst->capacity = new_cap;
     
-    printf("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
+    LOG_INFO("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
     return 0;
 }
 #endif

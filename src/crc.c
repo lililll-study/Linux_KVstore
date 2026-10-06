@@ -149,7 +149,7 @@ int crc_list_save(crc_list_t *list, const char *filename) {
     if (!list || !filename) return -1;
     FILE *fp = fopen(filename, "wb");
     if(!fp) {
-        printf("[CRC] fopen %s failed\n", filename);
+        LOG_ERROR("[CRC] fopen %s failed\n", filename);
         return -1;
     }
     pthread_mutex_lock(&list->lock);
