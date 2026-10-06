@@ -30,6 +30,7 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(SRC_DIR)/reactor.c \
        $(SRC_DIR)/kvs_sync.c \
 	   $(SRC_DIR)/ntyco.c \
+	   $(SRC_DIR)/log.c \
 	   $(SRC_DIR)/crc.c
 
 
@@ -49,6 +50,10 @@ AOF_FILE  = $(DATA_DIR)/data_aof.aof
 SNAP_FILE = $(DATA_DIR)/data_snap.snap
 CRC_AOF   = $(DATA_DIR)/crc_aof.dat
 CRC_SNAP  = $(DATA_DIR)/crc_snap.dat
+
+# 日志文件
+LOG_DIR  = logs
+LOG  = $(LOG_DIR)/kvs.log
 
 # 默认目标：服务端 + 所有测试端
 all: dirs $(TARGET) $(TEST_TARGETS)
@@ -89,8 +94,9 @@ clean:
 	@: > $(SNAP_FILE)     # 清空 SNAP
 	@: > $(CRC_AOF)       # 清空 CRC-AOF
 	@: > $(CRC_SNAP)      # 清空 CRC-SNAP
-	@echo "Data files cleared:"
-	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP)
+	@: > $(LOG)      	  # 清空 log
+	@echo "Data and log files cleared:"
+	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP) $(LOG)
 	@echo "Clean complete"
 
 .PHONY: all clean cleanall dirs
