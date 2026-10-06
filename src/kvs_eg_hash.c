@@ -122,7 +122,7 @@ int kvs_hash_create(kvs_hash_t *hash) {
 void kvs_hash_destory(kvs_hash_t *hash) {
 
 	if (!hash) return;
-	printf("Destroying hash table, count=%d\n", hash->count);
+	LOG_INFO("Destroying hash table, count=%d\n", hash->count);
 	int i = 0;
 	for (i = 0;i < hash->max_slots;i ++) {
 		hashnode_t *node = hash->nodes[i];
@@ -148,7 +148,7 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 
 	kvs_free(hash->nodes);
 	hash->nodes = NULL;
-	printf("Hash destroyed\n");
+	LOG_INFO("Hash destroyed\n");
 }
 
 // 5 + 2
@@ -161,7 +161,7 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	int idx = _hash(key, MAX_TABLE_SIZE);
 
 	hashnode_t *node = hash->nodes[idx];
-	// printf("alloc set hash\n");
+	// LOG_INFO("alloc set hash\n");
 #if 1
 	while (node != NULL) {
 		if (strcmp(node->key, key) == 0) { // exist
@@ -180,7 +180,7 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	hash->count ++;
     // 每 10000 条打印一次
     if (hash->count % 10000 == 0) {
-        printf("[Hash]      Progress: %d keys loaded\n", hash->count);
+        LOG_INFO("[Hash]      Progress: %d keys loaded\n", hash->count);
     }
 	return 0;
 }

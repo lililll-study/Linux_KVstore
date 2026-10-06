@@ -34,7 +34,7 @@ void server_reader(void *arg) {
                 if (data && data_len > 0) {
                     int n = send(fd, data, data_len, 0);   // ntyco hook 版 send
                     if (n <= 0) {
-                        printf("send failed: %d, %s\n", errno, strerror(errno));
+                        LOG_INFO("send failed: %d, %s\n", errno, strerror(errno));
                         close(fd);
                         cleanup_connection(fd);
                         return;
@@ -43,13 +43,13 @@ void server_reader(void *arg) {
                 }
             }
 		} else if (ret == 0) {	
-            printf("client disconnect: %d\n", fd);
+            LOG_INFO("client disconnect: %d\n", fd);
             close(fd);
             cleanup_connection(fd);
             break;
 		} else {
             /* recv 错误 */
-            printf("recv error: %d, %s\n", errno, strerror(errno));
+            LOG_INFO("recv error: %d, %s\n", errno, strerror(errno));
             close(fd);
             cleanup_connection(fd);
             break;
