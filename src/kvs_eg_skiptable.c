@@ -50,7 +50,14 @@ kvs_node_t* createNode(int level, char *key, char *value) {
     newNode->forward = (kvs_node_t**)((char*)newNode + sizeof(kvs_node_t));
 #else
     newNode->forward = (kvs_node_t**)malloc((level + 1) * sizeof(kvs_node_t*));
+    if (!newNode->forward) {                          // 加失败清理
+        if (newNode->key)   kvs_free(newNode->key);
+        if (newNode->value) kvs_free(newNode->value);
+        kvs_free(newNode);
+        return NULL;
+    }
 #endif
+    memset(newNode->forward, 0, (level + 1) * sizeof(kvs_node_t*));
     return newNode;
 }
 
@@ -258,31 +265,8 @@ int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value) {
     if (!node->value) return -2;
     strcpy(node->value, value);
 #else
-    // update表示在第i层，新节点应该插入在哪个节点之后
-    // 1. 初始化查找update和current
-    kvs_node_t *update[MAX_LEVEL + 1];
-    kvs_node_t *current = inst->header;
-
-    int i = 0;
-    // 从最高层向下寻找要插入的位置
-    // 2. 查找插入位置
-    for (i = inst->level; i>=0; i--) {
-        // 在每一层向右移动，直到找到key大于等于当前key的位置
-        while (current->forward[i] != NULL && strcmp(current->forward[i]->key, key) <0) {
-                current = current->forward[i];
-            }
-            update[i] = current;// 记录每层的前驱节点
-    }
-    // 找到位置
-    current = current->forward[0];
-
-    // 3. 更新value
-    if (current == NULL || strcmp(current->key, key) != 0) {
-        // 释放旧的value 替换为新的
-        return -1;
-    }
-    kvs_free(current->value);
-    current->value = strdup(value);
+    kvs_free(node->value);
+    node->value = strdup(value);
 #endif
     return 0;
 }
