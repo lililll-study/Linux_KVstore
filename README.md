@@ -1,4 +1,12 @@
-# 使用说明
+
+
+* * *
+
+# 基于C的仿Redis数据库实现（KV存储）
+
+* * *
+
+# 项目说明
 
 ## 编译运行
 
@@ -15,12 +23,10 @@ make
 
 # 批处理
 
-
-
 ```bash
 # 全部 QPS 测试（推荐）
 
-./build/1_RESP_testcase 127.0.0.1 2000 5
+./build/1_RESP_testcase 27.0.0.1 2000 5
 
 # 或者单独跑
 ./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
@@ -30,20 +36,13 @@ make
 ./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
 
 ./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
-
-
-错误格式检测
-./build/1_RESP_testcase 127.0.0.1 2000 10（存在bug）
-批量发送10w条set，最后一条99999号，会无法写入内存
 ```
-
-
 
 
 
 # 持久化
 
-## 1 增量持久化
+## 1、增量持久化
 
 配置文件master.conf
 
@@ -70,7 +69,7 @@ aof.enable=true
 
 
 
-## 2 全量持久化
+## 2、全量持久化
 
 配置文件master.conf
 
@@ -100,8 +99,6 @@ aof.enable=false
 
 
 # 主从同步
-
-
 
 ```bash
 # 1. 启动主机
@@ -154,20 +151,19 @@ aof.enable=false
 
 ```bash
 # ===== 步骤 1：无内存池 =====
-sed -i 's/#define ENABLE_MEMPOOL.*/#define ENABLE_MEMPOOL 0/' include/kvstore.h
-make clean && make
+make clean 
+make
 ./test/mem_test.sh nopool
 
 # ===== 步骤 2：有内存池 =====
-sed -i 's/#define ENABLE_MEMPOOL.*/#define ENABLE_MEMPOOL 1/' include/kvstore.h
-make clean && make
+make clean 
+make
 ./test/mem_test.sh pool
 
 # ===== 步骤 3：jemalloc =====
-# 为了对比干净，jemalloc 应该测"无池 + jemalloc"
-# 即：先编无池版，再 LD_PRELOAD jemalloc
-sed -i 's/#define ENABLE_MEMPOOL.*/#define ENABLE_MEMPOOL 0/' include/kvstore.h
-make clean && make
+# 需要关闭内存池
+make clean
+make
 ./test/mem_test.sh jemalloc
 ```
 
@@ -175,63 +171,33 @@ make clean && make
 
 # 性能测试
 
+## 1、主从同步性能测试
 
+| 操作            | 引擎        | 不开同步 QPS | 开同步 QPS | 变化     |
+| ------------- | --------- | -------- | ------- | ------ |
+| **批量 SET 5w** | Array     | 6514     | 6500    | ~0%    |
+|               | Rbtree    | 158730   | 182481  | +15.0% |
+|               | Hash      | 81168    | 58343   | -28.1% |
+|               | Skiptable | 83752    | 58685   | -29.9% |
+| **批量 GET 5w** | Array     | 8522     | 8976    | +5.3%  |
+|               | Rbtree    | 194552   | 197628  | +1.6%  |
+|               | Hash      | 88967    | 88809   | ~0%    |
+|               | Skiptable | 108225   | 115207  | +6.4%  |
 
-## 1、CRC性能测试
+ 
 
-不开主从同步，单机批量插入和批量查询：
+## 2、CRC性能测试
 
-```bash
-lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 3
-===== 批量 SET 5w =====
-[Batch  SET] Array      50000: 7675 ms, qps=6514
-[Batch  SET] Rbtree     50000: 315 ms, qps=158730
-[Batch  SET] Hash       50000: 616 ms, qps=81168
-[Batch  SET] Skiptable  50000: 597 ms, qps=83752
-lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 4
-===== 批量 GET 5w =====
-[Batch  GET] Array      50000: 5867 ms, qps=8522
-[Batch  GET] Rbtree     50000: 257 ms, qps=194552
-[Batch  GET] Hash       50000: 562 ms, qps=88967
-[Batch  GET] Skiptable  50000: 462 ms, qps=108225
-
-```
-
-
-
-开启主从同步（定时aof同步），批量插入和查询：
-
-```bash
-
-lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 3
-===== 批量 SET 5w =====
-[Batch  SET] Array      50000: 7692 ms, qps=6500
-[Batch  SET] Rbtree     50000: 274 ms, qps=182481
-[Batch  SET] Hash       50000: 857 ms, qps=58343
-[Batch  SET] Skiptable  50000: 852 ms, qps=58685
-lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 4
-===== 批量 GET 5w =====
-[Batch  GET] Array      50000: 5570 ms, qps=8976
-[Batch  GET] Rbtree     50000: 253 ms, qps=197628
-[Batch  GET] Hash       50000: 563 ms, qps=88809
-[Batch  GET] Skiptable  50000: 434 ms, qps=115207
-```
-
-性能几乎不损失
-二、开CRC对比数据
-
-------
-
-| 引擎            | 开 CRC（上次） | 关 CRC（本次）  | 差值      | 倍数        |
-| ------------- | --------- | ---------- | ------- | --------- |
-| **Array**     | 6045      | **6454**   | +409    | 1.07×     |
-| **Rbtree**    | 49067     | **149700** | +100633 | **3.05×** |
-| **Hash**      | 24764     | **108225** | +83461  | **4.37×** |
-| **Skiptable** | 23245     | **66050**  | +42805  | **2.84×** |
+| 引擎            | 开 CRC | 关 CRC      | 差值      | 倍数        |
+| ------------- | ----- | ---------- | ------- | --------- |
+| **Array**     | 6045  | **6454**   | +409    | 1.07×     |
+| **Rbtree**    | 49067 | **149700** | +100633 | **3.05×** |
+| **Hash**      | 24764 | **108225** | +83461  | **4.37×** |
+| **Skiptable** | 23245 | **66050**  | +42805  | **2.84×** |
 
 
 
-## 2、内存池性能测试
+## 3、内存池性能测试
 
 | VM/RSS (MB) | 无内存池        | 有内存池        | jemalloc       |
 | ----------- | ----------- | ----------- | -------------- |
@@ -239,8 +205,6 @@ lhy@lhy:~/share/kvs_lhy$ ./build/1_RESP_testcase 127.0.0.1 2000 4
 | 峰值状态        | 62.5 / 45.1 | 80.6 / 62.9 | 71.6 / 33.8    |
 | 结束状态        | 62.5 / 45.1 | 80.6 / 62.9 | 71.6 / 7.1     |
 | 对比          | RSS复用       | RSS复用       | **RSS归还 -79%** |
-
-
 
 | 方案       | 插入QPS | 删除QPS |
 | -------- | ----- | ----- |
