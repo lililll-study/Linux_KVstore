@@ -263,10 +263,8 @@ rbtree_node *rbtree_delete(rbtree *T, rbtree_node *z) {
 	} else if (y->right != T->nil) {
 		x = y->right;
 	}
-//  只有 x 不是 T->nil 时才设置 parent
-    if (x != T->nil) {
-        x->parent = y->parent;
-    }
+//  CLRS: 无条件设置，x == T->nil 时 fixup 仍需通过 x->parent 遍历
+	x->parent = y->parent;
 	
 	if (y->parent == T->nil) {
 		T->root = x;
@@ -444,6 +442,11 @@ int kvs_rbtree_create(kvs_rbtree_t *inst) {
 #endif
 	if (!inst->nil) return -1;
 	inst->nil->color = BLACK;
+	inst->nil->left = inst->nil;
+	inst->nil->right = inst->nil;
+	inst->nil->parent = inst->nil;
+	inst->nil->key = NULL;
+	inst->nil->value = NULL;
 	inst->root = inst->nil;
 
 	return 0;
