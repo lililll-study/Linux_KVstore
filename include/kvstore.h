@@ -38,8 +38,7 @@
 #define ENABLE_SKIPTABLE	 1
 
 #define ENABLE_PERSIST 		 1	 // 开启本地持久化存储
-#define ENABLE_MEMPOOL		 1   // 开启内存池
-#define ENABLE_LEVEL_MEMPOOL 1   // 开启cmd批处理
+#define ENABLE_MEMPOOL		 0   // 开启内存池
 
 #define ENABLE_CMD_BATCH	 1   // 开启cmd批处理
 
@@ -277,19 +276,38 @@ int replay_aof(const char *filename);
 */
 #if ENABLE_MEMPOOL
 
-#define KVS_POOL_NODE_COUNT     200000
-#define KVS_POOL_STRING_COUNT   400000
+#define KVS_POOL_NODE_COUNT     500000      // 每个引擎的节点池：容量上限50万块
 #define RESP_POOL_BLOCK_SIZE    4096
-#define RESP_POOL_BLOCK_COUNT   1024
+#define RESP_POOL_BLOCK_COUNT   1024        // 响应池：1024块 × 4KB
 
-// 内存池结构
+// 字符串池 size-class 配置（块大小从小到大，容量递减）
+// 字符串池按大小分 4 类：
+#define KVS_STRING_CLASSES  4
+#define KVS_STRING_CLASS_SIZES {32, 64, 128, 256}
+#define KVS_STRING_CLASS_COUNTS {1000000, 200000, 50000, 10000}
+
+// 块头：仅 8 字节，用户数据紧随其后；归属由 free 时的段范围+对齐校验推出，不占块内空间
+typedef struct mempool_block_hdr {
+    void *next;                 // 空闲时：下一个空闲块；分配后 bit0=1 作 in-use 标记
+} mempool_block_hdr_t;
+
+#define KVS_MEMPOOL_INUSE   ((uintptr_t)1)  // next 低位 in-use 标记（块地址 8 字节对齐，低位恒为 0）
+#define KVS_MEMPOOL_HDR     sizeof(mempool_block_hdr_t) // 8 字节
+
+
+// 池按照chunk增长，每段是一块连续内存，段之间用链表连接；首次分配小批量，不够再翻倍。
+typedef struct mempool_chunk_s {
+    struct mempool_chunk_s *next;
+    size_t blocks;              // 本段块数，块数据紧随其后
+} mempool_chunk_t;
+
+// 内存池结构（sub_pools 非空时为 size-class 组池外壳，子池数组以 NULL 结尾）
 typedef struct mempool_s{
-    size_t block_size;       // 每个内存块的总大小
-    size_t total_blocks;    // 内存池总块数
-    size_t free_blocks;     // 当前空闲块数量
+    size_t block_size;      // 每块总大小（含块头，8字节对齐）
+    size_t max_blocks;      // 容量上限
     void* free_list;        // 空闲链表头指针
-    char data[];        // 柔性数组
-// data[] 不占结构体空间，但可以通过 pool->data 访问结构体后面的内存：
+    mempool_chunk_t *chunks;    // 已分配段链表（最新段在前，段头记录各段块数）
+    struct mempool_s **sub_pools;      // 组池子池数组，NULL 结尾；普通池为 NULL
 } mempool_t;
 
 extern mempool_t *resp_pool;
@@ -304,10 +322,11 @@ extern mempool_t *hash_string_pool;
 extern mempool_t *skiptable_node_pool;
 extern mempool_t *skiptable_string_pool;
 
-#define SMALL_STRING_THRESHOLD 128  // 小字符串阈值
 
-// 指定块大小和块数量 
-mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks);
+// 指定块大小和块数量（num_blocks 为容量上限，首批小批量、按需翻倍增长）
+mempool_t* kvs_mempool_create(size_t user_block_size, size_t max_blocks);
+// 创建 size-class 组池：alloc 按 size 路由到最小可容纳的子池
+mempool_t* kvs_mempool_create_group(const size_t *sizes, const size_t *counts, int nclasses);
 void* kvs_mempool_alloc(mempool_t *pool, size_t size);
 void kvs_mempool_free(mempool_t *pool, void *ptr);
 void kvs_mempool_reset(mempool_t *pool);
