@@ -19,136 +19,238 @@ mempool_t *resp_pool = NULL;
  mempool_t *skiptable_node_pool = NULL; // 跳表节点池
  mempool_t *skiptable_string_pool = NULL; // 跳表字符串池
 
-// 指定块大小和块数量 
-mempool_t* kvs_mempool_create(size_t user_block_size, size_t num_blocks) {
-    if (user_block_size == 0 || num_blocks == 0) {
+// 字符串池 size-class 配置
+static const size_t g_string_sizes[]  = KVS_STRING_CLASS_SIZES;
+static const size_t g_string_counts[] = KVS_STRING_CLASS_COUNTS;
+
+// 首批批量：上限的 1/64，小池直接全量，降低启动预付
+static size_t _initial_blocks(size_t max_blocks) {
+    size_t n = max_blocks / 64;
+    if (n < 16) n = max_blocks;
+    if (n > max_blocks) n = max_blocks;
+    return n;
+}
+
+// 把一段 chunk 的所有块串入空闲链
+static void _link_chunk(mempool_t *pool, mempool_chunk_t *chunk) {
+    char *base = (char*)(chunk + 1);
+    size_t i;
+    for (i = 0; i < chunk->blocks; i++) {
+        mempool_block_hdr_t *hdr = (mempool_block_hdr_t*)(base + i * pool->block_size);
+        hdr->next = pool->free_list;
+        pool->free_list = hdr;
+    }
+}
+
+// 扩容：批量翻倍，直到容量上限
+static int _mempool_grow(mempool_t *pool) {
+    // 已分配总量（扩容翻倍时段数只有几段，遍历代价可忽略）
+    size_t total = 0;
+    mempool_chunk_t *c;
+    for (c = pool->chunks; c; c = c->next) total += c->blocks;
+    if (total >= pool->max_blocks) return -1;
+
+    // 批量 = 最近一段的 +25%（过预留率上限 25%，远低于翻倍策略的 100%）
+    size_t batch = pool->chunks ? pool->chunks->blocks + pool->chunks->blocks / 4 : _initial_blocks(pool->max_blocks);
+    if (batch < 16) batch = 16;             // 小池起步阶段保证有效增长
+    if (batch > pool->max_blocks - total)  batch = pool->max_blocks - total;
+
+    mempool_chunk_t *chunk = (mempool_chunk_t*)malloc(
+        sizeof(mempool_chunk_t) + batch * pool->block_size);
+    if (!chunk) return -1;
+    chunk->blocks = batch;
+    chunk->next = pool->chunks;
+    pool->chunks = chunk;
+    _link_chunk(pool, chunk);
+    return 0;
+}
+
+// 指定块大小和块数量（max_blocks 为容量上限，首批小批量、按需翻倍增长）
+mempool_t* kvs_mempool_create(size_t user_block_size, size_t max_blocks) {
+    if (user_block_size == 0 || max_blocks == 0) {
         return NULL;
     }
+    // 块大小 = 块头 + 用户空间，8 字节对齐
+    size_t block_size = (user_block_size + KVS_MEMPOOL_HDR + 7) & ~(size_t)7;
 
-    // 每个块至少要能容纳一个指针
-    // 块在空闲的时候，前8字节存下一个块的地址
-    // 块被分配后，前8字节用户看到不，只能感知到实际使用空间
-    size_t actual_block_size = user_block_size + sizeof(void *); // 块大小
-    // 关键修复：对齐到 8 字节边界（或指针大小）
-    // 这样确保每个块起始地址对齐，避免内存访问问题
-    size_t alignment = sizeof(void *);
-    actual_block_size = (actual_block_size + alignment - 1) & ~(alignment - 1);
-    size_t pool_size = sizeof(mempool_t) + actual_block_size * num_blocks; // 池大小
-
-    // 分配内存池结构体及内存块空间
-    mempool_t* pool = (mempool_t*)malloc(pool_size);
+    mempool_t* pool = (mempool_t*)malloc(sizeof(mempool_t));
     if (!pool) return NULL;
 
-    // 初始化内存池
-    pool->block_size = actual_block_size;
-    pool->total_blocks = num_blocks;
-    pool->free_blocks = num_blocks;
+    pool->block_size = block_size;
+    pool->max_blocks = max_blocks;
     pool->free_list = NULL;
 
-    // 初始化空闲链表
-    size_t i = 0;
-    for (i=0; i<num_blocks; ++i) {
-        // block 是一个指针，指向某个块的起始地址
-        void* block = pool->data + i * actual_block_size; 
-        // 得到块起始地址处存储的内容 ,这一段就是把pool->free_list的值（开始为null）写入块起始地址
-        *((void**)block) = pool->free_list; // 此时block0存储null
-        pool->free_list = block;    // free_list = block0
+    pool->chunks = NULL;
+    pool->sub_pools = NULL;
+
+    if (_mempool_grow(pool) != 0) {   // 首批段
+        free(pool);
+        return NULL;
     }
-    // printf("  mempool created: block_size=%zu, total_blocks=%zu\n",  actual_block_size, num_blocks);
     return pool;
 }
+
+// 创建 size-class 组池外壳：alloc 按 size 路由到最小可容纳的子池
+mempool_t* kvs_mempool_create_group(const size_t *sizes, const size_t *counts, int nclasses) {
+    if (!sizes || !counts || nclasses <= 0) return NULL;
+
+    mempool_t *pool = (mempool_t*)calloc(1, sizeof(mempool_t));
+    if (!pool) return NULL;
+
+    pool->sub_pools = (mempool_t**)calloc(nclasses + 1, sizeof(mempool_t*));
+    if (!pool->sub_pools) {
+        free(pool);
+        return NULL;
+    }
+
+
+    int i;
+    for (i = 0; i < nclasses; i++) {
+        pool->sub_pools[i] = kvs_mempool_create(sizes[i], counts[i]);
+        if (!pool->sub_pools[i]) goto fail;
+    }
+
+    return pool;
+
+fail:
+    {
+        int j;
+        for (j = 0; j < nclasses; j++) {
+            if (pool->sub_pools[j]) kvs_mempool_destroy(pool->sub_pools[j]);
+        }
+    }
+    free(pool->sub_pools);
+    free(pool);
+    return NULL;
+}
+
+// 从单个池分配（内部）
+static void* _pool_alloc(mempool_t *pool, size_t size) {
+    size_t user_capacity = pool->block_size - KVS_MEMPOOL_HDR;
+    if (size > user_capacity) {
+        return kvs_malloc(size);    // 超过块容量，溢出降级
+    }
+
+    if (!pool->free_list && _mempool_grow(pool) != 0) {
+        return kvs_malloc(size);    // 达到容量上限，溢出降级
+    }
+
+    mempool_block_hdr_t *hdr = (mempool_block_hdr_t*)pool->free_list;
+    pool->free_list = hdr->next;
+    hdr->next = (void*)((uintptr_t)hdr->next | KVS_MEMPOOL_INUSE);  // 置 in-use 标记
+    return (char*)hdr + KVS_MEMPOOL_HDR;
+}
+
 // 分配块
 void* kvs_mempool_alloc(mempool_t *pool, size_t size) {
-    if (!pool || !pool->free_list || pool->free_blocks == 0) {
-        return NULL;
-    }
-#if ENABLE_LEVEL_MEMPOOL
+    if (!pool) return kvs_malloc(size);
 
-    // 计算用户可用空间（块大小 - 指针头）
-    size_t user_capacity = pool->block_size - sizeof(void *);
-    
-    // 如果请求大小超过块容量，直接用 malloc
-    if (size > user_capacity) {
-        // printf("  WARN: size %zu > block capacity %zu, using malloc\n", size, user_capacity);
-        return kvs_malloc(size);
+    if (pool->sub_pools) {              // size-class 组池：按大小路由
+        int i;
+        mempool_t *sub = NULL;
+        for (i = 0; pool->sub_pools[i]; i++) {
+            if (size <= pool->sub_pools[i]->block_size - KVS_MEMPOOL_HDR) {
+                sub = pool->sub_pools[i];
+                break;
+            }
+        }
+        if (!sub) return kvs_malloc(size);  // 超过最大 class，溢出降级
+        pool = sub;
     }
-#endif
-    void* block = pool->free_list;
-    pool->free_list = *((void**)block);
-    // 检查请求大小
-    if (size > pool->block_size - sizeof(void*)) {
-        // printf("  ERROR: size %zu > block capacity %zu\n",  size, pool->block_size - sizeof(void*));
-        return NULL;
-    }
-    pool->free_blocks--;
-
-    // 返回用户可用的内存起始地址
-    void* user_ptr = (char*)block + sizeof(void*);
-    // printf("  alloc success: user_ptr=%p\n", user_ptr);
-    
-    return user_ptr;
+    return _pool_alloc(pool, size);
 }
-// 释放块
+// 在 pool 的段链中定位 hdr 所在段（含块对齐校验）；不在则返回 NULL
+static mempool_chunk_t* _chunk_of(mempool_t *pool, mempool_block_hdr_t *hdr) {
+    mempool_chunk_t *c;
+    for (c = pool->chunks; c; c = c->next) {
+        char *base = (char*)(c + 1);
+        char *end = base + c->blocks * pool->block_size;
+        if ((char*)hdr >= base && (char*)hdr < end
+            && ((char*)hdr - base) % pool->block_size == 0)
+            return c;
+    }
+    return NULL;
+}
+
+// 释放块：段范围+对齐校验归属；malloc 降级块走 kvs_free；bit0 检测 double-free
 void kvs_mempool_free(mempool_t *pool, void *ptr) {
-    if (!pool || !ptr) {
+    if (!ptr) return;
+    mempool_block_hdr_t *hdr = (mempool_block_hdr_t*)((char*)ptr - KVS_MEMPOOL_HDR);
+
+    mempool_t *owner = NULL;
+    if (pool) {
+        if (pool->sub_pools) {              // 组池：在各子池中定位归属
+            int i;
+            for (i = 0; pool->sub_pools[i] && !owner; i++) {
+                if (_chunk_of(pool->sub_pools[i], hdr)) owner = pool->sub_pools[i];
+            }
+        } else if (_chunk_of(pool, hdr)) {
+            owner = pool;
+        }
+    }
+    if (!owner) {                           // 非池块：malloc 降级块        
+        kvs_free(ptr);
         return;
     }
 
-#if ENABLE_LEVEL_MEMPOOL
-    // 检查指针是否在内存池范围内
-    void* block_start = (void*)pool->data;
-    void* block_end = (void*)(pool->data + pool->total_blocks * pool->block_size);
-    void* block = (char*)ptr - sizeof(void*);
-    // 如果指针在池范围内，用池释放
-    if (block >= block_start && block < block_end) {
-        size_t offset = (char*)block - (char*)block_start;
-        if (offset % pool->block_size == 0) {
-            *((void**)block) = pool->free_list;
-            pool->free_list = block;
-            pool->free_blocks++;
-            return;
-        }
+    if (!((uintptr_t)hdr->next & KVS_MEMPOOL_INUSE)) {   // double-free 检测
+        LOG_INFO("mempool: double-free detected ptr=%p\n", ptr);
+        return;
     }
-    // 否则用 free（来自 malloc）
-    kvs_free(ptr);
-#else
-    // 回退8字节，得到要释放块的起始地址
-    void* block = (char*)ptr - sizeof(void*);
 
-    // 在待释放块的头写入当前链表头（第一个空闲块）
-    *((void**)block) = pool->free_list;
-    // 更新free_list头，指向新插入的块
-    pool->free_list = block;
-    pool->free_blocks++;
-#endif
+    hdr->next = owner->free_list;
+    owner->free_list = hdr;
 }
-// 重置块
+
+// 重置池：组池递归重置各子池
 void kvs_mempool_reset(mempool_t *pool) {
     if (!pool) {
         return;
     }
 
-    // 重新构建空闲链表
-    pool->free_blocks = pool->total_blocks;
+    if (pool->sub_pools) {
+        int i;
+        for (i = 0; pool->sub_pools[i]; i++) {
+            kvs_mempool_reset(pool->sub_pools[i]);
+        }
+        return;
+    }
+
+    // 重新串联所有已分配段的块
     pool->free_list = NULL;
-    size_t i = 0;
-    for (i = 0; i < pool->total_blocks; ++i) {
-        void* block = pool->data + i * pool->block_size;
-        *((void**)block) = pool->free_list;
-        pool->free_list = block;
+    mempool_chunk_t *c;
+    for (c = pool->chunks; c; c = c->next) {
+        _link_chunk(pool, c);
     }
 }
-// 销毁内存池
+
+// 销毁内存池：释放所有段与结构体，组池递归销毁子池
 void kvs_mempool_destroy(mempool_t *pool) {
-    if (pool) {
+    if (!pool) return;
+
+    if (pool->sub_pools) {
+        int i;
+        for (i = 0; pool->sub_pools[i]; i++) {
+            kvs_mempool_destroy(pool->sub_pools[i]);
+        }
+        free(pool->sub_pools);
         free(pool);
+        return;
     }
+
+    mempool_chunk_t *c = pool->chunks;
+    while (c) {
+        mempool_chunk_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    free(pool);
 }
 
 int init_mempools(void) {
     // 数组：1024个item，2048个字符串（key+value）
     array_item_pool = kvs_mempool_create(sizeof(kvs_array_item_t), KVS_POOL_NODE_COUNT);
-    array_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
+    array_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
     if (!array_item_pool || !array_string_pool){
         // printf("Failed to create array_item_pool\n");
         return -1;
@@ -156,7 +258,7 @@ int init_mempools(void) {
     
     // 红黑树：1024个节点，2048个字符串
     rbtree_node_pool = kvs_mempool_create(sizeof(rbtree_node), KVS_POOL_NODE_COUNT);
-    rbtree_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
+    rbtree_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
     if (!rbtree_node_pool || !rbtree_string_pool){
         // printf("Failed to create rbtree_node_pool\n");
         return -1;
@@ -164,7 +266,7 @@ int init_mempools(void) {
     
     // 哈希：1024个节点，2048个字符串
     hash_node_pool = kvs_mempool_create(sizeof(hashnode_t), KVS_POOL_NODE_COUNT);
-    hash_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
+    hash_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
     if (!hash_node_pool || !hash_string_pool){
         // printf("Failed to create hash_node_pool\n");
         return -1;
@@ -175,7 +277,7 @@ int init_mempools(void) {
         sizeof(kvs_node_t) + (MAX_LEVEL + 1) * sizeof(kvs_node_t*),
         KVS_POOL_NODE_COUNT
     );
-    skiptable_string_pool = kvs_mempool_create(256, KVS_POOL_STRING_COUNT);
+    skiptable_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
     if (!skiptable_node_pool || !skiptable_string_pool){
         // printf("Failed to create skiptable_node_pool\n");
         return -1;
