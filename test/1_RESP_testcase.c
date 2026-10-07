@@ -449,6 +449,77 @@ void verify_single_key(int connfd, const char *key) {
         printf("[Verify] ==> key MISSING in memory engine\n");
 }
 
+/* ============================================================
+ * Part 3：内存测试（4 引擎 × 10w = 40w）
+ * ============================================================ */
+#define PER_ENGINE_100K   100000
+
+static const char *engine_del_cmd[4] = { "DEL", "RDEL", "HDEL", "SDEL" };
+
+/* 插 40w：4 引擎 × 10w */
+static void insert_400k(int connfd) {
+    int total = PER_ENGINE_100K * 4;
+    int cap = total * 80;
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    if (!batch || !resp) { free(batch); free(resp); return; }
+
+    int blen = 0, e, i;
+    for (e = 0; e < 4; e++) {
+        for (i = 0; i < PER_ENGINE_100K; i++) {
+            char key[64], value[64];
+            snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
+            snprintf(value, sizeof(value), "val_%06d", i);
+            blen = append_resp_cmd(batch, blen, engine_set_cmd[e], key, value);
+        }
+        printf("[Insert] %-10s done (%d)\n", engine_name[e], PER_ENGINE_100K);
+        fflush(stdout);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+    int got = send_and_recv(connfd, batch, blen, resp, cap, total);
+    gettimeofday(&tv_cur, NULL);
+    int ms = TIME_SUB_MS(tv_cur, tv_begin);
+
+    printf("[Insert 400k] total=%d resp=%d bytes, time=%d ms, qps=%d\n",
+           total, got, ms, total * 1000 / (ms ? ms : 1));
+
+    free(batch);
+    free(resp);
+}
+
+/* 删 40w：4 引擎 × 10w，key 和插入时一致 */
+static void delete_400k(int connfd) {
+    int total = PER_ENGINE_100K * 4;
+    int cap = total * 80;
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    if (!batch || !resp) { free(batch); free(resp); return; }
+
+    int blen = 0, e, i;
+    for (e = 0; e < 4; e++) {
+        for (i = 0; i < PER_ENGINE_100K; i++) {
+            char key[64];
+            snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
+            blen = append_resp_cmd(batch, blen, engine_del_cmd[e], key, NULL);
+        }
+        printf("[Delete] %-10s done (%d)\n", engine_name[e], PER_ENGINE_100K);
+        fflush(stdout);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+    int got = send_and_recv(connfd, batch, blen, resp, cap, total);
+    gettimeofday(&tv_cur, NULL);
+    int ms = TIME_SUB_MS(tv_cur, tv_begin);
+
+    printf("[Delete 400k] total=%d resp=%d bytes, time=%d ms, qps=%d\n",
+           total, got, ms, total * 1000 / (ms ? ms : 1));
+
+    free(batch);
+    free(resp);
+}
 
 /* ============================================================
  * main
@@ -464,6 +535,9 @@ int main(int argc, char *argv[]) {
         printf("  mode 5: 全部 QPS 测试（1+2+3+4）\n");
         printf("  ===== Part 2: 错误格式测试 =====\n");
         printf("  mode 10: 全部 4 阶段\n");
+        printf("  ===== Part 3: 内存测试 =====\n");
+        printf("  mode 6: 插 40w（4 引擎 × 10w）\n");
+        printf("  mode 7: 删 40w（4 引擎 × 10w）\n");
         return -1;
     }
 
@@ -517,7 +591,15 @@ int main(int argc, char *argv[]) {
 
         printf("\n===== QPS 测试完成 =====\n");
         break;
+    case 6:
+        printf("===== mode 6: 插 40w (4 引擎 × 10w) =====\n");
+        insert_400k(connfd);
+        break;
 
+    case 7:
+        printf("===== mode 7: 删 40w (4 引擎 × 10w) =====\n");
+        delete_400k(connfd);
+        break;
     case 10:
         printf("===== Part 2: 错误格式测试（Skiptable） =====\n\n");
 
