@@ -9,8 +9,9 @@ extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
 extern kvs_skiptable_t global_skiptable;
 
+#if ENABLE_MEMPOOL
 extern mempool_t *resp_pool;
-
+#endif
 
 #if ENABLE_SYNC
 int g_is_master = 1;  // 1: 主节点, 0: 从节点
@@ -128,18 +129,32 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     kvs_conn_ctx_t *ctx = NULL;
     char *single_resp = NULL;
     int resp_cap = 0;
+
     if (!is_aof_sync) {
-#if ENABLE_REPBUF && ENABLE_MEMPOOL
-        // 获取连接上下文
+#if ENABLE_REPBUF
+        /* ===== REPBUF=1：响应先进缓冲区 ===== */
         ctx = &kvs_conn_ctxs[fd];
-        // 从内存池分配响应缓冲区
+#  if ENABLE_MEMPOOL
+        /* 池模式：从 resp_pool 拿 */
         single_resp = (char*)kvs_mempool_alloc(resp_pool, RESP_POOL_BLOCK_SIZE);
         resp_cap = RESP_POOL_BLOCK_SIZE;
+        if (!single_resp) {
+            /* 池耗尽降级 malloc */
+            single_resp = (char*)kvs_malloc(RESP_POOL_BLOCK_SIZE);
+            resp_cap = RESP_POOL_BLOCK_SIZE;
+        }
+#  else
+        /* 非池模式：自己 malloc */
+        resp_cap = BUFFER_LENGTH;
+        single_resp = (char*)kvs_malloc(resp_cap);
+#  endif
+        if (!single_resp) return -1;
 #else
+        /* ===== REPBUF=0：直接用调用方 response ===== */
         single_resp = response;
+        resp_cap = BUFFER_LENGTH;
+        if (!single_resp) return -1;
 #endif
-
-
     }
 
 
@@ -160,9 +175,15 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             resp_buf_append(ctx, err, err_len);
             ctx->send_pending = 1;
         }
+#if ENABLE_MEMPOOL
         if (single_resp && !is_aof_sync) {
             kvs_mempool_free(resp_pool, single_resp);
         }
+#else
+        if (single_resp && single_resp != response && !is_aof_sync) {
+            kvs_free(single_resp);
+        }
+#endif
 
         return -1;
     }
@@ -176,6 +197,11 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     if (count > 1) key = tokens[1];
     if (count > 2) value = tokens[2];
 
+#if ENABLE_MEMPOOL
+    #define FREE_RESP(p)   kvs_mempool_free(resp_pool, (p))
+#else
+    #define FREE_RESP(p)   kvs_free(p)
+#endif
 
      // 安全的追加宏 - 修复了 new_size 的问题
     #define SAFE_APPEND(fmt, ...) do { \
@@ -184,11 +210,11 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             if (len + need >= resp_cap) { \
                 int new_cap = resp_cap > 0 ? resp_cap : BUFFER_LENGTH; \
                 while (new_cap < len + need + 1024) new_cap *= 2; \
-                char *new_buf = (char*)kvs_mempool_alloc(resp_pool, new_cap); \
-                if (!new_buf) new_buf = (char*)kvs_malloc(new_cap); \
+                char *new_buf = (char*)kvs_malloc(new_cap); \
                 if (!new_buf) break; \
                 if (single_resp && len > 0) memcpy(new_buf, single_resp, len); \
-                if (single_resp) kvs_mempool_free(resp_pool, single_resp); \
+                /* 释放旧缓冲 */ \
+                if (single_resp && single_resp != response) FREE_RESP(single_resp); \
                 single_resp = new_buf; \
                 resp_cap = new_cap; \
             } \
@@ -516,31 +542,41 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 resp_buf_append(ctx, err, strlen(err));
                 ctx->send_pending = 1;
             }
-             if (single_resp && !is_aof_sync) {
-                kvs_mempool_free(resp_pool, single_resp);
-            }
+            #if ENABLE_MEMPOOL
+                if (single_resp && !is_aof_sync) {
+                    kvs_mempool_free(resp_pool, single_resp);
+                }
+            #else
+                if (single_resp && single_resp != response && !is_aof_sync) {
+                    kvs_free(single_resp);
+                }
+            #endif
 
             return -1;
     }
 
 
 
-    // printf("debug 0: 解析完成\n");
 #if ENABLE_REPBUF
-    // ===== 追加到响应缓冲区 =====
-    if (len > 0 && ctx != NULL ) {
-        // printf("debug 1: get cmd done\n");
+    if (len > 0 && ctx != NULL) {
         resp_buf_append(ctx, single_resp, len);
-        ctx->send_pending = 1;  // 标记有待发送数据
-        // printf("debug 2: 追加数据成功，发送标志位置位成功\n");
-    }
-    // 释放内存池分配的缓冲区
-    if (single_resp) {
-        kvs_mempool_free(resp_pool, single_resp);
+        ctx->send_pending = 1;
     }
 #endif
+
+#if ENABLE_MEMPOOL
+    if (single_resp && single_resp != response && !is_aof_sync) {
+        kvs_mempool_free(resp_pool, single_resp);
+    }
+#else
+    if (single_resp && single_resp != response && !is_aof_sync) {
+        FREE_RESP(single_resp);
+    }
+#endif
+
     return len;
-    #undef SAFE_APPEND
+#undef SAFE_APPEND
+#undef FREE_RESP
 }
 
 int kvs_protocol(int fd, char *msg, int length, char *response) {
@@ -677,7 +713,7 @@ LOG_INFO("------------ 2. kvs_engine created ----\n");
 #if ENABLE_CRC
             /* ★ 主机启动：加载 SNAP 后强制重建 SNAP CRC，保证一致 */
             crc_rebuild_snap_list();
-            SYNC_LOG("[CRC] master SNAP crc rebuilt: %d entries",
+            SYNC_LOG("[CRC] master SNAP rebuilt crc: %d",
                     g_crc_list_snap.count);
 #endif
             LOG_INFO("------------ 3. Snapshots loaded ---\n");
@@ -692,7 +728,7 @@ LOG_INFO("------------ 2. kvs_engine created ----\n");
             long consumed = replay_aof_from_with_crc(AOF_FILE, 0, &g_crc_list_aof);
             if (consumed > 0) {
                 crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-                SYNC_LOG("[CRC] master AOF replay rebuilt crc=%d",
+                SYNC_LOG("[CRC] master AOF rebuilt crc: %d",
                         g_crc_list_aof.count);
             }
 #else
