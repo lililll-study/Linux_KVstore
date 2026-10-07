@@ -1029,3 +1029,389 @@ stat获取文件信息后，发送文件名和大小
 
 
 批处理中针对cmd_buf和resp_buf是动态扩容的：kvs_ctx_expand
+
+
+
+
+
+* * *
+
+# 基于C的仿Redis数据库实现（KV存储）
+
+* * *
+
+* 源码仓库见：
+
+* 视频讲解：
+
+* * *
+
+# 项目说明
+
+* * *
+
+# 1 RESP协议设计
+
+* * *
+
+        为了支持任意字符的key和value，需要设计一个高可靠的数据解析协议。因此本项目仿照redis的RESP协议设计方案。
+
+Redis 用 5 种类型前缀区分消息--CRLF 边界：
+
+| 前缀  | 类型    | 示例                                                |
+| --- | ----- | ------------------------------------------------- |
+| `+` | 简单字符串 | `+OK\r\n`                                         |
+| `-` | 错误    | `-ERR unknown command\r\n`                        |
+| `:` | 整数    | `:10\r\n`                                         |
+| `$` | 批量字符串 | `$5\r\nhello\r\n`                                 |
+| `*` | 数组    | `*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n` |
+
+客户端请求统一用 **Inline Command**（`SET key value\r\n`）格式。
+
+* * *
+
+        代码实现上，由于之前采用strtok根据空格分割SET KEY VALUE，因此需要改造为resp parse() 协议解析器。整体实现流程如下：
+    recv_cb接收数据
+
+    kvs_Ctx_append(cmd_buffer)把数据存入缓冲区
+
+    kvs_ctx_process()
+    循环处理cmd_buffer中的数据，只要cmd_buffer_len不为0，就交给resp_parse解析
+
+    resp_parse()
+    从cmd_buf中拿出数据，执行下面解析步骤：
+    1. 命令都以*2\r\n格式开头，数字表示本次传入的cmd数量
+    2. 然后开始解析第一个元素，以*3\r\n格式开头，代表第一个元素cmd的token个数
+    3. 然后解析每个元素，以$3\r\n开头，\r\n结尾，内容长度由开头数字表示
+    4. 每解析完一个元素，即count>0, 就调用kvs_filter_protocol执行，否则继续解析
+
+
+
+    命令1: SET a 1
+    RESP: *3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n
+
+    命令2: GET a
+    RESP: *2\r\n$3\r\nGET\r\n$1\r\na\r\n
+
+
+    // 解析器收到的数据
+    *2\r\n                          // ← 外层数组，2个元素
+    *3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n  // ← 元素1：数组
+    *2\r\n $3\r\nGET\r\n $1\r\na\r\n             // ← 元素2：数组
+
+    // 解析结果
+    外层数组: [cmd1, cmd2]
+      cmd1: ["SET", "a", "1"]
+      cmd2: ["GET", "a"]
+
+    // 执行
+    for each cmd in 外层数组:
+        execute(cmd)
+
+        用这种数组嵌套式写法，即使kv中存在\r\n也不会报错，因为解析根据校验头$len来判定kv的长度。
+
+# 2 协程和IO_uring应用
+
+## 基于coroutine的网络框架
+
+## 基于uring的持久化数据落盘
+
+问题
+    原先的aof数据落盘：
+    每次 SET/MOD/DEL 都会同步执行文件 I/O，每条写命令 open → fprintf → close，高频同步阻塞
+
+改造方法
+    把aof改为持久化请求队列，append_aof()变为：
+    构造 AOF record    // 定义一条 AOF 记录
+          ↓
+    加入 queue
+          ↓
+    唤醒 persistence thread
+          ↓
+    io_uring 提交
+
+
+    真正做法：做到高并发异步 I/O，实现批量提交
+           ┌── request 1 ──┐
+           ├── request 2 ──┤
+    queue ─┼── request 3 ──┼→ SQ
+           ├── request 4 ──┤
+           └── request 5 ──┘
+                           ↓
+                      kernel I/O
+                           ↓
+           ┌── CQE 1 ──────┐
+           ├── CQE 2 ──────┤
+           ├── CQE 3 ──────┤
+           └── CQE 4 ──────┘
+
+
+    而且需要保证aof的顺序，不能让多个业务线程随意直接操作同一个ring，故uring只由一个线程负责
+
+修改业务流程
+
+业务请求线程只负责把 AOF 数据放进内存队列，不直接执行磁盘写；后台持久化线程负责批量提交 io_uring。
+    客户端
+      ↓
+    ntyco 协程
+      ↓
+    kvs_handler()
+      ↓
+    SET / DEL / MOD
+      ↓
+    append_aof()
+      ↓
+    内存 FIFO 队列
+      ↓
+    Persistence Worker
+      ↓
+    io_uring SQ
+      ↓
+    IORING_OP_WRITE
+      ↓
+    AOF
+
+同时需要确保SAVA的一致性：
+    SAVE
+     ↓
+    persistence_flush()
+     ↓
+    等待所有 AOF 写完成
+     ↓
+    save_snapshots()
+     ↓
+    清空 AOF
+
+设计方案
+    kvs_uring_t          ← 对外实例（含 worker 线程、队列、计数）
+        └── kvs_ring_t   ← io_uring 裸封装（mmap 区域指针）
+                └── io_uring_sqe / io_uring_cqe  ← 内核数据结构
+
+
+    业务线程: kvs_uring_append → 构造 req → 入队 → signal(cond)
+                                                      ↓
+    worker线程: cond_wait → 批量取 64 个 → submit_requests
+                  → ring_get_sqe × N → ring_submit → reap_one × N
+                  → free_req → completed++
+
+## 基于mmap的持久化数据加载
+
+当前代码的 `load_snapshots()` 和 `replay_aof()` 都是 `fopen + fgetc/fread，效率低
+
+改造方案
+    AOF/SNAP 文件
+          ↓
+    open()
+          ↓
+    fstat()
+          ↓
+    mmap(PROT_READ, MAP_PRIVATE)
+          ↓
+    内存中的 char *data
+          ↓
+    基于指针 offset 顺序解析
+          ↓
+    KV 引擎恢复
+          ↓
+    munmap()
+
+代码实现
+
+1 mmap把文件映射到进程虚拟地址空间
+
+要映射到虚拟地址空间的原因：CPU不能直接读磁盘文件，所以需要先把磁盘内容加载进内存。传统方式：read拷贝。内核从磁盘读文件到page cache（物理内存），然后把数据从pc拷贝进用户态缓冲区，CPU通过用户态缓冲区的虚拟地址访问数据。
+
+    问题是从磁盘→pc，再从pc->用户态空间，需要两次拷贝。
+
+mmap的方式：直接映射，char *p = mmap(...);内核建立虚拟地址->pc的页表映射，CPU通过p的虚拟地址直接访问pc，少了一次拷贝。关键：<mark>p是虚拟地址，页表把p映射到page cache的物理页，cpu访问p的时候直接访问pagecache。</mark>
+    mf->data = mmap(NULL, mf->size, PROT_READ, MAP_PRIVATE, mf->fd, 0);
+             让内核自己选映射地址、映射多少字节、只读、只读场景写时复制
+
+    一次拷贝
+    磁盘
+      │ ① DMA 拷贝（磁盘 → page cache）
+      ↓
+    page cache
+      │ ② 页表映射（虚拟地址 → page cache）
+      ↓
+    进程虚拟地址空间（p）
+      │ ③ CPU 访问
+      ↓
+    CPU 读到数据
+
+
+    两次拷贝
+    磁盘
+      │ ① DMA 拷贝（磁盘 → page cache）
+      ↓
+    page cache
+      │ ② CPU 拷贝（page cache → 用户态 buf）
+      ↓
+    用户态 buf
+      │ ③ CPU 访问
+      ↓
+    CPU 读到数据
+
+# 3 config配置
+
+通常情况下全量和增量只会选择一个开启，因此需要把全量同步和增量同步功能独立出来，然后通过config文件进行配置，比如说./kvstore --config master.conf启动主节点，./kvstore --config slave.conf启动从节点。
+
+主从备份：
+
+主节点
+    # 主节点配置
+    role = master
+    port = 2000
+
+
+    # snap快照同步
+    snap.enable=true
+    # 从节点一般不启动aof
+    aof.enable=true
+
+从节点
+    # 从节点配置
+    role=slave
+    port=2001
+    master_ip=192.168.137.128
+    master_port=2000
+
+    # snap快照同步
+    snap.enable=true
+    # 从节点一般不启动aof
+    aof.enable=false
+
+# 4 持久化
+
+## 增量持久化
+
+## 全量持久化
+
+# 5 主从同步
+
+为什么要主从同步，使用场景：
+
+| 目的       | 说明              |
+| -------- | --------------- |
+| **高可用**  | 主机挂了，从机顶上       |
+| **读扩展**  | 读请求分发到从机，减轻主机压力 |
+| **数据备份** | 从机是主机数据的副本      |
+| **异地容灾** | 从机在异地，主机故障时接管   |
+| **数据分析** | 从机跑分析任务，不影响主机   |
+
+**Redis、MySQL、Kafka 都有主从**。
+
+## 同步流程
+
+SAVE指令只在snap模式下有效
+
+aof有两种同步方式：
+
+1：每5s同步一次（通过xxljob等定时平台调用）
+
+2：立即同步    （每个写操作立即同步）
+
+snap有一种同步方式：
+
+执行一次save同步一次（使用频率低）
+
+开启从机，自动连接主机，连接后发送sync。主机收到sync，把当前的持久化模式发送给从机。
+
+从机收到mode，如果是aof，就把命令接收完后批量执行，然后执行save（从机为snap模式）。如果是snap，就把data直接写入snap。
+
+主机操作：
+
+如果主机是aof模式，如果是定时同步，就会检测aof文件，有增加就发送。如果是立即同步，每个写操作就立即同步。
+
+如果主机是snap模式，那么从机每10s发一次save命令，把snap文件全量发送。
+
+### master
+
+作为主机可选aof或snap
+
+### slave
+
+作为从机，一般选择snap，此时不知道主机的模式，只管接收主机来的数据。
+
+如果a发生宕机，那么b需要选择开启aof或snap，然后重启。这时，功能和主节点相同。
+
+当a恢复后，b重启并执行cmd把数据同步给a。
+
+## 数据校验
+
+也就是说，写数据在主机上，需要给写入的数据加入CRC校验值，原因
+
+1：能避免传输过程中出现的数据错误问题
+
+2：能够校验数据是否被修改
+
+实现流程：
+
+A是主机，B是从机
+
+1：A每次同步给B数据，会在本地维护一个CRC列表 crc_list_a，如果是snap模式，在每次执行save后，重新计算每条信息的CRC。aof需要CRC校验吗？因为aof是记录命令操作，可以溯源的。
+
+2：A宕机后，B接管，B同样维护crc_list_b
+
+3：A恢复后，从B同步数据，先对比备份内容的crc_list，如果有不同，会把这些数据罗列出来，并暂停插入，同时把不同的数据写入临时文件中
+
+4：如果检查完无误后，执行命令在把临时文件的插入主机data。
+
+# 6 日志等级
+
+日志格式：
+    [时间] [级别] [文件:行] 消息
+
+    [2024-01-01 12:00:00] [INFO] [kvstore.c:100] AOF started, offset=0
+    [2024-01-01 12:00:01] [ERROR] [kvs_persist.c:200] open data/data_aof.aof failed: No such file
+
+    时间格式：YYYY-MM-DD HH:MM:SS
+
+另外在config中加入一个是否为调试状态的开关
+
+打开后，终端有输出
+
+# 7 内存管理
+
+![620a828c0f294373b923f7d3fecd4864](file:///V:/kvs_lhy/620a828c-0f29-4373-b923-f7d3fecd4864.png?msec=1791356321264)
+
+图为32位用户的虚拟空间内存结构图，由上到下分别是：
+
+1. 只读段：包括代码和常量等；
+
+2. 数据段：包括全局变量等；
+
+3. 堆：包括动态分配的内存，从低地址开始向上增长；
+
+4. 文件映射段：包括动态库、共享内存等，从高地址开始向下增长；
+
+5. 栈：包括局部变量和函数调用的上下文等。
+
+其中**堆**与**文件映射段**是我们讨论的重点，它们的内存都是动态分配的。比如说，使用 C 标准库的 **malloc()** 或者 **mmap()** ，就可以分别在**堆**和**文件映射段**动态分配内存。
+
+**malloc()** 是 C 标准库提供的内存分配函数，对应到系统调用上，有两种实现方式，即 **brk()** 和 **mmap()**。
+
+**1. brk 方式**
+
+* 对于小块内存（<128K），C 标准库使用 **brk()** 来分配。也就是通过移动堆顶的位置来分配内存。这些内存释放后并不会立刻归还系统，而是被缓存起来，重复使用。
+* 优缺点：brk() 方式可以减少缺页异常的发生，提高内存访问效率。不过，由于这些内存没有归还系统，所以在内存工作繁忙时，频繁的内存分配和释放会造成内存碎片。
+
+**2. mmap 匿名映射方式**
+
+* 对于大块内存（>128K），C 标准库使用 **mmap()** 来分配，也就是在文件映射段找一块空闲内存分配出去。**mmap()** 方式分配的内存，会在释放时直接归还系统，所以每次 mmap 都会发生缺页异常。
+* 优缺点：**mmap()** 方式可以将内存及时返回给系统，避免 OOM。但是工作繁忙时，频繁的内存分配会导致大量的缺页异常，使内核的管理负担增大。这也是 malloc 只对大块内存使用 mmap 的原因。
+
+所谓的**缺页异常**是指进程申请内存后，只分配了虚拟内存。这些所申请的虚拟内存，只有在首次访问时才会分配真正的物理内存，也就是通过缺页异常进入内核中，再由**内核**来分配物理内存（本质就是建立虚拟内存与物理内存的地址映射）。
+
+* brk() 方式申请的**堆内存**由于释放内存后并不会归还给系统，所以下次申请内存时，并不需要发生缺页异常。
+* mmap() 方式申请的动态内存会在释放内存后直接归还系统，所以下次申请内存时，会发生缺页异常（增加内核态 CPU 开销）。
+
+C 语言跟内存申请相关的函数主要有 calloc, malloc, realloc 等。
+
+* malloc：根据内存申请大小，选择在堆或文件映射段中分配连续内存，但是不会初始化内存，一般会再通过 memset 函数来初始化这块内存。
+* calloc：与 malloc 类似，只不过会自动初始化这块内存空间，每个字节置为 0。
+* realloc：可以对已申请的内存进行大小调整，同 malloc 一样新申请的内存也是未初始化的。
+
+上述所说的是 Linux 进程通过 C 标准库中的内存分配函数 malloc 向系统申请内存，但是到真正与内核交互之间，其实还隔了一层，即**内存分配管理器(memory allocator)**。常见的内存分配器包括：ptmalloc(Glibc)、tcmalloc(Google)、jemalloc(FreeBSD)。MySQL 默认使用的是 glibc 的 ptmalloc 作为内存分配器。
+
+![7mj3vh74lg](https://ask.qcloudimg.com/http-save/yehe-7053949/7mj3vh74lg.png)
