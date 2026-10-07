@@ -867,8 +867,7 @@ int load_snapshots()
 
     mmap_file_close(&mf);
 
-    LOG_INFO("Loaded %d entries from %s\n",
-           count, SNAP_FILE);
+    // LOG_INFO("Loaded %d entries from %s\n", count, SNAP_FILE);
 
     return 0;
 }
@@ -1043,7 +1042,7 @@ int crc_rebuild_snap_list(void)
 #endif
 
     crc_list_save(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
-    SYNC_LOG("[CRC] SNAP list rebuilt: %d entries", g_crc_list_snap.count);
+    // SYNC_LOG("[CRC] SNAP list rebuilt: %d entries", g_crc_list_snap.count);
     return 0;
 }
 #endif
