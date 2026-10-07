@@ -72,37 +72,6 @@ void kvs_array_destory(kvs_array_t *inst) {
 }
 
 // ===== 扩容函数 =====
-
-#if 0
-static int kvs_array_expand(kvs_array_t *inst) {
-    int new_cap = inst->capacity * KVS_ARRAY_GROW_FACTOR;
-    size_t new_size = sizeof(kvs_array_item_t) * new_cap;
-
-    /* ★ 变长表统一 malloc：池块固定大小，装不下翻倍的表 */
-    kvs_array_item_t *new_table = (kvs_array_item_t *)kvs_malloc(new_size);
-    if (!new_table) {
-        LOG_INFO("[Array] Expand failed: out of memory\n");
-        return -1;
-    }
-
-    memcpy(new_table, inst->table, sizeof(kvs_array_item_t) * inst->capacity);
-
-    int i = 0;
-    for (i = inst->capacity; i < new_cap; i++) {
-        new_table[i].key = NULL;
-        new_table[i].value = NULL;
-    }
-
-    /* ★ 与分配严格配对 */
-    kvs_free(inst->table);
-
-    inst->table = new_table;
-    inst->capacity = new_cap;
-
-    LOG_INFO("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
-    return 0;
-}
-#else
 static int kvs_array_expand(kvs_array_t *inst) {
     int new_cap = inst->capacity * KVS_ARRAY_GROW_FACTOR;
     size_t new_size = sizeof(kvs_array_item_t) * new_cap;
@@ -151,7 +120,6 @@ static int kvs_array_expand(kvs_array_t *inst) {
     LOG_INFO("[Array] Expanded: %d -> %d slots\n", inst->capacity / 2, new_cap);
     return 0;
 }
-#endif
 
 // 实现五个接口
 
@@ -166,17 +134,6 @@ int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
     // 先查找 key 是否已存在（更新）
     for (i = 0; i < inst->total; i++) {
         if (inst->table[i].key != NULL && strcmp(inst->table[i].key, key) == 0) {
-//             // 更新 value
-// #if ENABLE_MEMPOOL
-//             kvs_mempool_free(array_string_pool, inst->table[i].value);
-//             char *kvalue = kvs_mempool_alloc(array_string_pool, strlen(value) + 1);
-// #else
-//             kvs_free(inst->table[i].value);
-//             char *kvalue = kvs_malloc(strlen(value) + 1);
-// #endif
-//             if (!kvalue) return -2;
-//             strcpy(kvalue, value);
-//             inst->table[i].value = kvalue;
             return 1;
         }
     }
@@ -255,16 +212,20 @@ int kvs_array_del(kvs_array_t *inst, char *key) {
     for (i=0; i< inst->total; i++) {
         if (strcmp(inst->table[i].key, key) == 0) {
 #if ENABLE_MEMPOOL
+            // 释放 key/value
             kvs_mempool_free(array_string_pool, inst->table[i].key);
             kvs_mempool_free(array_string_pool, inst->table[i].value);
 #else
             kvs_free(inst->table[i].key);
             kvs_free(inst->table[i].value);
 #endif
-            inst->table[i].value = NULL;
-            inst->table[i].key = NULL;
- // 关键修复：无论删除哪个位置，total 都应该减
+            // 用最后一个元素填坑
             inst->total--;
+            if (i != inst->total) {
+                inst->table[i] = inst->table[inst->total];
+                inst->table[inst->total].key = NULL;
+                inst->table[inst->total].value = NULL;
+            }
             return 0;
         }
     }
