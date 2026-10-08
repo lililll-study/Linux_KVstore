@@ -25,11 +25,14 @@
 
 #define ENABLE_MMAP         1   // 持久化数据加载
 #define ENABLE_URING        1   // 持久化数据落盘
+
+/* 底层网络架构选择：NET_REACTOR 或 NET_NTYCO*/
 #define NET_REACTOR     0
 #define NET_NTYCO       1
-#define NET_PROACTOR    2
 
-#define NET_SELECT NET_NTYCO
+#ifndef NET_SELECT
+#define NET_SELECT NET_REACTOR
+#endif
 
 
 #define ENABLE_ARRAY         1
@@ -525,6 +528,7 @@ typedef struct {
     int aof_enable;
 
     int aof_mode;       // 0: everysec, 1: immediate
+    int log_level;      // 日志级别，见 log_level_t
 } kvs_config_t;
 
 extern kvs_config_t g_config;
