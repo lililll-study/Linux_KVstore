@@ -72,15 +72,17 @@ LOG_DIR  = logs
 LOG  = $(LOG_DIR)/kvs.log
 
 # 默认目标：服务端 + 所有测试端
-all: dirs $(TARGET) $(TEST_TARGETS)
+all: submodule dirs $(TARGET) $(TEST_TARGETS)
 
-# 创建必要的目录
-dirs:
-	@mkdir -p $(BUILD_DIR) data
+# NtyCo 以 git submodule 引入，未拉取时自动初始化
+submodule:
+	@test -f NtyCo/core/nty_coroutine.h || git submodule update --init --recursive
 
-
-# ===== 链接服务端 =====
+# ntyco 模式需要静态库，submodule 内只有源码时自动编译
 $(TARGET): $(OBJS)
+ifeq ($(NETWORK),ntyco)
+	@test -f NtyCo/lib/libntyco.a || $(MAKE) -C NtyCo
+endif
 	$(CC) -no-pie -o $@ $(OBJS) $(LIBS)
 	@echo "Build complete: $(TARGET)"
 
@@ -115,7 +117,7 @@ clean:
 	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP) $(LOG)
 	@echo "Clean complete"
 
-.PHONY: all clean cleanall dirs reactor ntyco
+.PHONY: all clean cleanall dirs submodule reactor ntyco
 
 # 快捷方式：make reactor / make ntyco 切换网络模式
 reactor:
