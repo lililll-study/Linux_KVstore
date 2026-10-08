@@ -6,6 +6,22 @@ SRC_DIR = src
 TEST_DIR = test
 INC_DIR = include
 
+# ===== 网络模式开关：reactor 或 ntyco =====
+# 与 include/kvstore.h 中 NET_SELECT 联动：此处决定是否编译/链接 NtyCo
+NETWORK ?= reactor
+
+ifeq ($(NETWORK),ntyco)
+NET_SRC  = $(SRC_DIR)/ntyco.c
+NET_LIB  = -L ./NtyCo/lib/ -lntyco
+NET_INC  = -I./NtyCo/core
+NET_FLAG = -DNET_SELECT=NET_NTYCO
+else
+NET_SRC  =
+NET_LIB  = -lpthread
+NET_INC  =
+NET_FLAG = -DNET_SELECT=NET_REACTOR
+endif
+
 # 测试用例列表（每个独立编译）
 TEST_SRCS = $(TEST_DIR)/5_crc_testcase.c \
 			$(TEST_DIR)/3_sync_testcase.c \
@@ -28,20 +44,20 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(SRC_DIR)/kvs_mempool.c \
 	   $(SRC_DIR)/config.c \
 	   $(SRC_DIR)/reactor.c \
+	   $(NET_SRC) \
        $(SRC_DIR)/kvs_sync.c \
-	   $(SRC_DIR)/ntyco.c \
 	   $(SRC_DIR)/log.c \
 	   $(SRC_DIR)/crc.c
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
-INC = -I$(INC_DIR) -I./NtyCo/core
-# LIBS = -lpthread -ldl
-LIBS = -L ./NtyCo/lib/ -lntyco -lpthread -ldl
+INC = -I$(INC_DIR) $(NET_INC)
+# reactor 模式不依赖 libntyco；LIBS = -lpthread -ldl
+LIBS = $(NET_LIB) -lpthread -ldl
 # 测试端只链接 -lpthread -ldl，不链接 -lntyco
 TEST_LIBS = -lpthread -ldl
-CFLAGS = -Wall -g $(INC)
+CFLAGS = -Wall -g $(NET_FLAG) $(INC)
 
 
 # 持久化数据文件
@@ -99,4 +115,10 @@ clean:
 	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP) $(LOG)
 	@echo "Clean complete"
 
-.PHONY: all clean cleanall dirs
+.PHONY: all clean cleanall dirs reactor ntyco
+
+# 快捷方式：make reactor / make ntyco 切换网络模式
+reactor:
+	$(MAKE) NETWORK=reactor all
+ntyco:
+	$(MAKE) NETWORK=ntyco all
