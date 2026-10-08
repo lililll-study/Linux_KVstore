@@ -1,175 +1,194 @@
+* * *
 
+# 基于C语言的 仿Redis数据库实现（KV存储）
 
 * * *
 
-# 基于C的仿Redis数据库实现（KV存储）
+# 项目目标
 
-* * *
+* 协议兼容：支持标准RESP协议，兼容redis-cli工具
 
-# 项目说明
+* 高性能：单机QPS 5w+，持久化、同步及CRC校验功能开启后，仍然保持高性能
 
-## 编译运行
+* 完整功能：数据引擎、持久化、主从备份、日志、数据校验
 
-```bash
-cd kvs_lhy
-make
+# 技术栈
 
-运行项目
-./build/kvstore --config master.conf
+* 语言：C/C++
 
-```
+* 网络：reactor/ntyco
 
+* 协议：RESP
 
+* 数据结构：ARRAY + RBTREE + HASH + SKIPTABLE
 
-# 批处理
+* 持久化：AOF + SNAP
 
-```bash
-# 全部 QPS 测试（推荐）
+* 构建：Makefile
 
-./build/1_RESP_testcase 27.0.0.1 2000 5
+* 数据落盘：io_uring
 
-# 或者单独跑
-./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
+* 数据加载：mmap
 
-./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
+* 内存管理：仿jemalloc实现的字符串分级内存池
 
-./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
+# 环境要求
 
-./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
-```
+* Linux 5.1+（依赖 epoll / io _uring）
+* gcc
+* make
+* git（构建 ntyco 模式时需要，用于自动拉取 submodule）
 
+| 模式      | 网络架构               | 是否依赖 NtyCo submodule | 适用场景        |
+| ------- | ------------------ | -------------------- | ----------- |
+| reactor | 单线程 IO 多路复用（epoll） | 否                    | 通用部署，构建路径最短 |
+| ntyco   | 同步写法 + 协程（NtyCo 库） | 是                    | 高并发连接场景     |
 
+# 编译
 
-# 持久化
+## 方式一、reactor 模式（默认，无需克隆 NtyCo）
 
-## 1、增量持久化
+    git clone git@gitlab.0voice.com:lihongyi/kvs_lhy.git
+    cd kvs_lhy
+    
+    #或直接make
+    make reactor
+
+## 方式二、ntyco 协程模式
+
+    git clone --recurse-submodules git@gitlab.0voice.com :lihongyi/kvs_lhy.git
+    cd kvs_lhy
+    make ntyco
+
+# 运行
+
+主节点
+    ./build/kvstore --config master.conf
+
+从节点
+    ./build/kvstore --config config/slave.conf
+
+# 清理编译文件和数据
+
+    make clean
+
+# 功能测试
+
+## 批处理
+
+    # 全部 QPS 测试（推荐）
+    
+    ./build/1_RESP_testcase 27.0.0.1 2000 5
+    
+    # 或者单独跑
+    ./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
+    
+    ./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
+    
+    ./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
+    
+    ./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
+
+## 持久化
+
+### 1、增量持久化
 
 配置文件master.conf
-
-```bash
-# 主节点配置
-role=master
-port=2000
-# 不启动snap
-snap.enable=false
-# 启动aof
-aof.enable=true
-```
+    # 主节点配置
+    role=master
+    port=2000
+    # 不启动snap
+    snap.enable=false
+    # 启动aof
+    aof.enable=true
 
 测试
+    # AOF 测试
+    ./build/2_presist_testcase 127.0.0.1 2000 1
+    # 插入完成后，重启服务端
+    ./build/kvstore --config master.conf
+    # 测试端读取aof加载的数据
+    ./build/2_presist_testcase 127.0.0.1 2000 2
 
-```bash
-# AOF 测试
-./build/2_presist_testcase 127.0.0.1 2000 1
-# 插入完成后，重启服务端
-./build/kvstore --config master.conf
-# 测试端读取aof加载的数据
-./build/2_presist_testcase 127.0.0.1 2000 2
-```
-
-
-
-## 2、全量持久化
+### 2、全量持久化
 
 配置文件master.conf
-
-```bash
-# 主节点配置
-role=master
-port=2000
-# 启动snap
-snap.enable=true
-# 不启动aof
-aof.enable=false
-```
+    # 主节点配置
+    role=master
+    port=2000
+    # 启动snap
+    snap.enable=true
+    # 不启动aof
+    aof.enable=false
 
 测试
+    # SNAP 测试
+    ./build/2_presist_testcase 127.0.0.1 2000 3
+    # 插入完成后，重启服务端
+    ./build/kvstore --config master.conf
+    # 测试端读取aof加载的数据
+    ./build/2_presist_testcase 127.0.0.1 2000 4
 
-```bash
-# SNAP 测试
-./build/2_presist_testcase 127.0.0.1 2000 3
-# 插入完成后，重启服务端
-./build/kvstore --config master.conf
-# 测试端读取aof加载的数据
-./build/2_presist_testcase 127.0.0.1 2000 4
-```
+## 主从同步
 
+    # 1. 启动主机
+    ./build/kvstore --config config/master.conf
+    
+    # 测试端：连接主机并插入5w条数据
+    ./build/3_sync_testcase 192.168.137.134 2000 1
+    
+    # 2. 启动从机
+    ./build/kvstore --config config/slave.conf
+    
+    
+    # 测试端：再向主机插入5w条数据
+    ./build/3_sync_testcase 192.168.137.134 2000 2
+    
+    
+    # 测试端：连从机，验证 10w
+    ./build/3_sync_testcase 192.168.137.135 2001 3
 
+## 数据校验
 
+    # 1. 启动主机
+    ./build/kvstore --config config/master.conf
+    
+    # 测试端：连接主机并插入5条数据
+    ./build/3_sync_testcase 192.168.137.134 2000 10
+    
+    # 2. 启动从机
+    ./build/kvstore --config config/slave.conf
+    
+    
+    # 3. 对比主从机的crc列表
+    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+    
+    
+    # 4. 修改从机数据
+    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
+    
+    # 5. 再次对比 
+    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
 
+## 内存池
 
-# 主从同步
+    # ===== 步骤 1：无内存池 =====
+    make clean 
+    make
+    ./test/mem_test.sh nopool
+    
+    # ===== 步骤 2：有内存池 =====
+    make clean 
+    make
+    ./test/mem_test.sh pool
+    
+    # ===== 步骤 3：jemalloc =====
+    # 需要关闭内存池
+    make clean
+    make
+    ./test/mem_test.sh jemalloc
 
-```bash
-# 1. 启动主机
-./build/kvstore --config config/master.conf
-
-# 测试端：连接主机并插入5w条数据
-./build/3_sync_testcase 192.168.137.134 2000 1
-
-# 2. 启动从机
-./build/kvstore --config config/slave.conf
-
-
-# 测试端：再向主机插入5w条数据
-./build/3_sync_testcase 192.168.137.134 2000 2
-
-
-# 测试端：连从机，验证 10w
-./build/3_sync_testcase 192.168.137.135 2001 3
-```
-
-
-
-# 数据校验
-
-```bash
-# 1. 启动主机
-./build/kvstore --config config/master.conf
-
-# 测试端：连接主机并插入5条数据
-./build/3_sync_testcase 192.168.137.134 2000 10
-
-# 2. 启动从机
-./build/kvstore --config config/slave.conf
-
-
-# 3. 对比主从机的crc列表
-./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
-
-
-# 4. 修改从机数据
-./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
-
-# 5. 再次对比 
-./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
-```
-
-
-
-# 内存池
-
-```bash
-# ===== 步骤 1：无内存池 =====
-make clean 
-make
-./test/mem_test.sh nopool
-
-# ===== 步骤 2：有内存池 =====
-make clean 
-make
-./test/mem_test.sh pool
-
-# ===== 步骤 3：jemalloc =====
-# 需要关闭内存池
-make clean
-make
-./test/mem_test.sh jemalloc
-```
-
-
-
-# 性能测试
+# 性能数据
 
 ## 1、主从同步性能测试
 
@@ -184,8 +203,6 @@ make
 |               | Hash      | 88967    | 88809   | ~0%    |
 |               | Skiptable | 108225   | 115207  | +6.4%  |
 
- 
-
 ## 2、CRC性能测试
 
 | 引擎            | 开 CRC | 关 CRC      | 差值      | 倍数        |
@@ -194,8 +211,6 @@ make
 | **Rbtree**    | 49067 | **149700** | +100633 | **3.05×** |
 | **Hash**      | 24764 | **108225** | +83461  | **4.37×** |
 | **Skiptable** | 23245 | **66050**  | +42805  | **2.84×** |
-
-
 
 ## 3、内存池性能测试
 
