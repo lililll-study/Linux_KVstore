@@ -31,7 +31,7 @@
 #define NET_NTYCO       1
 
 #ifndef NET_SELECT
-#define NET_SELECT NET_REACTOR
+#define NET_SELECT NET_NTYCO
 #endif
 
 
