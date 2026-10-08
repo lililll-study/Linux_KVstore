@@ -77,7 +77,9 @@ all: submodule dirs $(TARGET) $(TEST_TARGETS)
 # NtyCo 以 git submodule 引入，未拉取时自动初始化
 submodule:
 	@test -f NtyCo/core/nty_coroutine.h || git submodule update --init --recursive
-
+# 创建必要的目录
+dirs:
+	@mkdir -p $(BUILD_DIR) data
 # ntyco 模式需要静态库，submodule 内只有源码时自动编译
 $(TARGET): $(OBJS)
 ifeq ($(NETWORK),ntyco)
