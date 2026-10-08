@@ -72,19 +72,41 @@ LOG_DIR  = logs
 LOG  = $(LOG_DIR)/kvs.log
 
 # 默认目标：服务端 + 所有测试端
+ifeq ($(NETWORK),ntyco)
 all: submodule dirs $(TARGET) $(TEST_TARGETS)
 
 # NtyCo 以 git submodule 引入，未拉取时自动初始化
 submodule:
 	@test -f NtyCo/core/nty_coroutine.h || git submodule update --init --recursive
+else
+all: dirs $(TARGET) $(TEST_TARGETS)
+endif
+
 # 创建必要的目录
 dirs:
 	@mkdir -p $(BUILD_DIR) data
+
 # ntyco 模式需要静态库，submodule 内只有源码时自动编译
-$(TARGET): $(OBJS)
-ifeq ($(NETWORK),ntyco)
-	@test -f NtyCo/lib/libntyco.a || $(MAKE) -C NtyCo
-endif
+# ntyco 模式需要静态库：直接将 submodule 拉取的 core/ 源码编译为 libntyco.a
+# （NtyCo 自带 Makefile 仅构建 sample 可执行文件，不产出静态库）
+NTYCO_CORE = NtyCo/core/nty_coroutine.c NtyCo/core/nty_schedule.c \
+            NtyCo/core/nty_epoll.c NtyCo/core/nty_socket.c
+NTYCO_LIB = NtyCo/lib/libntyco.a
+
+# 注意：修改本行参数后需 make clean 重新编译库
+# 通过 -include 强制前置注入头文件，先包含 stdio.h 再重定义 printf，屏蔽 NtyCo 内部打印
+NTYCO_CFLAG = -O2 -D'_GNU_SOURCE=' -include $(PWD)/include/nty_silence.h
+
+$(NTYCO_LIB): $(NTYCO_CORE)
+	@mkdir -p NtyCo/lib NtyCo/objs
+	$(CC) $(NTYCO_CFLAG) -c NtyCo/core/nty_coroutine.c -o NtyCo/objs/nty_coroutine.o -I NtyCo/core
+	$(CC) $(NTYCO_CFLAG) -c NtyCo/core/nty_schedule.c -o NtyCo/objs/nty_schedule.o -I NtyCo/core
+	$(CC) $(NTYCO_CFLAG) -c NtyCo/core/nty_epoll.c -o NtyCo/objs/nty_epoll.o -I NtyCo/core
+	$(CC) $(NTYCO_CFLAG) -c NtyCo/core/nty_socket.c -o NtyCo/objs/nty_socket.o -I NtyCo/core
+	ar rcs $@ NtyCo/objs/*.o
+
+
+$(TARGET): $(OBJS) $(if $(filter ntyco,$(NETWORK)),$(NTYCO_LIB),)
 	$(CC) -no-pie -o $@ $(OBJS) $(LIBS)
 	@echo "Build complete: $(TARGET)"
 
