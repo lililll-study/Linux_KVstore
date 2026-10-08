@@ -884,6 +884,8 @@ int main(int argc, char *argv[]) {
     if (kvs_config_load(config_file) < 0) {
         return -1;
     }
+    // 配置文件中的日志级别覆盖默认值
+    kvs_log_set_level(g_config.log_level);
     // 打印配置
     kvs_config_print();
     // 设置全局角色
@@ -913,8 +915,6 @@ int main(int argc, char *argv[]) {
     reactor_start(port, kvs_protocol);
 #elif (NET_SELECT == NET_NTYCO)
     ntyco_start(port, kvs_protocol);
-#elif (NET_SELECT == NET_PROACTOR)
-    proactor_start(port, kvs_protocol);
 #endif
     dest_kvengine();
     
