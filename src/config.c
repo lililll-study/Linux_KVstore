@@ -9,6 +9,7 @@ kvs_config_t g_config = {
     .snap_enable = 1,      // 默认开启快照同步
     .aof_enable = 0,        // 默认关闭 AOF 同步
     .aof_mode = AOF_MODE_EVERYSEC,
+    .log_level = LOG_LEVEL_INFO,
 };
 
 // ===== 去除字符串首尾空白 =====
@@ -31,6 +32,20 @@ static int parse_bool(const char *value) {
     if (strcmp(value, "on") == 0)    return 1;
     if (strcmp(value, "off") == 0)   return 0;
     return atoi(value);  // "1" / "0"
+}
+
+// ===== 解析日志级别 =====
+static int parse_log_level(const char *value) {
+    if (strcmp(value, "debug") == 0) return LOG_LEVEL_DEBUG;
+    if (strcmp(value, "info") == 0)  return LOG_LEVEL_INFO;
+    if (strcmp(value, "warn") == 0)  return LOG_LEVEL_WARN;
+    if (strcmp(value, "warning") == 0) return LOG_LEVEL_WARN;
+    if (strcmp(value, "error") == 0) return LOG_LEVEL_ERROR;
+    if (strcmp(value, "fatal") == 0) return LOG_LEVEL_FATAL;
+    int lv = atoi(value);
+    if (lv < LOG_LEVEL_DEBUG) return LOG_LEVEL_DEBUG;
+    if (lv > LOG_LEVEL_FATAL) return LOG_LEVEL_FATAL;
+    return lv;
 }
 
 // ===== 加载配置文件 =====
@@ -88,6 +103,8 @@ int kvs_config_load(const char *filename) {
             strncpy(g_config.master_ip, value, sizeof(g_config.master_ip) - 1);
         } else if (strcmp(key, "master_port") == 0) {
             g_config.master_port = atoi(value);
+        } else if (strcmp(key, "log.level") == 0 || strcmp(key, "log_level") == 0) {
+            g_config.log_level = parse_log_level(value);
         }
         // ===== 处理 key.subkey 格式 =====
         else if (subkey && strcmp(key, "snap") == 0) {
@@ -130,6 +147,11 @@ void kvs_config_print(void) {
     printf("  snap.enable : %s\n", g_config.snap_enable ? "true" : "false");
     printf("  aof.enable  : %s\n", g_config.aof_enable ? "true" : "false");
     printf("  aof.mode    : %s\n", g_config.aof_mode == AOF_MODE_EVERYSEC ? "everysec" : "immediate");
+    static const char *lv_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
+    int lv = g_config.log_level;
+    if (lv < LOG_LEVEL_DEBUG) lv = LOG_LEVEL_DEBUG;
+    if (lv > LOG_LEVEL_FATAL) lv = LOG_LEVEL_FATAL;
+    printf("  log.level   : %s\n", lv_names[lv]);
     printf("============================\n");
 }
 
