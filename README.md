@@ -48,71 +48,97 @@
 
 ## 方式一、reactor 模式（默认，无需克隆 NtyCo）
 
-    git clone git@gitlab.0voice.com:lihongyi/kvs_lhy.git
-    cd kvs_lhy
-    
-    #或直接make
-    make reactor
+```bash
+git clone git@gitlab.0voice.com:lihongyi/kvs_lhy.git
+cd kvs_lhy
+
+#或直接make
+make reactor
+```
 
 ## 方式二、ntyco 协程模式
 
-    git clone --recurse-submodules git@gitlab.0voice.com :lihongyi/kvs_lhy.git
-    cd kvs_lhy
-    make ntyco
+```bash
+git clone --recurse-submodules git@gitlab.0voice.com :lihongyi/kvs_lhy.git
+cd kvs_lhy
+make ntyco
+```
 
 # 运行
 
+```bash
 主节点
-    ./build/kvstore --config master.conf
+./build/kvstore --config master.conf
 
 从节点
-    ./build/kvstore --config config/slave.conf
+./build/kvstore --config config/slave.conf
+```
+
+
 
 # 清理编译文件和数据
 
-    make clean
+```bash
+make clean
+```
 
 # 功能测试
 
 ## 批处理
 
-    # 全部 QPS 测试（推荐）
-    
-    ./build/1_RESP_testcase 27.0.0.1 2000 5
-    
-    # 或者单独跑
-    ./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
-    
-    ./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
-    
-    ./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
-    
-    ./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
+```bash
+# 全部 QPS 测试（推荐）
+
+./build/1_RESP_testcase 27.0.0.1 2000 5
+
+# 或者单独跑
+./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
+
+./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
+
+./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
+
+./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
+```
 
 ## 持久化
 
 ### 1、增量持久化
 
 配置文件master.conf
-    # 主节点配置
-    role=master
-    port=2000
-    # 不启动snap
-    snap.enable=false
-    # 启动aof
-    aof.enable=true
+
+
+
+```bash
+# 主节点配置
+role=master
+port=2000
+# 不启动snap
+snap.enable=false
+# 启动aof
+aof.enable=true
+```
+
+
 
 测试
-    # AOF 测试
-    ./build/2_presist_testcase 127.0.0.1 2000 1
-    # 插入完成后，重启服务端
-    ./build/kvstore --config master.conf
-    # 测试端读取aof加载的数据
-    ./build/2_presist_testcase 127.0.0.1 2000 2
+
+```bash
+# AOF 测试
+./build/2_presist_testcase 127.0.0.1 2000 1
+# 插入完成后，重启服务端
+./build/kvstore --config master.conf
+# 测试端读取aof加载的数据
+./build/2_presist_testcase 127.0.0.1 2000 2
+```
+
+
 
 ### 2、全量持久化
 
 配置文件master.conf
+
+```bash
     # 主节点配置
     role=master
     port=2000
@@ -120,73 +146,84 @@
     snap.enable=true
     # 不启动aof
     aof.enable=false
+```
 
 测试
+
+```bash
+
     # SNAP 测试
     ./build/2_presist_testcase 127.0.0.1 2000 3
     # 插入完成后，重启服务端
     ./build/kvstore --config master.conf
     # 测试端读取aof加载的数据
     ./build/2_presist_testcase 127.0.0.1 2000 4
+```
 
 ## 主从同步
 
-    # 1. 启动主机
-    ./build/kvstore --config config/master.conf
-    
-    # 测试端：连接主机并插入5w条数据
-    ./build/3_sync_testcase 192.168.137.134 2000 1
-    
-    # 2. 启动从机
-    ./build/kvstore --config config/slave.conf
-    
-    
-    # 测试端：再向主机插入5w条数据
-    ./build/3_sync_testcase 192.168.137.134 2000 2
-    
-    
-    # 测试端：连从机，验证 10w
-    ./build/3_sync_testcase 192.168.137.135 2001 3
+```bash
+# 1. 启动主机
+./build/kvstore --config config/master.conf
+
+# 测试端：连接主机并插入5w条数据
+./build/3_sync_testcase 192.168.137.134 2000 1
+
+# 2. 启动从机
+./build/kvstore --config config/slave.conf
+
+
+# 测试端：再向主机插入5w条数据
+./build/3_sync_testcase 192.168.137.134 2000 2
+
+
+# 测试端：连从机，验证 10w
+./build/3_sync_testcase 192.168.137.135 2001 3
+```
 
 ## 数据校验
 
-    # 1. 启动主机
-    ./build/kvstore --config config/master.conf
-    
-    # 测试端：连接主机并插入5条数据
-    ./build/3_sync_testcase 192.168.137.134 2000 10
-    
-    # 2. 启动从机
-    ./build/kvstore --config config/slave.conf
-    
-    
-    # 3. 对比主从机的crc列表
-    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
-    
-    
-    # 4. 修改从机数据
-    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
-    
-    # 5. 再次对比 
-    ./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+```bash
+# 1. 启动主机
+./build/kvstore --config config/master.conf
+
+# 测试端：连接主机并插入5条数据
+./build/3_sync_testcase 192.168.137.134 2000 10
+
+# 2. 启动从机
+./build/kvstore --config config/slave.conf
+
+
+# 3. 对比主从机的crc列表
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+
+
+# 4. 修改从机数据
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
+
+# 5. 再次对比 
+./build/5_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+```
 
 ## 内存池
 
-    # ===== 步骤 1：无内存池 =====
-    make clean 
-    make
-    ./test/mem_test.sh nopool
-    
-    # ===== 步骤 2：有内存池 =====
-    make clean 
-    make
-    ./test/mem_test.sh pool
-    
-    # ===== 步骤 3：jemalloc =====
-    # 需要关闭内存池
-    make clean
-    make
-    ./test/mem_test.sh jemalloc
+```bash
+# ===== 步骤 1：无内存池 =====
+make clean 
+make
+./test/mem_test.sh nopool
+
+# ===== 步骤 2：有内存池 =====
+make clean 
+make
+./test/mem_test.sh pool
+
+# ===== 步骤 3：jemalloc =====
+# 需要关闭内存池
+make clean
+make
+./test/mem_test.sh jemalloc
+```
 
 # 性能数据
 
