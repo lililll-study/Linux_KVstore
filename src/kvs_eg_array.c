@@ -98,8 +98,9 @@ static int kvs_array_expand(kvs_array_t *inst) {
     }
 #endif
     
-    // 复制旧数据到新表
-    memcpy(new_table, inst->table, sizeof(kvs_array_item_t) * inst->capacity);
+    if (new_table != inst->table) {
+        memcpy(new_table, inst->table, sizeof(kvs_array_item_t) * inst->capacity);
+    }
     int i = 0;
     // 初始化新增的槽位
     for (i = inst->capacity; i < new_cap; i++) {
@@ -107,11 +108,15 @@ static int kvs_array_expand(kvs_array_t *inst) {
         new_table[i].value = NULL;
     }
     
-    // 释放旧表
+    // 释放旧表（池可能返回同一块内存，此时不能重复释放）
 #if ENABLE_MEMPOOL
-    kvs_mempool_free(array_item_pool, inst->table);
+    if (new_table != inst->table) {
+        kvs_mempool_free(array_item_pool, inst->table);
+    }
 #else
-    kvs_free(inst->table);
+    if (new_table != inst->table) {
+        kvs_free(inst->table);
+    }
 #endif
     
     inst->table = new_table;
@@ -223,9 +228,9 @@ int kvs_array_del(kvs_array_t *inst, char *key) {
             inst->total--;
             if (i != inst->total) {
                 inst->table[i] = inst->table[inst->total];
-                inst->table[inst->total].key = NULL;
-                inst->table[inst->total].value = NULL;
             }
+            inst->table[inst->total].key = NULL;
+            inst->table[inst->total].value = NULL;
             return 0;
         }
     }
