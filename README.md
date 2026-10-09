@@ -84,21 +84,11 @@ make clean
 
 # 功能测试
 
-## 批处理
+## 管道写入
 
 ```bash
-# 全部 QPS 测试（推荐）
-
+# 单条写入和管道写入的性能对比
 ./build/1_RESP_testcase 27.0.0.1 2000 5
-
-# 或者单独跑
-./build/1_RESP_testcase 127.0.0.1 2000 1   # 单条SET
-
-./build/1_RESP_testcase 127.0.0.1 2000 2   # 单条 GET
-
-./build/1_RESP_testcase 127.0.0.1 2000 3   # 批量 SET
-
-./build/1_RESP_testcase 127.0.0.1 2000 4   # 批量 GET
 ```
 
 ## 持久化
@@ -106,8 +96,6 @@ make clean
 ### 1、增量持久化
 
 配置文件master.conf
-
-
 
 ```bash
 # 主节点配置
@@ -139,25 +127,27 @@ aof.enable=true
 配置文件master.conf
 
 ```bash
-    # 主节点配置
-    role=master
-    port=2000
-    # 启动snap
-    snap.enable=true
-    # 不启动aof
-    aof.enable=false
+# 主节点配置
+role=master
+port=2000
+# 启动snap
+snap.enable=true
+# 不启动aof
+aof.enable=false
 ```
+
+
 
 测试
 
 ```bash
 
-    # SNAP 测试
-    ./build/2_presist_testcase 127.0.0.1 2000 3
-    # 插入完成后，重启服务端
-    ./build/kvstore --config master.conf
-    # 测试端读取aof加载的数据
-    ./build/2_presist_testcase 127.0.0.1 2000 4
+# SNAP 测试
+./build/2_presist_testcase 127.0.0.1 2000 3
+# 插入完成后，重启服务端
+./build/kvstore --config master.conf
+# 测试端读取aof加载的数据
+./build/2_presist_testcase 127.0.0.1 2000 4
 ```
 
 ## 主从同步
@@ -227,6 +217,21 @@ make
 
 # 性能数据
 
+
+
+## 1、管道化性能
+
+| 引擎            | ② 单条写入 (QPS) | ④ 管道写入 (QPS) | 提升倍数  |
+| ------------- | ------------ | ------------ | ----- |
+| **Array**     | 1.0w         | 3.2w         | 3.1x  |
+| **Rbtree**    | 1.7w         | 16.6w        | 10.0x |
+| **Hash**      | 1.4w         | 9.8w         | 7.1x  |
+| **Skiptable** | 1.3w         | 13.5w        | 10.1x |
+
+
+
+
+
 ## 1、主从同步性能测试
 
 | 操作            | 引擎        | 不开同步 QPS | 开同步 QPS | 变化     |
@@ -239,6 +244,10 @@ make
 |               | Rbtree    | 194552   | 197628  | +1.6%  |
 |               | Hash      | 88967    | 88809   | ~0%    |
 |               | Skiptable | 108225   | 115207  | +6.4%  |
+
+
+
+
 
 ## 2、CRC性能测试
 
@@ -277,3 +286,5 @@ make
 **结论 ：**
 
         内存池在吞吐不劣于两种动态分配器的前提下（删除路径甚至最优），以峰值内存增加 39% 的代价，换取了 jemalloc 与 glibc 都无法提供的能力—— 启动时即可精确承诺内存上限、超限行为可定义、分配路径 O(1) 确定性 。三种方案的本质区别不在性能，而在内存策略：glibc 保留但不精细，jemalloc 激进归还（适合删多插少），内存池保留复用（适合删了又插、需要水位管控）。对内存上限有硬性要求的部署场景（嵌入式、多租户），池化是唯一选择；无此需求时 jemalloc 是综合最优解。
+
+
