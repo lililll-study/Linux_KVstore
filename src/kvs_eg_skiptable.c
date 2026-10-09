@@ -176,7 +176,7 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
             update[i] = inst->header;
         }
         // ===== 新增：跳表层数增长打印 =====
-        LOG_INFO("[Skiptable] Level up: %d -> %d (key=%s)\n",
+        LOG_DEBUG("[Skiptable] Level up: %d -> %d (key=%s)\n",
                inst->level, level, key);
         inst->level = level;
     }
