@@ -88,7 +88,7 @@ make clean
 
 ```bash
 # 单条写入和管道写入的性能对比
-./build/1_RESP_testcase 27.0.0.1 2000 5
+./build/1_RESP_testcase 127.0.0.1 2000 5
 ```
 
 ## 持久化
@@ -153,6 +153,8 @@ aof.enable=false
 ## 主从同步
 
 ```bash
+make clean
+make reactor
 # 1. 启动主机
 ./build/kvstore --config config/master.conf
 
@@ -174,6 +176,8 @@ aof.enable=false
 ## 数据校验
 
 ```bash
+make clean
+make reactor
 # 1. 启动主机
 ./build/kvstore --config config/master.conf
 
