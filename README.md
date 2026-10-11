@@ -61,7 +61,7 @@ make reactor
 克隆时导入
 
 ```bash
-git clone --recurse-submodules git@gitlab.0voice.com :lihongyi/kvs_lhy.git
+git clone --recurse-submodules git@gitlab.0voice.com:lihongyi/kvs_lhy.git
 cd kvs_lhy
 make ntyco
 ```
@@ -232,14 +232,14 @@ make
 
 # 性能数据
 
-性能优化对比
+加入功能后的性能对比
 
-| 优化项                | 优化前 QPS | 优化后 QPS | 提升倍数      | 备注               |
+| 添加功能               | 优化前 QPS | 优化后 QPS | 提升倍数      | 备注               |
 | ------------------ | ------- | ------- | --------- | ---------------- |
 | 基础实现（单条写入）         | 1.2w    | -       | -         | 阻塞 I/O + 同步 AOF  |
 | 管道化写入（批量）          | 1.4w    | 17.7w   | **12.6x** | 减少网络 RTT         |
 | 管道 + 集中写入          | 1.4w    | 13.5w   | **9.6x**  | 批量发送，顺序处理        |
-| AOF 异步写入（io_uring） | 1.4k    | 9.0w    | **64x**   | AOF 模式下的巨大提升     |
+| AOF 异步写入（io_uring） | 1.4w    | 9.0w    | **6.4x**  | 异步AOF降低损耗        |
 | 主从同步（管道模式）         | 17.1w   | 4.0w    | **0.23x** | AOF + 同步双开销      |
 | 主从同步（单条模式）         | 1.4w    | 1.9w    | **1.36x** | RTT 主导，AOF 影响被掩盖 |
 
