@@ -2,7 +2,7 @@
 # test/mem_test.sh <mode>
 #   mode: nopool | pool | jemalloc
 #
-# 自动完成：启动服务端 → 采样 → 插 40w → 采样 → 删 40w → 采样 → 关服务端 → 输出结果
+# 自动完成：启动服务端 → 采样 → 插 20w → 采样 → 删 20w → 采样 → 关服务端 → 输出结果
 # 结果追加到 /tmp/mem_results.txt
 
 set -u
@@ -100,17 +100,17 @@ echo "0 0" > "$PEAK_FILE"
 ) &
 SAMPLER_PID=$!
 
-# ===== 5. 插 40w（4 引擎 × 10w）=====
-echo "----- insert 400k -----"
-$TEST 127.0.0.1 $PORT 6
+# ===== 5. 插 20w（2 引擎 × 10w）=====
+echo "----- insert 200k -----"
+$TEST 6 -1
 sleep 2
 AFTER_INSERT_RSS=$(sample_rss)
 AFTER_INSERT_VSZ=$(sample_vsz)
 echo "[AFTER_INSERT] VmSize=${AFTER_INSERT_VSZ} kB, VmRSS=${AFTER_INSERT_RSS} kB"
 
-# ===== 6. 删 40w =====
-echo "----- delete 400k -----"
-$TEST 127.0.0.1 $PORT 7
+# ===== 6. 删 20w =====
+echo "----- delete 200k -----"
+$TEST 7 -1
 sleep 2
 AFTER_DELETE_RSS=$(sample_rss)
 AFTER_DELETE_VSZ=$(sample_vsz)
