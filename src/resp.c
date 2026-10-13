@@ -43,8 +43,9 @@ int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     ctx->resp_scmd_unit_num = 0;
     ctx->resp_scmd_unit_idx = 0;
     ctx->resp_token_len = 0;
-    ctx->resp_temp_buffer = NULL;
-    ctx->resp_temp_buffer_cap = 0;
+    ctx->resp_flat = 0;             // 0: 旧嵌套 RESP; 1: redis-cli 扁平 RESP
+    memset(ctx->resp_tokens, 0, sizeof(ctx->resp_tokens));
+    ctx->resp_token_count = 0;
     ctx->resp_cmd_start = 0;
     return 0;
 }
@@ -68,12 +69,17 @@ void kvs_ctx_free(kvs_conn_ctx_t *ctx) {
     ctx->resp_sent = 0;
     ctx->send_pending = 0;
 #endif
-    // ===== 释放 RESP 临时缓冲区 =====
-    if (ctx->resp_temp_buffer) {
-        free(ctx->resp_temp_buffer);
-        ctx->resp_temp_buffer = NULL;
+    // ===== 释放 RESP 已解析 token =====
+    if (ctx->resp_token_count > 0) {
+        int i;
+        for (i = 0; i < ctx->resp_token_count; i++) {
+            if (ctx->resp_tokens[i]) {
+                free(ctx->resp_tokens[i]);
+                ctx->resp_tokens[i] = NULL;
+            }
+        }
+        ctx->resp_token_count = 0;
     }
-    ctx->resp_temp_buffer_cap = 0;
     ctx->resp_cmd_start = 0;
     ctx->resp_state = RESP_TOTAL_HEAD;
 }
@@ -120,6 +126,17 @@ void kvs_ctx_consume(kvs_conn_ctx_t *ctx, int consumed) {
 
 
 
+static void resp_free_tokens(kvs_conn_ctx_t *ctx) {
+    int i;
+    for (i = 0; i < ctx->resp_token_count; i++) {
+        if (ctx->resp_tokens[i]) {
+            free(ctx->resp_tokens[i]);
+            ctx->resp_tokens[i] = NULL;
+        }
+    }
+    ctx->resp_token_count = 0;
+}
+
 static void resp_reset_and_consume(kvs_conn_ctx_t *ctx, int consume_len) {
     ctx->resp_state = RESP_TOTAL_HEAD;
     ctx->resp_cmd_num = 0;
@@ -128,20 +145,23 @@ static void resp_reset_and_consume(kvs_conn_ctx_t *ctx, int consume_len) {
     ctx->resp_scmd_unit_idx = 0;
     ctx->resp_token_len = 0;
     ctx->resp_cmd_start = 0;
-    if (ctx->resp_temp_buffer) {
-        free(ctx->resp_temp_buffer);
-        ctx->resp_temp_buffer = NULL;
-        ctx->resp_temp_buffer_cap = 0;
-    }
+    ctx->resp_flat = 0;
+    resp_free_tokens(ctx);
     if (consume_len <= 0) consume_len = 1;  // 至少跳 1 字节，避免死循环
     kvs_ctx_consume(ctx, consume_len);
 }
 
 /*
-// 解析器收到的数据
-*2\r\n                          // ← 外层数组，2个元素
-*3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n  // ← 元素1：数组
-*2\r\n $3\r\nGET\r\n $1\r\na\r\n             // ← 元素2：数组
+// 解析器收到的数据（两种格式）
+// 1) 旧嵌套格式（本项目客户端 / 主从心跳）
+//    *2\r\n                          // ← 外层数组，2个元素（2条命令）
+//    *3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n  // ← 元素1：数组
+//    *2\r\n $3\r\nGET\r\n $1\r\na\r\n             // ← 元素2：数组
+// 2) redis-cli 扁平格式（一个数组就是一条命令）
+//    *3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n
+// 区分方法：读完外层 *N\r\n 后探测下一字节：
+//    '$' = 扁平格式（redis-cli，N 个 token 构成一条命令）
+//    '*' = 嵌套格式（旧客户端，外层数组包 N 条命令）
 */
 
 
@@ -212,8 +232,33 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 并更新已处理内容
             p += 2; //跳过\r\n
             processed_data = p - data; // 处理过的数据
-            ctx->resp_cmd_idx = 0;// 当前准备处理第1个命令
-            ctx->resp_state = RESP_CMD_HEAD;    // 可用处理命令头了
+
+            // ===== 探测下一字节，区分请求格式 =====
+            //   redis-cli 扁平 RESP: *N\r\n$len\r\n... （数组就是一条命令）
+            //   旧嵌套 RESP:        *N\r\n*n\r\n... （外层数组包 N 条命令）
+            if (processed_data >= remain) {
+                // 数据还没到（`*N\r\n` 可能就是 buffer 末尾），回退到数组头不消费，等更多数据
+                processed_data = ctx->resp_cmd_start;
+                break;
+            }
+            if (data[processed_data] == '$') {
+                // 扁平格式（redis-cli）：整条数组是一条命令，N 个 token
+                ctx->resp_flat = 1;
+                ctx->resp_scmd_unit_num = ctx->resp_cmd_num;
+                ctx->resp_scmd_unit_idx = 0;
+                ctx->resp_cmd_num = 1;
+                ctx->resp_token_count = 0;
+                ctx->resp_state = RESP_TOKEN;
+            } else if (data[processed_data] == '*') {
+                // 嵌套格式（旧客户端 / 主从心跳）
+                ctx->resp_flat = 0;
+                ctx->resp_cmd_idx = 0;
+                ctx->resp_state = RESP_CMD_HEAD;
+            } else {
+                LOG_INFO("[RESP1] ERROR: unexpected char '%c' after *N\\r\\n\n", data[processed_data]);
+                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
+                break;
+            }
         }
 
         // 4. 然后找第一个cmd，同样检测头*y\r\n，y代表该cmd的token个数，此处循环检测x次
@@ -262,15 +307,9 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             p += 2;
             processed_data = p - data;
 
-            // 分配resp_temp_buffer
-            if (ctx->resp_temp_buffer) {
-                free(ctx->resp_temp_buffer);
-                ctx->resp_temp_buffer = NULL;
-            }
-            ctx->resp_temp_buffer_cap = 1024;
-            ctx->resp_temp_buffer = malloc(ctx->resp_temp_buffer_cap);
-            if (!ctx->resp_temp_buffer) return -1;
-            ctx->resp_temp_buffer[0] = '\0';
+            // 开始解析本条命令的 token
+            resp_free_tokens(ctx);
+            ctx->resp_token_count = 0;
             ctx->resp_state = RESP_TOKEN;
         }
 
@@ -309,7 +348,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             ctx->resp_state = RESP_DATA;
         }
 
-        // 开始存储数据进resp_temp_buffer：SET a 1
+        // 开始存储 token：支持含空格的值，直接保存 token 指针数组
         if (ctx->resp_state == RESP_DATA) {
             p = data + processed_data;
             left = remain - processed_data;
@@ -317,32 +356,13 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 如果剩余数据小于token长度+2,说明数据不够
             if (left < ctx->resp_token_len + 2) break;
 
-            // 创建一个token内存
-            char *token = malloc(ctx->resp_token_len + 1);
-            if (!token) return -1;
-            memcpy(token, p, ctx->resp_token_len); // 把从p开始的resp_token_len长度数据拷贝到token中
-            token[ctx->resp_token_len] = '\0';  // 确保token以\0结尾
-
-            // 把数据追加到resp_temp_buffer
-            if (ctx->resp_temp_buffer) {
-                size_t cur = strlen(ctx->resp_temp_buffer);
-                size_t need = cur + ctx->resp_token_len + 2;
-                // 如果需求的内存比临时缓冲区的容量大，那么扩大容量
-                if (need >= (size_t)ctx->resp_temp_buffer_cap) {
-                    while (need >= (size_t) ctx->resp_temp_buffer_cap) {
-                        ctx->resp_temp_buffer_cap *= 2;
-                    }
-                    char *nb = realloc(ctx->resp_temp_buffer, ctx->resp_temp_buffer_cap);
-                    if (!nb) {free(token); return -1;}
-                    ctx->resp_temp_buffer = nb;
-                }
-                // 如果当前resp_temp_buffer不为空，就把token拼接到一起
-                if (cur > 0) {
-                    strncat(ctx->resp_temp_buffer, " ", ctx->resp_temp_buffer_cap - cur - 1);
-                }
-                strncat(ctx->resp_temp_buffer, token, ctx->resp_temp_buffer_cap - strlen(ctx->resp_temp_buffer) - 1);
+            if (ctx->resp_token_count < KVS_MAX_TOKENS) {
+                char *token = malloc(ctx->resp_token_len + 1);
+                if (!token) return -1;
+                memcpy(token, p, ctx->resp_token_len); // 把从p开始的resp_token_len长度数据拷贝到token中
+                token[ctx->resp_token_len] = '\0';  // 确保token以\0结尾
+                ctx->resp_tokens[ctx->resp_token_count++] = token;
             }
-            free(token);
             // 跳过token_len 的数据后再跳过 \r\n
             p += ctx->resp_token_len + 2;
             processed_data = p - data;
@@ -353,34 +373,16 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // 如果所有没读完，单条读完了，就执行单条的，并读下一个cmd 的RESP_CMD_HEAD
             if (ctx->resp_scmd_unit_idx >= ctx->resp_scmd_unit_num){
                 int exec_ret = 0;
-                // 执行命令（用 resp_temp_buffer）
-                if (ctx->resp_temp_buffer && strlen(ctx->resp_temp_buffer) > 0) {
-                    char *tokens[KVS_MAX_TOKENS] = {0};
-                    char *saveptr;
-                    char *token_str = strtok_r(ctx->resp_temp_buffer, " ", &saveptr);
-                    int i = 0;
-                    while (token_str && i < KVS_MAX_TOKENS) {
-                        tokens[i++] = token_str;
-                        token_str = strtok_r(NULL, " ", &saveptr);
-                    }
-                    exec_ret = kvs_filter_protocol(fd, tokens, i, NULL);
+                // 执行命令（直接使用 token 指针数组，避免含空格的值被拆碎）
+                if (ctx->resp_token_count > 0) {
+                    exec_ret = kvs_filter_protocol(fd, ctx->resp_tokens, ctx->resp_token_count, NULL);
                 }
-                #if 0
-                // ===== 命令执行失败：跳过当前命令 =====
-                if (exec_ret < 0) {
-                    printf("[RESP] skip bad cmd: start=%d, end=%d, remain=%d\n",
-                        ctx->resp_cmd_start, processed_data,
-                        ctx->cmd_buffer_len - processed_data);
-                    resp_reset_and_consume(ctx, processed_data);
-                    continue;
-                }
-                #else
                 if (exec_ret < 0) {
                     int bad_cmd_len = processed_data - ctx->resp_cmd_start;
-                    LOG_INFO("[RESP] skip bad cmd: start=%d, end=%d, cmd_len=%d, tokens='%s'\n",
+                    LOG_INFO("[RESP] skip bad cmd: start=%d, end=%d, cmd_len=%d, token0='%s'\n",
                         ctx->resp_cmd_start, processed_data, bad_cmd_len,
-                        ctx->resp_temp_buffer ? ctx->resp_temp_buffer : "(null)");
-                    
+                        ctx->resp_token_count > 0 ? ctx->resp_tokens[0] : "(null)");
+
                     // 重置状态机
                     ctx->resp_state = RESP_TOTAL_HEAD;
                     ctx->resp_cmd_num = 0;
@@ -389,25 +391,13 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                     ctx->resp_scmd_unit_idx = 0;
                     ctx->resp_token_len = 0;
                     ctx->resp_cmd_start = 0;
-                    
-                    if (ctx->resp_temp_buffer) {
-                        free(ctx->resp_temp_buffer);
-                        ctx->resp_temp_buffer = NULL;
-                        ctx->resp_temp_buffer_cap = 0;
-                    }
-                    
+                    resp_free_tokens(ctx);
+
                     // 不 consume，继续循环
                     continue;
                 }
-                #endif
 
-                // 释放 resp_temp_buffer
-                if (ctx->resp_temp_buffer) {
-                    free(ctx->resp_temp_buffer);
-                    ctx->resp_temp_buffer = NULL;
-                    ctx->resp_temp_buffer_cap = 0;
-                }
-                
+                resp_free_tokens(ctx);
                 ctx->resp_cmd_idx++;
                 if (ctx->resp_cmd_idx >= ctx->resp_cmd_num) {
                     ctx->resp_state = RESP_TOTAL_HEAD;
