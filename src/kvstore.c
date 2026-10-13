@@ -4,8 +4,6 @@
 
 
 
-extern kvs_array_t global_array;
-extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t global_hash;
 extern kvs_skiptable_t global_skiptable;
 
@@ -28,8 +26,6 @@ void kvs_free(void *ptr) {
 
 
 const char *command[] = {
-    "SET", "GET", "DEL", "MOD", "EXIST",
-    "RSET", "RGET", "RDEL", "RMOD", "REXIST",
     "HSET", "HGET", "HDEL", "HMOD", "HEXIST",
     "SSET", "SGET", "SDEL", "SMOD", "SEXIST",
     "SAVE", "SYNC"
@@ -38,20 +34,8 @@ const char *command[] = {
 
 enum {
     KVS_CMD_START = 0,
-    //array
-    KVS_CMD_SET = KVS_CMD_START,
-    KVS_CMD_GET,
-    KVS_CMD_DEL,
-    KVS_CMD_MOD,
-    KVS_CMD_EXIST,
-    // rbtree
-    KVS_CMD_RSET,
-    KVS_CMD_RGET,
-    KVS_CMD_RDEL,
-    KVS_CMD_RMOD,
-    KVS_CMD_REXIST,
 	// hash
-	KVS_CMD_HSET,
+	KVS_CMD_HSET = KVS_CMD_START,
 	KVS_CMD_HGET,
 	KVS_CMD_HDEL,
 	KVS_CMD_HMOD,
@@ -119,8 +103,20 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 // 进行协议数据过滤
     if (tokens == NULL || count == 0) return -1;
     // 移除 response == NULL 的检查
-    // ===== 新增：忽略 PING/PONG 心跳命令 =====
+    // ===== PING/PONG =====
+    //   redis-cli 扁平请求: 回复 +PONG（标准 RESP）
+    //   旧嵌套格式（主从心跳）: 保持静默，避免从机把响应误当 AOF 内容写入
     if (strcmp(tokens[0], "PING") == 0 || strcmp(tokens[0], "PONG") == 0) {
+#if ENABLE_REPBUF
+        if (fd >= 0 && fd < MAX_CONN) {
+            kvs_conn_ctx_t *pctx = &kvs_conn_ctxs[fd];
+            if (pctx->resp_flat) {
+                const char *pong = "+PONG\r\n";
+                resp_buf_append(pctx, pong, (int)strlen(pong));
+                pctx->send_pending = 1;
+            }
+        }
+#endif
         return 0;  // 直接返回，不处理
     }
     // 来自 AOF 同步的命令，不需要响应
@@ -169,8 +165,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     if (cmd >= KVS_CMD_COUNT) {
         // printf("[ERROR] unknown command token: '%s'\n", tokens[0]);
 
-        const char *err = "error: unknown command\r\n";
-        int err_len = strlen(err);
+        char err[256];
+        int err_len = snprintf(err, sizeof(err), "-ERR unknown command '%s'\r\n", tokens[0]);
+        if (err_len < 0) err_len = 0;
+        if (err_len >= (int)sizeof(err)) err_len = (int)sizeof(err) - 1;
         if (ctx != NULL) {
             resp_buf_append(ctx, err, err_len);
             ctx->send_pending = 1;
@@ -191,7 +189,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     int ret = 0;
     char *key = NULL;
     char *value = NULL;
-    char *result = NULL;
 
     // ===== 关键：根据 count 判断是否有 key 和 value =====
     if (count > 1) key = tokens[1];
@@ -224,201 +221,68 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 
 
     switch (cmd) {
-#if ENABLE_ARRAY
-        case KVS_CMD_SET:
-            ret = kvs_array_set(&global_array, key, value);
-            if (ret < 0) {
-                SAFE_APPEND("set error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("SET", key, value);  // 追加AOF
-
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("SET", key, value);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_GET:{
-            result = kvs_array_get(&global_array, key);
-            if (result == NULL) {
-                SAFE_APPEND("no exist\r\n");
-            } else {
-                SAFE_APPEND("%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_DEL:
-            ret = kvs_array_del(&global_array, key);
-            if (ret < 0) {
-                SAFE_APPEND("error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("DEL", key, NULL);  // 追加AOF
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("DEL", key, NULL);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_MOD:
-            ret = kvs_array_mod(&global_array, key, value);
-            if (ret < 0) {
-                SAFE_APPEND("error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("MOD", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("MOD", key, value);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-        case KVS_CMD_EXIST:
-            ret = kvs_array_exist(&global_array, key);
-            if (ret == 0) {
-                SAFE_APPEND("exist\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-#endif
-#if ENABLE_RBTREE
-        case KVS_CMD_RSET:
-            ret = kvs_rbtree_set(&global_rbtree, key, value);
-            if (ret < 0) {
-                SAFE_APPEND("set error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("RSET", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("RSET", key, value);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_RGET:{
-            char *result = kvs_rbtree_get(&global_rbtree, key);
-            if (result == NULL) {
-                SAFE_APPEND("no exist\r\n");
-            } else {
-                SAFE_APPEND("%s\r\n", result);
-            }
-            break;
-        }
-        case KVS_CMD_RDEL:
-            ret = kvs_rbtree_del(&global_rbtree, key);
-            if (ret < 0) {
-                SAFE_APPEND("error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("RDEL", key, NULL);  // 追加AOF
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("RDEL", key, NULL);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-
-        case KVS_CMD_RMOD:
-            ret = kvs_rbtree_mod(&global_rbtree, key, value);
-            if (ret < 0) {
-                SAFE_APPEND("error\r\n");
-            } else if (ret == 0) {
-                if (!is_aof_sync) append_aof("RMOD", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
-                    master_aof_immediate("RMOD", key, value);
-                }
-                SAFE_APPEND("ok\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-        case KVS_CMD_REXIST:
-            ret = kvs_rbtree_exist(&global_rbtree, key);
-            if (ret == 0) {
-                SAFE_APPEND("exist\r\n");
-            } else {
-                SAFE_APPEND("no exist\r\n");
-            }
-            break;
-#endif
 #if ENABLE_HASH
         case KVS_CMD_HSET:
             ret = kvs_hash_set(&global_hash ,key, value);
             if (ret < 0) {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HSET", key, value);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
-                SAFE_APPEND("exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
             } 
             
             break;
         case KVS_CMD_HGET: {
             char *result = kvs_hash_get(&global_hash, key);
             if (result == NULL) {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND("$-1\r\n");     // 空值
             } else {
-                SAFE_APPEND("%s\r\n", result);
+                SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
             break;
         }
         case KVS_CMD_HDEL:
             ret = kvs_hash_del(&global_hash ,key);
             if (ret < 0) {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HDEL", key, NULL);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 不存在 → 0
             }
             break;
         case KVS_CMD_HMOD:
             ret = kvs_hash_mod(&global_hash ,key, value);
             if (ret < 0) {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HMOD", key, value);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND("+OK\r\n");
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND("-ERR no such key\r\n");
             }
             break;
         case KVS_CMD_HEXIST:
             ret = kvs_hash_exist(&global_hash ,key);
             if (ret == 0) {
-                SAFE_APPEND("exist\r\n");
+                SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 不存在 → 0
             }
             break;
 #endif
@@ -426,65 +290,65 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         case KVS_CMD_SSET:
             ret = kvs_skiptable_set(&global_skiptable, key, value);
             if (ret < 0) {
-                SAFE_APPEND("set error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SSET", key, value);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
-                SAFE_APPEND("exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
             }
             break;
 
         case KVS_CMD_SGET:{
             char *result = kvs_skiptable_get(&global_skiptable, key);
             if (result == NULL) {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND("$-1\r\n");     // 空值
             } else {
-                SAFE_APPEND("%s\r\n", result);
+                SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
             break;
         }
         case KVS_CMD_SDEL:
             ret = kvs_skiptable_del(&global_skiptable, key);
             if (ret < 0) {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SDEL", key, NULL);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 不存在 → 0
             }
             break;
 
         case KVS_CMD_SMOD:
             ret = kvs_skiptable_mod(&global_skiptable, key, value);
             if (ret < 0) {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
                 if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SMOD", key, value);
                 }
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND("+OK\r\n");
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND("-ERR no such key\r\n");
             }
             break;
         case KVS_CMD_SEXIST:
             ret = kvs_skiptable_exist(&global_skiptable, key);
             if (ret == 0) {
-                SAFE_APPEND("exist\r\n");
+                SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {
-                SAFE_APPEND("no exist\r\n");
+                SAFE_APPEND(":0\r\n");      // 不存在 → 0
             }
             break;
 #endif
@@ -494,18 +358,18 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         case KVS_CMD_SAVE:
             // SAVE 只在 SNAP 模式有效
             if (!g_config.snap_enable) {
-                SAFE_APPEND("error: SAVE only in SNAP mode\r\n");
+                SAFE_APPEND("-ERR SAVE only in SNAP mode\r\n");
                 break;
             }
             ret = save_snapshots();
             // 如果是从机的 SAVE 请求，发送 SNAP
             if (g_config.snap_enable && is_slave_save(fd)) {
                 send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
-                // SAFE_APPEND("ok\r\n");
+                // SAFE_APPEND("+OK\r\n");
                 break;
             }
 
-            SAFE_APPEND(ret == 0 ? "ok\r\n" : "error\r\n");
+            SAFE_APPEND(ret == 0 ? "+OK\r\n" : "-ERR save failed\r\n");
             break;
 #else
         case KVS_CMD_SAVE:
@@ -515,9 +379,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 FILE *fp = fopen(AOF_FILE, "w"); // w模式会清空文件内容
                 if (fp) fclose(fp);
 
-                SAFE_APPEND("ok\r\n");
+                SAFE_APPEND("+OK\r\n");
             } else {
-                SAFE_APPEND("error\r\n");
+                SAFE_APPEND("-ERR save failed\r\n");
             }
             break;
 #endif
@@ -538,7 +402,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             LOG_INFO("[ERROR] unhandled cmd=%d, token='%s'\n", cmd, tokens[0]);
             // 发送错误响应给客户端
             if (ctx != NULL) {
-                const char *err = "error: unhandled command\r\n";
+                const char *err = "-ERR unhandled command\r\n";
                 resp_buf_append(ctx, err, strlen(err));
                 ctx->send_pending = 1;
             }
@@ -673,12 +537,6 @@ int init_kvengine(void) {
     }
 #endif
 
-#if ENABLE_ARRAY
-    memset(&global_array, 0, sizeof(kvs_array_t));
-    kvs_array_create(&global_array);
-    // printf("Array created\n");
-#endif
-
 #if ENABLE_HASH
 	memset(&global_hash, 0, sizeof(kvs_hash_t));
 	kvs_hash_create(&global_hash);
@@ -689,12 +547,6 @@ int init_kvengine(void) {
 	memset(&global_skiptable, 0, sizeof(kvs_skiptable_t));
 	kvs_skiptable_create(&global_skiptable);
     // printf("skiptable created\n");
-#endif
-
-#if ENABLE_RBTREE
-    memset(&global_rbtree, 0, sizeof(kvs_rbtree_t));
-    kvs_rbtree_create(&global_rbtree);
-    // printf("Rbtree created\n");
 #endif
 
 LOG_INFO("------------ 2. kvs_engine created ----\n");
@@ -761,12 +613,6 @@ void dest_kvengine(void) {
 #if ENABLE_PERSIST
     /* Drain/stop AOF before destroying the KV engine. */
     persistence_shutdown();
-#endif
-#if ENABLE_ARRAY
-    kvs_array_destory(&global_array);
-#endif
-#if ENABLE_RBTREE
-    kvs_rbtree_destory(&global_rbtree);
 #endif
 #if ENABLE_HASH
 	kvs_hash_destory(&global_hash);
@@ -896,7 +742,7 @@ int main(int argc, char *argv[]) {
     if (check_datafile_exist()== -1) return -1;
 #endif
 
-    // 用于创建kv存储全局单例内存块global_array
+    // 用于创建kv存储全局单例内存块
     init_kvengine();
 
     if (g_config.role == ROLE_SLAVE) {
