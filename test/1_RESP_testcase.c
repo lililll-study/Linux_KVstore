@@ -728,20 +728,20 @@ static void verify_single_key(int connfd, const char *key, const char *expect) {
 }
 
 /* ============================================================
- * Part 3：20 万数据（2 引擎 × 10 万）
+ * Part 3：100 万数据（2 引擎 × 50 万）
  * ============================================================ */
-#define PER_ENGINE_100K  100000
+#define PER_ENGINE_500K  500000
 
-void insert_200k(int connfd) {
+void insert_1m(int connfd) {
     int e;
     for (e = 0; e < ENGINE_COUNT; e++) {
-        int cap = PER_ENGINE_100K * 80;
+        int cap = PER_ENGINE_500K * 80;
         char *batch = malloc(cap);
         char *resp  = malloc(cap);
         int blen = 0;
         int i;
 
-        for (i = 0; i < PER_ENGINE_100K; i++) {
+        for (i = 0; i < PER_ENGINE_500K; i++) {
             char key[64], value[64];
             snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
             snprintf(value, sizeof(value), "val_%06d", i);
@@ -751,30 +751,30 @@ void insert_200k(int connfd) {
         struct timeval tv_begin, tv_cur;
         gettimeofday(&tv_begin, NULL);
 
-        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_100K);
+        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_500K);
 
         gettimeofday(&tv_cur, NULL);
         int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
-        printf("[Insert 100k] %-10s %d: %d ms, qps=%d\n",
-               engine_name[e], PER_ENGINE_100K, time_used,
-               PER_ENGINE_100K * 1000 / (time_used > 0 ? time_used : 1));
+        printf("[Insert 500k] %-10s %d: %d ms, qps=%d\n",
+               engine_name[e], PER_ENGINE_500K, time_used,
+               PER_ENGINE_500K * 1000 / (time_used > 0 ? time_used : 1));
 
         free(batch);
         free(resp);
     }
 }
 
-void delete_200k(int connfd) {
+void delete_1m(int connfd) {
     int e;
     for (e = 0; e < ENGINE_COUNT; e++) {
-        int cap = PER_ENGINE_100K * 80;
+        int cap = PER_ENGINE_500K * 80;
         char *batch = malloc(cap);
         char *resp  = malloc(cap);
         int blen = 0;
         int i;
 
-        for (i = 0; i < PER_ENGINE_100K; i++) {
+        for (i = 0; i < PER_ENGINE_500K; i++) {
             char key[64];
             snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
             blen = append_resp_cmd(batch, blen, engine_del_cmd[e], key, NULL);
@@ -783,14 +783,14 @@ void delete_200k(int connfd) {
         struct timeval tv_begin, tv_cur;
         gettimeofday(&tv_begin, NULL);
 
-        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_100K);
+        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_500K);
 
         gettimeofday(&tv_cur, NULL);
         int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
-        printf("[Delete 100k] %-10s %d: %d ms, qps=%d\n",
-               engine_name[e], PER_ENGINE_100K, time_used,
-               PER_ENGINE_100K * 1000 / (time_used > 0 ? time_used : 1));
+        printf("[Delete 500k] %-10s %d: %d ms, qps=%d\n",
+               engine_name[e], PER_ENGINE_500K, time_used,
+               PER_ENGINE_500K * 1000 / (time_used > 0 ? time_used : 1));
 
         free(batch);
         free(resp);
@@ -809,8 +809,8 @@ int main(int argc, char *argv[]) {
         printf("    3  mixed_ops      管道化 + 交叉\n");
         printf("    4  staged_ops     管道化 + 集中\n");
         printf("    5  批量 SET/GET (每引擎 BATCH_COUNT 条)\n");
-        printf("    6  插入 20w (2 引擎 x 10w)\n");
-        printf("    7  删除 20w (2 引擎 x 10w)\n");
+        printf("    6  插入 100w (2 引擎 x 50w)\n");
+        printf("    7  删除 100w (2 引擎 x 50w)\n");
         printf("   10  错误格式测试 (SSET → SMOD缺参 → SDELX未知命令 → SGET校验)\n");
         printf("  engine: 0=Hash 1=Skiptable (-1=全部引擎)\n");
         return 0;
@@ -857,10 +857,10 @@ int main(int argc, char *argv[]) {
         }
         break;
     case 6:
-        insert_200k(connfd);
+        insert_1m(connfd);
         break;
     case 7:
-        delete_200k(connfd);
+        delete_1m(connfd);
         break;
     case 10:
         error_test_phase1_correct_sset(connfd, 10000);
