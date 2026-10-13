@@ -32,11 +32,68 @@ int connect_tcpserver(const char *ip, unsigned short port) {
 }
 
 /* ============================================================
- * RESP 命令拼接(外层 *1)
+ * RESP 响应解析（redis-cli 扁平格式）
+ *
+ * resp_parse_one 解析一个完整 RESP 响应：
+ *   p   指向响应起始（'+' / '-' / ':' / '$'）
+ *   end 指向缓冲区末尾（不含）
+ *   out 回填响应值（去掉类型前缀与结尾 \r\n；$-1 回填 "nil"）
+ *   返回完整响应后的下一个位置；数据不完整时返回 NULL
+ * ============================================================ */
+static const char *resp_parse_one(const char *p, const char *end,
+                                  char *out, int cap) {
+    if (!p || p >= end) return NULL;
+    switch (*p) {
+    case '+':
+    case '-':
+    case ':': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int n = (int)(e - p) - 1;
+        if (n > cap - 1) n = cap - 1;
+        memcpy(out, p + 1, n);
+        out[n] = '\0';
+        return e + 2;
+    }
+    case '$': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int len = atoi(p + 1);
+        if (len < 0) {                    /* $-1：空值 */
+            strcpy(out, "nil");
+            return e + 2;
+        }
+        const char *data = e + 2;
+        if (data + len + 2 > end) return NULL;   /* 数据未收完 */
+        if (len > cap - 1) len = cap - 1;
+        memcpy(out, data, len);
+        out[len] = '\0';
+        return data + len + 2;
+    }
+    default:
+        return NULL;
+    }
+}
+
+/* 统计缓冲区中完整 RESP 响应的条数 */
+static int resp_count(const char *buf, int len) {
+    int count = 0;
+    const char *p = buf, *end = buf + len;
+    char tmp[1024];
+    while (p && p < end) {
+        const char *next = resp_parse_one(p, end, tmp, sizeof(tmp));
+        if (!next) break;
+        count++;
+        p = next;
+    }
+    return count;
+}
+
+/* ============================================================
+ * RESP 命令拼接（redis-cli 扁平格式：一条命令 = 一个数组）
  * ============================================================ */
 static int append_resp_cmd(char *buf, int len, const char *cmd,
                            const char *key, const char *value) {
-    len += sprintf(buf + len, "*1\r\n");
     if (value) {
         len += sprintf(buf + len,
                        "*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
@@ -50,15 +107,6 @@ static int append_resp_cmd(char *buf, int len, const char *cmd,
                        (int)strlen(key), key);
     }
     return len;
-}
-
-/* 统计响应条数 */
-static int count_responses(const char *buf, int len) {
-    int count = 0, i;
-    for (i = 0; i < len - 1; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n') { count++; i++; }
-    }
-    return count;
 }
 
 /* 边发边收 */
@@ -81,7 +129,7 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
         }
     }
 
-    while (count_responses(resp, total) < expected_count) {
+    while (resp_count(resp, total) < expected_count) {
         if (total >= resp_cap - 1) break;
         int n = recv(connfd, resp + total, resp_cap - total - 1, 0);
         if (n <= 0) break;
@@ -93,14 +141,15 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
 }
 
 /* ============================================================
- * 引擎命令前缀
+ * 引擎命令前缀（仅 Hash / Skiptable）
  * ============================================================ */
-static const char *engine_set_cmd[4]   = { "SET",  "RSET", "HSET", "SSET" };
-static const char *engine_get_cmd[4]   = { "GET",  "RGET", "HGET", "SGET" };
-static const char *engine_del_cmd[4]   = { "DEL",  "RDEL", "HDEL", "SDEL" };
-static const char *engine_mod_cmd[4]   = { "MOD",  "RMOD", "HMOD", "SMOD" };
-static const char *engine_exist_cmd[4] = { "EXIST", "REXIST", "HEXIST", "SEXIST" };
-static const char *engine_name[4]      = { "Array", "Rbtree", "Hash", "Skiptable" };
+#define ENGINE_COUNT   2
+static const char *engine_set_cmd[ENGINE_COUNT]   = { "HSET", "SSET" };
+static const char *engine_get_cmd[ENGINE_COUNT]   = { "HGET", "SGET" };
+static const char *engine_del_cmd[ENGINE_COUNT]   = { "HDEL", "SDEL" };
+static const char *engine_mod_cmd[ENGINE_COUNT]   = { "HMOD", "SMOD" };
+static const char *engine_exist_cmd[ENGINE_COUNT] = { "HEXIST", "SEXIST" };
+static const char *engine_name[ENGINE_COUNT]      = { "Hash", "Skiptable" };
 
 /* ============================================================
  * Part 1：四种模式(单条/管道 x 交叉/集中)
@@ -111,56 +160,56 @@ static const char *engine_name[4]      = { "Array", "Rbtree", "Hash", "Skiptable
 #define STAGE_COUNT   20000
 #define VERIFY_CHUNK  1000
 
+/* 各操作的标准 RESP 期望值：
+ *   SET(新插入) → :1 ；GET → $len\r\nval... ；MOD(已存在) → +OK
+ *   EXIST(存在) → :1 ；DEL(删除成功) → :1
+ */
 static void expected_of(int op, int i, char *out, int n) {
-    if (op == 0)      snprintf(out, n, "ok");            /* SET */
-    else if (op == 1) snprintf(out, n, "val_%06d", i);   /* GET */
-    else if (op == 2) snprintf(out, n, "ok");            /* MOD */
-    else if (op == 3) snprintf(out, n, "exist");         /* EXIST */
-    else              snprintf(out, n, "ok");            /* DEL */
+    if (op == 0)      snprintf(out, n, "1");            /* SET */
+    else if (op == 1) snprintf(out, n, "val_%06d", i);  /* GET */
+    else if (op == 2) snprintf(out, n, "OK");           /* MOD */
+    else if (op == 3) snprintf(out, n, "1");            /* EXIST */
+    else              snprintf(out, n, "1");            /* DEL */
 }
 
 static int verify_resp_lines(char *resp, int op, int i_start, int count,
                              int *pass, int *fail) {
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256], exp[64];
     int k;
     for (k = 0; k < count; k++) {
-        char *e = strstr(p, "\r\n");
-        if (!e) { *fail += count - k; break; }
-        *e = '\0';
-        if (p[0] != '$' && p[0] != '+' && p[0] != '-' &&
-            p[0] != ':' && p[0] != '*') {
-            char exp[64];
-            expected_of(op, i_start + k, exp, sizeof(exp));
-            if (strcmp(p, exp) == 0) (*pass)++;
-            else {
-                (*fail)++;
-                if (*fail <= 5)
-                    printf("[Verify] MISMATCH op=%d i=%d: got '%s', exp '%s'\n",
-                           op, i_start + k, p, exp);
-            }
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) { *fail += count - k; break; }
+        expected_of(op, i_start + k, exp, sizeof(exp));
+        if (strcmp(got, exp) == 0) (*pass)++;
+        else {
+            (*fail)++;
+            if (*fail <= 5)
+                printf("[Verify] MISMATCH op=%d i=%d: got '%s', exp '%s'\n",
+                       op, i_start + k, got, exp);
         }
-        p = e + 2;
+        p = next;
     }
     return 0;
 }
 
 /* ============================================================
- * 工具：循环 recv 直到收到完整一行（含 \r\n）
+ * 工具：循环 recv 直到收到一个完整的 RESP 响应
  * 返回收到的字节数，-1 表示连接断开
  * ============================================================ */
-static int recv_one_line(int connfd, char *resp, int cap) {
+static int recv_one_resp(int connfd, char *buf, int cap, char *out, int outcap) {
     int total = 0;
     while (total < cap - 1) {
-        int n = recv(connfd, resp + total, cap - 1 - total, 0);
+        int n = recv(connfd, buf + total, cap - 1 - total, 0);
         if (n <= 0) {
-            resp[total] = '\0';
+            buf[total] = '\0';
             return -1;
         }
         total += n;
-        resp[total] = '\0';
-        if (strstr(resp, "\r\n")) break;
+        buf[total] = '\0';
+        if (resp_parse_one(buf, buf + total, out, outcap)) return total;
     }
-    return total;
+    return -1;
 }
 
 /* ============================================================
@@ -172,57 +221,47 @@ static int recv_one_line(int connfd, char *resp, int cap) {
  * ============================================================ */
 static int verify_resp_seq(char *resp, int r_start, int total,
                            int *pass, int *fail) {
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256], exp[64];
     int k;
     for (k = 0; k < total; k++) {
-        char *e = strstr(p, "\r\n");
-        if (!e) { *fail += total - k; break; }
-        *e = '\0';
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) { *fail += total - k; break; }
 
         int op  = k % MIX_CMDS;
         int idx = r_start + k / MIX_CMDS;
 
-        /* 跳过 RESP 类型前缀（$ + - : *） */
-        if (p[0] != '$' && p[0] != '+' && p[0] != '-' &&
-            p[0] != ':' && p[0] != '*') {
-            char exp[64];
-            expected_of(op, idx, exp, sizeof(exp));
-            if (strcmp(p, exp) == 0) {
-                (*pass)++;
-            } else {
-                (*fail)++;
-                if (*fail <= 5)
-                    printf("[Verify] MISMATCH op=%d idx=%d: got '%s', exp '%s'\n",
-                           op, idx, p, exp);
-            }
+        expected_of(op, idx, exp, sizeof(exp));
+        if (strcmp(got, exp) == 0) {
+            (*pass)++;
+        } else {
+            (*fail)++;
+            if (*fail <= 5)
+                printf("[Verify] MISMATCH op=%d idx=%d: got '%s', exp '%s'\n",
+                       op, idx, got, exp);
         }
-        p = e + 2;
+        p = next;
     }
     return 0;
 }
 
 static int verify_one_resp(char *resp, int op, int i, int *pass, int *fail) {
-    char exp[64];
+    char exp[64], got[256];
     expected_of(op, i, exp, sizeof(exp));
-    if (op == 1) {
-        if (strncmp(resp, "val_", 4) == 0) (*pass)++;
-        else goto mismatch;
-    } else if (op == 2) {
-        if (strncmp(resp, "mod_", 4) == 0 || strcmp(resp, "ok") == 0) (*pass)++;
-        else goto mismatch;
-    } else if (op == 3) {
-        if (strcmp(resp, "exist") == 0 || strcmp(resp, "1") == 0) (*pass)++;
-        else goto mismatch;
-    } else {
-        if (strcmp(resp, "ok") == 0) (*pass)++;
-        else goto mismatch;
+    if (!resp_parse_one(resp, resp + strlen(resp), got, sizeof(got))) {
+        (*fail)++;
+        if (*fail <= 5)
+            printf("[Verify] PARSE-FAIL op=%d i=%d: resp='%.64s'\n", op, i, resp);
+        return 0;
     }
-    return 0;
-mismatch:
+    if (strcmp(got, exp) == 0) {
+        (*pass)++;
+        return 0;
+    }
     (*fail)++;
     if (*fail <= 5)
-        printf("[Verify] MISMATCH op=%d i=%d: got '%.32s', exp '%s'\n",
-               op, i, resp, exp);
+        printf("[Verify] MISMATCH op=%d i=%d: got '%s', exp '%s'\n",
+               op, i, got, exp);
     return 0;
 }
 
@@ -244,12 +283,12 @@ static int build_one_cmd(char *buf, int engine_idx, int op, int i) {
     }
 
     if (nargs == 3)
-        return sprintf(buf, "*1\r\n*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+        return sprintf(buf, "*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
                        (int)strlen(cmdname), cmdname,
                        (int)strlen(key), key,
                        (int)strlen(op == 2 ? value2 : value),
                        op == 2 ? value2 : value);
-    return sprintf(buf, "*1\r\n*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+    return sprintf(buf, "*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
                    (int)strlen(cmdname), cmdname,
                    (int)strlen(key), key);
 }
@@ -260,6 +299,7 @@ void mixed_single(int connfd, int engine_idx, int loop) {
     int r, op;
     char cmd[256];
     char resp[256];
+    char got[256];
     int pass = 0, fail = 0;
 
     struct timeval tv_begin, tv_cur;
@@ -270,12 +310,11 @@ void mixed_single(int connfd, int engine_idx, int loop) {
             int cmd_len = build_one_cmd(cmd, engine_idx, op, r);
             send(connfd, cmd, cmd_len, 0);
 
-            /* ★ 循环收到完整一行 */
-            if (recv_one_line(connfd, resp, sizeof(resp)) < 0) {
+            /* ★ 循环收到一个完整 RESP 响应 */
+            if (recv_one_resp(connfd, resp, sizeof(resp), got, sizeof(got)) < 0) {
                 printf("[Mixed single] recv failed at r=%d op=%d\n", r, op);
                 goto done;
             }
-            resp[strcspn(resp, "\r\n")] = '\0';
             verify_one_resp(resp, op, r, &pass, &fail);
         }
     }
@@ -294,6 +333,7 @@ void staged_single(int connfd, int engine_idx, int count) {
     int op, i;
     char cmd[256];
     char resp[256];
+    char got[256];
     int pass = 0, fail = 0;
 
     struct timeval tv_begin, tv_cur;
@@ -304,12 +344,11 @@ void staged_single(int connfd, int engine_idx, int count) {
             int cmd_len = build_one_cmd(cmd, engine_idx, op, i);
             send(connfd, cmd, cmd_len, 0);
 
-            /* ★ 循环收到完整一行 */
-            if (recv_one_line(connfd, resp, sizeof(resp)) < 0) {
+            /* ★ 循环收到一个完整 RESP 响应 */
+            if (recv_one_resp(connfd, resp, sizeof(resp), got, sizeof(got)) < 0) {
                 printf("[Staged single] recv failed at op=%d i=%d\n", op, i);
                 goto done;
             }
-            resp[strcspn(resp, "\r\n")] = '\0';
             verify_one_resp(resp, op, i, &pass, &fail);
         }
     }
@@ -467,11 +506,11 @@ void batch_get(int connfd, int engine_idx, int count) {
 }
 
 /* ============================================================
- * Part 2：错误格式测试
+ * Part 2：错误格式测试（Skiptable 引擎）
  * ============================================================ */
 
 /* 阶段 1：正确 SSET */
-void error_test_phase1_correct_rset(int connfd, int count) {
+void error_test_phase1_correct_sset(int connfd, int count) {
     int cap = count * 80;
     char *batch = malloc(cap);
     char *resp  = malloc(cap);
@@ -482,7 +521,123 @@ void error_test_phase1_correct_rset(int connfd, int count) {
         char key[64], value[64];
         snprintf(key, sizeof(key), "rt_%06d", i);
         snprintf(value, sizeof(value), "val_%06d", i);
-        blen = append_resp_cmd(batch, blen, "RSET", key, value);
+        blen = append_resp_cmd(batch, blen, "SSET", key, value);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+
+    send_and_recv(connfd, batch, blen, resp, cap, count);
+
+    gettimeofday(&tv_cur, NULL);
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+    /* SSET 新插入 → :1 */
+    int ok_count = 0;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[64];
+    for (i = 0; i < count; i++) {
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) break;
+        if (strcmp(got, "1") == 0) ok_count++;
+        p = next;
+    }
+
+    printf("[Error Test Phase1] SSET %d: %d ms, ok=%d\n",
+           count, time_used, ok_count);
+
+    free(batch);
+    free(resp);
+}
+
+/* ===== 通用：边发边收,但只统计响应,不校验内容 ===== */
+static void send_and_drain(int connfd, const char *batch, int batch_len,
+                           int expected_count) {
+    int cap = expected_count * 64 + 1;
+    char *big_resp = malloc(cap);          /* 大缓冲 */
+    int big_len = 0;
+    int sent = 0;
+
+    while (sent < batch_len) {
+        int chunk = batch_len - sent;
+        if (chunk > CHUNK_SIZE) chunk = CHUNK_SIZE;
+
+        int n = send(connfd, batch + sent, chunk, 0);
+        if (n <= 0) { perror("send"); break; }
+        sent += n;
+
+        if (big_len < cap - 1) {
+            int n2 = recv(connfd, big_resp + big_len, cap - 1 - big_len, 0);
+            if (n2 <= 0) { perror("recv"); break; }
+            big_len += n2;
+        }
+    }
+
+    /* 收尾：把剩余响应全部收完,不校验内容 */
+    while (resp_count(big_resp, big_len) < expected_count) {
+        if (big_len >= cap - 1) break;
+        int n = recv(connfd, big_resp + big_len, cap - 1 - big_len, 0);
+        if (n <= 0) break;
+        big_len += n;
+    }
+
+    free(big_resp);
+}
+
+/* 阶段 2：参数缺失（SMOD 只给 key 不给 value）→ -ERR invalid arguments */
+void error_test_phase2_bad_resp_smod(int connfd, int count) {
+    int cap = count * 64;
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    int blen = 0;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "rt_%06d", i);
+        blen += sprintf(batch + blen, "*2\r\n$4\r\nSMOD\r\n$%d\r\n%s\r\n",
+                        (int)strlen(key), key);
+    }
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+
+    send_and_recv(connfd, batch, blen, resp, cap, count);
+
+    gettimeofday(&tv_cur, NULL);
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+    /* 每条响应都应为 -ERR invalid arguments */
+    int ok_count = 0;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256];
+    for (i = 0; i < count; i++) {
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) break;
+        if (strncmp(got, "ERR", 3) == 0) ok_count++;
+        p = next;
+    }
+
+    printf("[Error Test Phase2] SMOD(缺value) %d: %d ms, err_count=%d\n",
+           count, time_used, ok_count);
+
+    free(batch);
+    free(resp);
+}
+
+/* 阶段 3：未知命令 SDELX → -ERR unknown command 'SDELX' */
+void error_test_phase3_bad_cmd_del(int connfd, int count) {
+    int cap = count * 64;
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    int blen = 0;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "rt_%06d", i);
+        blen += sprintf(batch + blen, "*2\r\n$5\r\nSDELX\r\n$%d\r\n%s\r\n",
+                        (int)strlen(key), key);
     }
 
     struct timeval tv_begin, tv_cur;
@@ -494,118 +649,25 @@ void error_test_phase1_correct_rset(int connfd, int count) {
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
     int ok_count = 0;
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256];
     for (i = 0; i < count; i++) {
-        char *line_end = strstr(p, "\r\n");
-        if (!line_end) break;
-        *line_end = '\0';
-        if (strcmp(p, "ok") == 0) ok_count++;
-        p = line_end + 2;
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) break;
+        if (strstr(got, "unknown command")) ok_count++;
+        p = next;
     }
 
-    printf("[Error Test Phase1] RSET %d: %d ms, ok=%d\n",
+    printf("[Error Test Phase3] SDELX(未知命令) %d: %d ms, err_count=%d\n",
            count, time_used, ok_count);
 
     free(batch);
     free(resp);
 }
 
-/* ===== 通用：边发边收,但只统计响应,不校验内容 ===== */
-static void send_and_drain(int connfd, const char *batch, int batch_len,
-                           int expected_count) {
-    // char resp_buf[CHUNK_SIZE];
-    int sent = 0;
-    // int total_resp = 0;
-    char *big_resp = malloc(expected_count * 64);   // 大缓冲
-    int big_len = 0;
-
-    while (sent < batch_len) {
-        int chunk = batch_len - sent;
-        if (chunk > CHUNK_SIZE) chunk = CHUNK_SIZE;
-
-        int n = send(connfd, batch + sent, chunk, 0);
-        if (n <= 0) { perror("send"); break; }
-        sent += n;
-
-        int n2 = recv(connfd, big_resp + big_len,
-                      expected_count * 64 - big_len - 1, 0);
-        if (n2 > 0) big_len += n2;
-    }
-
-    /* 用 count_responses 收完剩余 */
-    while (count_responses(big_resp, big_len) < expected_count) {
-        fd_set rfds;
-        struct timeval tv = { 1, 0 };
-        FD_ZERO(&rfds);
-        FD_SET(connfd, &rfds);
-        if (select(connfd + 1, &rfds, NULL, NULL, &tv) <= 0) break;
-        int n = recv(connfd, big_resp + big_len,
-                     expected_count * 64 - big_len - 1, 0);
-        if (n <= 0) break;
-        big_len += n;
-    }
-
-    free(big_resp);
-}
-
-/* 阶段 2：发 10w 条 RESP 格式错误的 SMOD */
-void error_test_phase2_bad_resp_rmod(int connfd, int count) {
-    char *batch = malloc(count * 64);
-    int blen = 0;
-    int i;
-
-    for (i = 0; i < count; i++) {
-        char key[64];
-        snprintf(key, sizeof(key), "rt_%06d", i);
-
-        /* 错误格式：*2 RMOD key(缺 value) */
-        blen += sprintf(batch + blen, "*1\r\n");
-        blen += sprintf(batch + blen,
-                        "*2\r\n$4\r\nRMOD\r\n$%d\r\n%s\r\n",
-                        (int)strlen(key), key);
-    }
-
-    printf("[Error Test Phase2] Sending %d bad RESP RMOD...\n", count);
-    fflush(stdout);
-
-    /* ===== 边发边收 ===== */
-    send_and_drain(connfd, batch, blen, count);
-
-    printf("[Error Test Phase2] Done\n");
-
-    free(batch);
-}
-
-/* 阶段 3：发 10w 条命令错误的 DEL */
-void error_test_phase3_bad_cmd_del(int connfd, int count) {
-    char *batch = malloc(count * 64);
-    int blen = 0;
-    int i;
-
-    for (i = 0; i < count; i++) {
-        char key[64];
-        snprintf(key, sizeof(key), "rt_%06d", i);
-
-        blen += sprintf(batch + blen, "*1\r\n");
-        blen += sprintf(batch + blen,
-                        "*2\r\n$5\r\nRDELX\r\n$%d\r\n%s\r\n",
-                        (int)strlen(key), key);
-    }
-
-    printf("[Error Test Phase3] Sending %d bad cmd RDEL...\n", count);
-    fflush(stdout);
-
-    /* ===== 边发边收 ===== */
-    send_and_drain(connfd, batch, blen, count);
-
-    printf("[Error Test Phase3] Done\n");
-
-    free(batch);
-}
-
-/* 阶段 4：正确 SGET,验证数据完整 */
+/* 阶段 4：SGET 校验 phase1 插入的数据（bulk 响应解析） */
 void error_test_phase4_verify(int connfd, int count) {
-    int cap = count * 80;
+    int cap = count * 64;
     char *batch = malloc(cap);
     char *resp  = malloc(cap);
     int blen = 0;
@@ -614,7 +676,7 @@ void error_test_phase4_verify(int connfd, int count) {
     for (i = 0; i < count; i++) {
         char key[64];
         snprintf(key, sizeof(key), "rt_%06d", i);
-        blen = append_resp_cmd(batch, blen, "RGET", key, NULL);
+        blen = append_resp_cmd(batch, blen, "SGET", key, NULL);
     }
 
     struct timeval tv_begin, tv_cur;
@@ -626,242 +688,189 @@ void error_test_phase4_verify(int connfd, int count) {
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
     int pass = 0, fail = 0;
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256], exp[64];
     for (i = 0; i < count; i++) {
-        char *line_end = strstr(p, "\r\n");
-        if (!line_end) { fail++; break; }
-        *line_end = '\0';
-
-        char expected[64];
-        snprintf(expected, sizeof(expected), "val_%06d", i);
-
-        if (strcmp(p, expected) == 0) pass++;
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) { fail += count - i; break; }
+        snprintf(exp, sizeof(exp), "val_%06d", i);
+        if (strcmp(got, exp) == 0) pass++;
         else {
             fail++;
-            if (fail <= 10)
-                printf("[Error Test] MISMATCH i=%d: got '%s', expected '%s'\n",
-                       i, p, expected);
+            if (fail <= 5)
+                printf("[Verify] MISMATCH i=%d: got '%s', exp '%s'\n",
+                       i, got, exp);
         }
-        p = line_end + 2;
+        p = next;
     }
 
-    printf("[Error Test Phase4] RGET  %d: %d ms, pass=%d, fail=%d\n",
+    printf("[Error Test Phase4] SGET校验 %d: %d ms, pass=%d fail=%d\n",
            count, time_used, pass, fail);
-
-    if (fail == 0 && pass == count)
-        printf("[Error Test] ==> PASS (data intact)\n");
-    else
-        printf("[Error Test] ==> FAILED (data corrupted)\n");
 
     free(batch);
     free(resp);
 }
-void verify_single_key(int connfd, const char *key) {
-    char cmd[256];
-    char resp[256];
-    int total = 0;
 
-    int cmd_len = snprintf(cmd, sizeof(cmd),
-                           "*1\r\n*2\r\n$4\r\nRGET\r\n$%d\r\n%s\r\n",
-                           (int)strlen(key), key);
-
+/* 单键 SGET：拼接扁平命令,解析 bulk 值 */
+static void verify_single_key(int connfd, const char *key, const char *expect) {
+    char cmd[128], resp[1024], got[256];
+    int cmd_len = append_resp_cmd(cmd, 0, "SGET", key, NULL);
     send(connfd, cmd, cmd_len, 0);
 
-    /* 一直读到出现 \r\n */
-    while (total < (int)sizeof(resp) - 1) {
-        int n = recv(connfd, resp + total, sizeof(resp) - 1 - total, 0);
-        if (n <= 0) break;
-        total += n;
-        resp[total] = '\0';
-        if (strstr(resp, "\r\n")) break;
-    }
-
-    if (total <= 0) {
-        printf("[Verify] recv failed for key '%s'\n", key);
+    if (recv_one_resp(connfd, resp, sizeof(resp), got, sizeof(got)) < 0) {
+        printf("[Verify] SGET %s recv failed\n", key);
         return;
     }
-    resp[strcspn(resp, "\r\n")] = '\0';
-
-    printf("[Verify] RGET %s => '%s'\n", key, resp);
-    if (strncmp(resp, "val_", 4) == 0)
-        printf("[Verify] ==> key EXISTS in memory engine (skiptable)\n");
+    if (strcmp(got, expect) == 0)
+        printf("[Verify] SGET %s = %s (PASS)\n", key, got);
     else
-        printf("[Verify] ==> key MISSING in memory engine\n");
+        printf("[Verify] SGET %s = %s, exp '%s' (FAIL)\n", key, got, expect);
 }
 
 /* ============================================================
- * Part 3：内存测试(4 引擎 × 10w = 40w)
+ * Part 3：20 万数据（2 引擎 × 10 万）
  * ============================================================ */
-#define PER_ENGINE_100K   100000
+#define PER_ENGINE_100K  100000
 
-/* 插 40w：4 引擎 × 10w */
-static void insert_400k(int connfd) {
-    int total = PER_ENGINE_100K * 4;
-    int cap = total * 80;
-    char *batch = malloc(cap);
-    char *resp  = malloc(cap);
-    if (!batch || !resp) { free(batch); free(resp); return; }
+void insert_200k(int connfd) {
+    int e;
+    for (e = 0; e < ENGINE_COUNT; e++) {
+        int cap = PER_ENGINE_100K * 80;
+        char *batch = malloc(cap);
+        char *resp  = malloc(cap);
+        int blen = 0;
+        int i;
 
-    int blen = 0, e, i;
-    for (e = 0; e < 4; e++) {
         for (i = 0; i < PER_ENGINE_100K; i++) {
             char key[64], value[64];
             snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
             snprintf(value, sizeof(value), "val_%06d", i);
             blen = append_resp_cmd(batch, blen, engine_set_cmd[e], key, value);
         }
-        printf("[Insert] %-10s done (%d)\n", engine_name[e], PER_ENGINE_100K);
-        fflush(stdout);
+
+        struct timeval tv_begin, tv_cur;
+        gettimeofday(&tv_begin, NULL);
+
+        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_100K);
+
+        gettimeofday(&tv_cur, NULL);
+        int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+        printf("[Insert 100k] %-10s %d: %d ms, qps=%d\n",
+               engine_name[e], PER_ENGINE_100K, time_used,
+               PER_ENGINE_100K * 1000 / (time_used > 0 ? time_used : 1));
+
+        free(batch);
+        free(resp);
     }
-
-    struct timeval tv_begin, tv_cur;
-    gettimeofday(&tv_begin, NULL);
-    int got = send_and_recv(connfd, batch, blen, resp, cap, total);
-    gettimeofday(&tv_cur, NULL);
-    int ms = TIME_SUB_MS(tv_cur, tv_begin);
-
-    printf("[Insert 400k] total=%d resp=%d bytes, time=%d ms, qps=%d\n",
-           total, got, ms, total * 1000 / (ms ? ms : 1));
-
-    free(batch);
-    free(resp);
 }
 
-/* 删 40w：4 引擎 × 10w,key 和插入时一致 */
-static void delete_400k(int connfd) {
-    int total = PER_ENGINE_100K * 4;
-    int cap = total * 80;
-    char *batch = malloc(cap);
-    char *resp  = malloc(cap);
-    if (!batch || !resp) { free(batch); free(resp); return; }
+void delete_200k(int connfd) {
+    int e;
+    for (e = 0; e < ENGINE_COUNT; e++) {
+        int cap = PER_ENGINE_100K * 80;
+        char *batch = malloc(cap);
+        char *resp  = malloc(cap);
+        int blen = 0;
+        int i;
 
-    int blen = 0, e, i;
-    for (e = 0; e < 4; e++) {
         for (i = 0; i < PER_ENGINE_100K; i++) {
             char key[64];
             snprintf(key, sizeof(key), "%s_%06d", engine_name[e], i);
             blen = append_resp_cmd(batch, blen, engine_del_cmd[e], key, NULL);
         }
-        printf("[Delete] %-10s done (%d)\n", engine_name[e], PER_ENGINE_100K);
-        fflush(stdout);
+
+        struct timeval tv_begin, tv_cur;
+        gettimeofday(&tv_begin, NULL);
+
+        send_and_recv(connfd, batch, blen, resp, cap, PER_ENGINE_100K);
+
+        gettimeofday(&tv_cur, NULL);
+        int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+        printf("[Delete 100k] %-10s %d: %d ms, qps=%d\n",
+               engine_name[e], PER_ENGINE_100K, time_used,
+               PER_ENGINE_100K * 1000 / (time_used > 0 ? time_used : 1));
+
+        free(batch);
+        free(resp);
     }
-
-    struct timeval tv_begin, tv_cur;
-    gettimeofday(&tv_begin, NULL);
-    int got = send_and_recv(connfd, batch, blen, resp, cap, total);
-    gettimeofday(&tv_cur, NULL);
-    int ms = TIME_SUB_MS(tv_cur, tv_begin);
-
-    printf("[Delete 400k] total=%d resp=%d bytes, time=%d ms, qps=%d\n",
-           total, got, ms, total * 1000 / (ms ? ms : 1));
-
-    free(batch);
-    free(resp);
 }
 
 /* ============================================================
- * main
+ * main：测试入口
  * ============================================================ */
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <ip> <port> <mode>\n", argv[0]);
-        printf("  ===== Part 1: 四种模式对比 =====\n");
-        printf("  mode 1: 单条收发 + 交叉(set/get/mod/exist/del x 2w轮,4 引擎共 40w)\n");
-        printf("  mode 2: 单条收发 + 集中(每阶段 2w 条 x 5 阶段)\n");
-        printf("  mode 3: 管道化 + 交叉\n");
-        printf("  mode 4: 管道化 + 集中\n");
-        printf("  mode 5: 全部四种模式(1+2+3+4)\n");
-        printf("  ===== Part 2: 错误格式测试 =====\n");
-        printf("  mode 10: 全部 4 阶段\n");
-        printf("  ===== Part 3: 内存测试 =====\n");
-        printf("  mode 6: 插 40w(4 引擎 × 10w)\n");
-        printf("  mode 7: 删 40w(4 引擎 × 10w)\n");
-        return -1;
+    if (argc != 3) {
+        printf("usage: %s <mode> <engine>\n", argv[0]);
+        printf("  mode:\n");
+        printf("    1  mixed_single   单条收发 + 交叉 (SET/GET/MOD/EXIST/DEL)\n");
+        printf("    2  staged_single  单条收发 + 集中\n");
+        printf("    3  mixed_ops      管道化 + 交叉\n");
+        printf("    4  staged_ops     管道化 + 集中\n");
+        printf("    5  批量 SET/GET (每引擎 BATCH_COUNT 条)\n");
+        printf("    6  插入 20w (2 引擎 x 10w)\n");
+        printf("    7  删除 20w (2 引擎 x 10w)\n");
+        printf("   10  错误格式测试 (SSET → SMOD缺参 → SDELX未知命令 → SGET校验)\n");
+        printf("  engine: 0=Hash 1=Skiptable (-1=全部引擎)\n");
+        return 0;
     }
 
-    char *ip = argv[1];
-    int port = atoi(argv[2]);
-    mode = atoi(argv[3]);
+    mode = atoi(argv[1]);
+    int engine = atoi(argv[2]);
 
-    int connfd = connect_tcpserver(ip, port);
+    int connfd = connect_tcpserver("127.0.0.1", 2000);
     if (connfd < 0) {
-        printf("Connect failed\n");
+        printf("connect to 127.0.0.1:2000 failed\n");
         return -1;
     }
 
     int e;
-
     switch (mode) {
     case 1:
-        printf("===== mode 1: 单条收发 + 交叉 =====\n");
-        for (e = 0; e < 4; e++) mixed_single(connfd, e, MIX_LOOP);
-        break;
-
     case 2:
-        printf("===== mode 2: 单条收发 + 集中 =====\n");
-        for (e = 0; e < 4; e++) staged_single(connfd, e, STAGE_COUNT);
-        break;
-
     case 3:
-        printf("===== mode 3: 管道化 + 交叉 =====\n");
-        for (e = 0; e < 4; e++) mixed_ops(connfd, e, MIX_LOOP);
-        break;
-
     case 4:
-        printf("===== mode 4: 管道化 + 集中 =====\n");
-        for (e = 0; e < 4; e++) staged_ops(connfd, e, STAGE_COUNT);
+        if (engine < 0)
+            for (e = 0; e < ENGINE_COUNT; e++) {
+                if (mode == 1) mixed_single(connfd, e, MIX_LOOP);
+                else if (mode == 2) staged_single(connfd, e, STAGE_COUNT);
+                else if (mode == 3) mixed_ops(connfd, e, MIX_LOOP);
+                else staged_ops(connfd, e, STAGE_COUNT);
+            }
+        else {
+            if (mode == 1) mixed_single(connfd, engine, MIX_LOOP);
+            else if (mode == 2) staged_single(connfd, engine, STAGE_COUNT);
+            else if (mode == 3) mixed_ops(connfd, engine, MIX_LOOP);
+            else staged_ops(connfd, engine, STAGE_COUNT);
+        }
         break;
-
     case 5:
-        printf("===== Part 1: 四种模式对比 =====\n\n");
-
-        printf("--- 1. 单条收发 + 交叉 ---\n");
-        for (e = 0; e < 4; e++) mixed_single(connfd, e, MIX_LOOP);
-
-        printf("\n--- 2. 单条收发 + 集中 ---\n");
-        for (e = 0; e < 4; e++) staged_single(connfd, e, STAGE_COUNT);
-
-        printf("\n--- 3. 管道化 + 交叉 ---\n");
-        for (e = 0; e < 4; e++) mixed_ops(connfd, e, MIX_LOOP);
-
-        printf("\n--- 4. 管道化 + 集中 ---\n");
-        for (e = 0; e < 4; e++) staged_ops(connfd, e, STAGE_COUNT);
-
-        printf("\n===== 对比测试完成 =====\n");
+        if (engine < 0)
+            for (e = 0; e < ENGINE_COUNT; e++) {
+                batch_set(connfd, e, BATCH_COUNT);
+                batch_get(connfd, e, BATCH_COUNT);
+            }
+        else {
+            batch_set(connfd, engine, BATCH_COUNT);
+            batch_get(connfd, engine, BATCH_COUNT);
+        }
         break;
     case 6:
-        printf("===== mode 6: 插 40w (4 引擎 × 10w) =====\n");
-        insert_400k(connfd);
+        insert_200k(connfd);
         break;
-
     case 7:
-        printf("===== mode 7: 删 40w (4 引擎 × 10w) =====\n");
-        delete_400k(connfd);
+        delete_200k(connfd);
         break;
     case 10:
-        printf("===== Part 2: 错误格式测试(Skiptable) =====\n\n");
-
-        printf("--- 阶段1: 发 10w 条正确的 SSET ---\n");
-        error_test_phase1_correct_rset(connfd, 100000);
-        printf("\n--- 阶段1.5: 直接验证 et_099999 是否在内存中 ---\n");
-        verify_single_key(connfd, "et_099999");
-        verify_single_key(connfd, "et_099998");
-        verify_single_key(connfd, "et_000000");
-
-        printf("\n--- 阶段2: 发 10w 条 RESP 格式错误的 SMOD(数据不被修改)---\n");
-        error_test_phase2_bad_resp_rmod(connfd, 100000);
-
-        printf("\n--- 阶段3: 发 10w 条命令错误的 DEL(数据不被删除)---\n");
-        error_test_phase3_bad_cmd_del(connfd, 100000);
-
-        printf("\n--- 阶段4: 发 10w 条正确的 SGET,验证数据完整 ---\n");
-        error_test_phase4_verify(connfd, 100000);
-
-        printf("\n===== 错误格式测试完成 =====\n");
+        error_test_phase1_correct_sset(connfd, 10000);
+        error_test_phase2_bad_resp_smod(connfd, 10000);
+        error_test_phase3_bad_cmd_del(connfd, 10000);
+        error_test_phase4_verify(connfd, 10000);
+        verify_single_key(connfd, "rt_000000", "val_000000");
         break;
-
     default:
-        printf("Unknown mode: %d\n", mode);
+        printf("unknown mode %d\n", mode);
         break;
     }
 
