@@ -6,8 +6,6 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-extern kvs_array_t  global_array;
-extern kvs_rbtree_t global_rbtree;
 extern kvs_hash_t   global_hash;
 extern kvs_skiptable_t global_skiptable;
 
@@ -20,8 +18,6 @@ extern kvs_skiptable_t global_skiptable;
 typedef int (*snapshot_save_fn)(const char *filename);
 
 
-int save_snapshot_array(const char *filename);
-int save_snapshot_rbtree(const char *filename);
 int save_snapshot_hash(const char *filename) ;
 int save_snapshot_skiptable(const char *filename) ;
 
@@ -35,8 +31,6 @@ typedef struct engine_persist_s {
 
 // 引擎配置，和函数接口相对应
 static engine_persist_t engine_persist_table[] = {
-    {"array",       save_snapshot_array},
-    {"rbtree",      save_snapshot_rbtree},
     {"hash",        save_snapshot_hash},
     {"skiptable",   save_snapshot_skiptable},
     {NULL, NULL}
@@ -315,54 +309,9 @@ static int write_token(FILE *fp, const char *data) {
     return 0;
 }
 
-static void travel_rbtree_node(rbtree *T, rbtree_node *node, FILE *fp) {
-    if (node == T->nil || node == NULL) return;
-    
-    travel_rbtree_node(T, node->left, fp);
-    
-    write_token(fp, node->key);
-    write_token(fp, (char*)node->value);   // 直接连在一起
-    
-    travel_rbtree_node(T, node->right, fp);
-}
-
-
-
-
-
 /* 底层函数 */
 // 快照保存 需要修改休🍉的地方，此处也应该改为uring的方式进行@@@@@@@@@@@@@@@@@@@@@@@@@
 #if 1
-int save_snapshot_array(const char *filename) {
-    FILE *fp = fopen(filename, "a");
-    if (!fp) return -1;
-    
-    fprintf(fp, "# array\n");
-    int i = 0;
-    for (i = 0; i < global_array.total; i++) {
-        if (global_array.table[i].key != NULL) {
-            write_token(fp, global_array.table[i].key);
-            write_token(fp, global_array.table[i].value);   // 直接连在一起
-        }
-    }
-    
-    fclose(fp);
-    LOG_INFO("Snapshot array saved to %s\n", filename);
-    return 0;
-}
-
-int save_snapshot_rbtree(const char *filename) {
-    FILE *fp = fopen(filename, "a");
-    if (!fp) return -1;
-    
-    fprintf(fp, "# rbtree\n");
-    travel_rbtree_node(&global_rbtree, global_rbtree.root, fp);
-    
-    fclose(fp);
-    LOG_INFO("Snapshot rbtree saved to %s\n", filename);
-    return 0;
-}
-
 int save_snapshot_hash(const char *filename) {
     FILE *fp = fopen(filename, "a");
     if (!fp) return -1;
@@ -402,31 +351,6 @@ int save_snapshot_skiptable(const char *filename) {
 }
 #endif 
 #if 0
-int save_snapshot_array(const char *filename) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return -1;
-    int i = 0;
-
-    for (i=0; i<global_array.total; i++) {
-        if (global_array.table[i].key != NULL) {
-            fprintf(fp, "%s %s\n", global_array.table[i].key, global_array.table[i].value);
-        }
-    }
-    fclose(fp);
-    printf("Snapshot saved to %s\n", filename);
-    return 0;
-}
-
-int save_snapshot_rbtree(const char *filename) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return -1;
-
-    travel_rbtree_node(&global_rbtree, global_rbtree.root, fp);
-    fclose(fp);
-    printf("Snapshot saved to %s\n", filename);
-    return 0;
-}
-
 int save_snapshot_hash(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) return -1;
@@ -800,11 +724,7 @@ int load_snapshots()
             mmap_read_line(mf.data, mf.size,
                            &offset, line, sizeof(line));
 
-            if (strstr(line, "array"))
-                current_engine = 0;
-            else if (strstr(line, "rbtree"))
-                current_engine = 1;
-            else if (strstr(line, "hash"))
+            if (strstr(line, "hash"))
                 current_engine = 2;
             else if (strstr(line, "skiptable"))
                 current_engine = 3;
@@ -832,14 +752,6 @@ int load_snapshots()
             }
 
             switch (current_engine) {
-            case 0:
-                kvs_array_set(&global_array, key, value);
-                break;
-
-            case 1:
-                kvs_rbtree_set(&global_rbtree, key, value);
-                break;
-
             case 2:
                 kvs_hash_set(&global_hash, key, value);
                 break;
@@ -898,9 +810,7 @@ int load_snapshots() {
             line[i] = '\0';
             line[strcspn(line, "\r\n")] = '\0';
             
-            if (strstr(line, "array"))          current_engine = 0;
-            else if (strstr(line, "rbtree"))    current_engine = 1;
-            else if (strstr(line, "hash"))      current_engine = 2;
+            if (strstr(line, "hash"))           current_engine = 2;
             else if (strstr(line, "skiptable")) current_engine = 3;
             continue;
         }
@@ -924,8 +834,6 @@ int load_snapshots() {
             
             // ===== 根据当前引擎分发 =====
             switch (current_engine) {
-                case 0: kvs_array_set(&global_array, key, value); break;
-                case 1: kvs_rbtree_set(&global_rbtree, key, value); break;
                 case 2: kvs_hash_set(&global_hash, key, value); break;
                 case 3: kvs_skiptable_set(&global_skiptable, key, value); break;
             }
@@ -973,48 +881,12 @@ int load_snapshots() {
 
 
 #if ENABLE_CRC
-/* ===== rbtree 中序回调 ===== */
-typedef void (*rbtree_visit_fn)(rbtree_node *node, void *arg);
-
-static void rbtree_inorder_cb(rbtree *T, rbtree_node *node,
-                              rbtree_visit_fn cb, void *arg)
-{
-    if (node == T->nil || node == NULL) return;
-    rbtree_inorder_cb(T, node->left,  cb, arg);
-    cb(node, arg);
-    rbtree_inorder_cb(T, node->right, cb, arg);
-}
-
-static void rbtree_crc_visit(rbtree_node *node, void *arg)
-{
-    crc_list_t *list = (crc_list_t *)arg;
-    crc_list_append(list, "SNAP", node->key, (char *)node->value);
-}
-
 /* 重建 SNAP CRC 列表并落盘到 CRC_LIST_SNAP_FILE
  * 内部流程：reset 全局 g_crc_list_snap → 遍历四引擎 → save
  * 主机 SAVE 后、从机 load_snapshots 后都调它 */
 int crc_rebuild_snap_list(void)
 {
     crc_list_reset(&g_crc_list_snap);
-
-#if ENABLE_ARRAY
-    {
-        int i;
-        for (i = 0; i < global_array.total; i++) {
-            if (global_array.table[i].key != NULL) {
-                crc_list_append(&g_crc_list_snap, "SNAP",
-                                global_array.table[i].key,
-                                global_array.table[i].value);
-            }
-        }
-    }
-#endif
-
-#if ENABLE_RBTREE
-    rbtree_inorder_cb(&global_rbtree, global_rbtree.root,
-                      rbtree_crc_visit, &g_crc_list_snap);
-#endif
 
 #if ENABLE_HASH
     {

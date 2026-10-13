@@ -7,12 +7,6 @@
 mempool_t *resp_pool = NULL;
 
 // 定义内存池
- mempool_t *array_item_pool = NULL;     // 数组节点池
- mempool_t *array_string_pool = NULL;   // 数组字符串池
-
- mempool_t *rbtree_node_pool = NULL;    // 红黑树节点池
- mempool_t *rbtree_string_pool = NULL;  // 红黑树字符串池
-
  mempool_t *hash_node_pool = NULL;      // 哈希节点池
  mempool_t *hash_string_pool = NULL;    // 哈希字符串池
 
@@ -248,22 +242,6 @@ void kvs_mempool_destroy(mempool_t *pool) {
 }
 
 int init_mempools(void) {
-    // 数组：1024个item，2048个字符串（key+value）
-    array_item_pool = kvs_mempool_create(sizeof(kvs_array_item_t), KVS_POOL_NODE_COUNT);
-    array_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
-    if (!array_item_pool || !array_string_pool){
-        // printf("Failed to create array_item_pool\n");
-        return -1;
-    }
-    
-    // 红黑树：1024个节点，2048个字符串
-    rbtree_node_pool = kvs_mempool_create(sizeof(rbtree_node), KVS_POOL_NODE_COUNT);
-    rbtree_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
-    if (!rbtree_node_pool || !rbtree_string_pool){
-        // printf("Failed to create rbtree_node_pool\n");
-        return -1;
-    }
-    
     // 哈希：1024个节点，2048个字符串
     hash_node_pool = kvs_mempool_create(sizeof(hashnode_t), KVS_POOL_NODE_COUNT);
     hash_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
@@ -294,10 +272,6 @@ int init_mempools(void) {
 
 // 销毁内存池
 void dest_mempools(void) {
-    if (array_item_pool) kvs_mempool_destroy(array_item_pool);
-    if (array_string_pool) kvs_mempool_destroy(array_string_pool);
-    if (rbtree_node_pool) kvs_mempool_destroy(rbtree_node_pool);
-    if (rbtree_string_pool) kvs_mempool_destroy(rbtree_string_pool);
     if (hash_node_pool) kvs_mempool_destroy(hash_node_pool);
     if (hash_string_pool) kvs_mempool_destroy(hash_string_pool);
     if (skiptable_node_pool) kvs_mempool_destroy(skiptable_node_pool);
