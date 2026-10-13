@@ -24,6 +24,7 @@ endif
 
 # 测试用例列表（每个独立编译）
 TEST_SRCS = $(TEST_DIR)/5_crc_testcase.c \
+			$(TEST_DIR)/4_mempool_testcase.c \
 			$(TEST_DIR)/3_sync_testcase.c \
 			$(TEST_DIR)/2_presist_testcase.c \
 			$(TEST_DIR)/1_RESP_testcase.c \
@@ -34,8 +35,6 @@ TEST_TARGETS = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_SRCS))
 
 #       $(SRC_DIR)/reactor.c 
 SRCS = $(SRC_DIR)/kvstore.c \
-       $(SRC_DIR)/kvs_eg_array.c \
-       $(SRC_DIR)/kvs_eg_rbtree.c \
        $(SRC_DIR)/kvs_eg_hash.c \
        $(SRC_DIR)/kvs_eg_skiptable.c \
        $(SRC_DIR)/kvs_persist.c \
