@@ -35,8 +35,6 @@
 #endif
 
 
-#define ENABLE_ARRAY         1
-#define ENABLE_RBTREE        1
 #define ENABLE_HASH			 1
 #define ENABLE_SKIPTABLE	 1
 
@@ -82,69 +80,6 @@ extern int proactor_start(unsigned short port, msg_handler handler);
 ======================================= 1.kv引擎 ======================================
 ==========================================================================================
 */
-#if ENABLE_ARRAY
-typedef struct kvs_array_item_s {
-    char *key;
-    char *value;
-} kvs_array_item_t;
-
-
-#define KVS_ARRAY_INIT_SIZE 1024      // 初始容量
-#define KVS_ARRAY_GROW_FACTOR 2       // 扩容因子
-
-typedef struct kvs_array_s {
-    kvs_array_item_t *table;
-    int total;
-    int capacity;    // 当前容量（新增）
-} kvs_array_t;
-
-void kvs_array_destory(kvs_array_t *inst);
-int kvs_array_create(kvs_array_t *inst);
-int kvs_array_set(kvs_array_t *inst, char *key, char *value);
-char *kvs_array_get(kvs_array_t *inst, char *key);
-int kvs_array_del(kvs_array_t *inst, char *key);
-int kvs_array_mod(kvs_array_t *inst, char *key, char *value);
-int kvs_array_exist(kvs_array_t *inst, char *key);
-#endif
-
-#if ENABLE_RBTREE
-
-#define RED				1
-#define BLACK 			2
-#define ENABLE_KEY_CHAR 1
-
-#if ENABLE_KEY_CHAR
-typedef char* KEY_TYPE;
-#else
-typedef int KEY_TYPE;
-#endif
-
-
-typedef struct _rbtree_node {
-	unsigned char color;
-	struct _rbtree_node *right;
-	struct _rbtree_node *left;
-	struct _rbtree_node *parent;
-	KEY_TYPE key;
-	void *value;
-} rbtree_node;
-
-typedef struct _rbtree {
-	rbtree_node *root;
-	rbtree_node *nil;
-} rbtree;
-
-
-typedef struct _rbtree kvs_rbtree_t;
-int kvs_rbtree_create(kvs_rbtree_t *inst);
-void kvs_rbtree_destory(kvs_rbtree_t *inst) ;
-int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value) ;
-char *kvs_rbtree_get(kvs_rbtree_t *inst, char *key);
-int kvs_rbtree_del(kvs_rbtree_t *inst, char *key) ;
-int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value) ;
-int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key) ;
-#endif
-
 #if ENABLE_HASH
 
 #define MAX_KEY_LEN	128
@@ -242,27 +177,19 @@ int persistence_reset_aof(void);
 void persistence_shutdown(void);
 #else
 // 快照文件路径（放在 data 目录下）
-#define SNAP_ARRAY_FILE     "data/array.snap"
-#define SNAP_RBTREE_FILE    "data/rbtree.snap"
 #define SNAP_HASH_FILE      "data/hash.snap"
 #define SNAP_SKIPTABLE_FILE "data/skiptable.snap"
 
 // AOF文件路径（放在 data 目录下）
-#define AOF_ARRAY_FILE      "data/array.aof"
-#define AOF_RBTREE_FILE     "data/rbtree.aof"
 #define AOF_HASH_FILE       "data/hash.aof"
 #define AOF_SKIPTABLE_FILE  "data/skiptable.aof"
 
 int save_snapshots();
 int load_snapshots();
 // 快照保存
-int save_snapshot_array(const char *filename);
-int save_snapshot_rbtree(const char *filename);
 int save_snapshot_hash(const char *filename);
 int save_snapshot_skiptable(const char *filename);
 // 快照加载
-int load_snapshot_array(const char *filename);
-int load_snapshot_rbtree(const char *filename);
 int load_snapshot_hash(const char *filename);
 int load_snapshot_skiptable(const char *filename);
 
@@ -316,10 +243,6 @@ typedef struct mempool_s{
 extern mempool_t *resp_pool;
 
 // 不同数据类型分类设计
-extern mempool_t *array_item_pool;
-extern mempool_t *array_string_pool;
-extern mempool_t *rbtree_node_pool;
-extern mempool_t *rbtree_string_pool;
 extern mempool_t *hash_node_pool;
 extern mempool_t *hash_string_pool;
 extern mempool_t *skiptable_node_pool;
@@ -376,8 +299,9 @@ typedef struct kvs_conn_ctx {
     int resp_scmd_unit_idx; // 单条命令的元素索引
 
     int resp_token_len; //token的字节数
-    char *resp_temp_buffer; // 用于存储解析好的cmd token的临时缓冲区
-    int resp_temp_buffer_cap;   // 临时token缓冲区的容量
+    int resp_flat;      // 1: redis-cli 扁平 RESP 请求; 0: 旧嵌套 RESP 请求
+    char *resp_tokens[KVS_MAX_TOKENS]; // 当前命令已解析的 token 指针数组（支持含空格的值）
+    int resp_token_count;   // 当前命令 token 个数
 
     int resp_cmd_start;     // 当前命令起始偏移
 
