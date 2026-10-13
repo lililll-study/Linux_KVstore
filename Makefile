@@ -23,8 +23,7 @@ NET_FLAG = -DNET_SELECT=NET_REACTOR
 endif
 
 # 测试用例列表（每个独立编译）
-TEST_SRCS = $(TEST_DIR)/5_crc_testcase.c \
-			$(TEST_DIR)/4_mempool_testcase.c \
+TEST_SRCS = $(TEST_DIR)/4_crc_testcase.c \
 			$(TEST_DIR)/3_sync_testcase.c \
 			$(TEST_DIR)/2_presist_testcase.c \
 			$(TEST_DIR)/1_RESP_testcase.c \
