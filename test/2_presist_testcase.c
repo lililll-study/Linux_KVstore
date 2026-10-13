@@ -8,8 +8,8 @@
 
 
 #define TEST_COUNT      100000      // 总数据量 10w
-#define PER_ENGINE      25000       // 每种数据结构 2.5w
-#define ENGINE_COUNT    4           // 4 种引擎
+#define PER_ENGINE      50000       // 每种数据结构 5w
+#define ENGINE_COUNT    2           // 2 种引擎 (Hash / Skiptable)
 
 #define CHUNK_SIZE 1024
 
@@ -30,12 +30,62 @@ int connect_tcpserver(const char *ip, unsigned short port) {
 }
 
 /* ============================================================
- * RESP 命令拼接
+ * RESP 响应解析（redis-cli 扁平格式）
+ * ============================================================ */
+static const char *resp_parse_one(const char *p, const char *end,
+                                  char *out, int cap) {
+    if (!p || p >= end) return NULL;
+    switch (*p) {
+    case '+':
+    case '-':
+    case ':': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int n = (int)(e - p) - 1;
+        if (n > cap - 1) n = cap - 1;
+        memcpy(out, p + 1, n);
+        out[n] = '\0';
+        return e + 2;
+    }
+    case '$': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int len = atoi(p + 1);
+        if (len < 0) {                    /* $-1：空值 */
+            strcpy(out, "nil");
+            return e + 2;
+        }
+        const char *data = e + 2;
+        if (data + len + 2 > end) return NULL;   /* 数据未收完 */
+        if (len > cap - 1) len = cap - 1;
+        memcpy(out, data, len);
+        out[len] = '\0';
+        return data + len + 2;
+    }
+    default:
+        return NULL;
+    }
+}
+
+/* 统计缓冲区中完整 RESP 响应的条数 */
+static int resp_count(const char *buf, int len) {
+    int count = 0;
+    const char *p = buf, *end = buf + len;
+    char tmp[1024];
+    while (p && p < end) {
+        const char *next = resp_parse_one(p, end, tmp, sizeof(tmp));
+        if (!next) break;
+        count++;
+        p = next;
+    }
+    return count;
+}
+
+/* ============================================================
+ * RESP 命令拼接（redis-cli 扁平格式：一条命令 = 一个数组）
  * ============================================================ */
 static int append_resp_cmd(char *buf, int len, const char *cmd,
                            const char *key, const char *value) {
-    len += sprintf(buf + len, "*1\r\n");
-
     if (value) {
         len += sprintf(buf + len,
                        "*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
@@ -52,18 +102,8 @@ static int append_resp_cmd(char *buf, int len, const char *cmd,
 }
 
 static int append_save(char *buf, int len) {
-    len += sprintf(buf + len, "*1\r\n");
     len += sprintf(buf + len, "*1\r\n$4\r\nSAVE\r\n");
     return len;
-}
-
-/* 统计 \r\n 个数（响应条数） */
-static int count_responses(const char *buf, int len) {
-    int count = 0, i;
-    for (i = 0; i < len - 1; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n') { count++; i++; }
-    }
-    return count;
 }
 
 /* 边发边收：每次 send CHUNK_SIZE 字节，发完立刻 recv */
@@ -87,7 +127,7 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
         }
     }
 
-    while (count_responses(resp, total) < expected_count) {
+    while (resp_count(resp, total) < expected_count) {
         if (total >= resp_cap - 1) break;
         int n = recv(connfd, resp + total, resp_cap - total - 1, 0);
         if (n <= 0) break;
@@ -99,31 +139,27 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
 }
 
 /* ============================================================
- * 引擎命令前缀
+ * 引擎命令前缀（仅 Hash / Skiptable）
  * ============================================================ */
 static const char *engine_set_cmd[ENGINE_COUNT] = {
-    "SET",   /* Array */
-    "RSET",  /* Rbtree */
     "HSET",  /* Hash */
     "SSET",  /* Skiptable */
 };
 
 static const char *engine_get_cmd[ENGINE_COUNT] = {
-    "GET",   /* Array */
-    "RGET",  /* Rbtree */
     "HGET",  /* Hash */
     "SGET",  /* Skiptable */
 };
 
 static const char *engine_name[ENGINE_COUNT] = {
-    "Array", "Rbtree", "Hash", "Skiptable"
+    "Hash", "Skiptable"
 };
 
 /* ============================================================
- * 阶段1：插入 10w 条 SET（4 引擎 × 2.5w）
+ * 阶段1：插入 10w 条 SET（2 引擎 × 5w）
  *
  * 每种引擎的数据：
- *   key = "{engine_prefix}_{i}"   i = 0..24999
+ *   key = "{engine_prefix}_{i}"   i = 0..49999
  *   val = "val_{i}"
  * ============================================================ */
 void insert_100k(int connfd) {
@@ -141,7 +177,7 @@ void insert_100k(int connfd) {
             blen = append_resp_cmd(batch, blen, engine_set_cmd[e], key, value);
         }
 
-        printf("Insert progress: %d%% (%s done)\n", (e + 1) * 25, engine_name[e]);
+        printf("Insert progress: %d%% (%s done)\n", (e + 1) * 50, engine_name[e]);
         fflush(stdout);
     }
 
@@ -154,7 +190,7 @@ void insert_100k(int connfd) {
 }
 
 /* ============================================================
- * 阶段2：验证 10w 条 GET（4 引擎 × 2.5w）
+ * 阶段2：验证 10w 条 GET（2 引擎 × 5w）
  * ============================================================ */
 void verify_100k(int connfd) {
     int cap = TEST_COUNT * 80;
@@ -171,31 +207,31 @@ void verify_100k(int connfd) {
             blen = append_resp_cmd(batch, blen, engine_get_cmd[e], key, NULL);
         }
 
-        printf("Verify progress: %d%% (%s done)\n", (e + 1) * 25, engine_name[e]);
+        printf("Verify progress: %d%% (%s done)\n", (e + 1) * 50, engine_name[e]);
         fflush(stdout);
     }
 
     send_and_recv(connfd, batch, blen, resp, cap, TEST_COUNT);
 
-    /* 逐条验证 */
-    char *p = resp;
+    /* 逐条验证（bulk 响应：$len\r\nval\r\n） */
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[256];
     for (e = 0; e < ENGINE_COUNT; e++) {
         for (i = 0; i < PER_ENGINE; i++) {
-            char *line_end = strstr(p, "\r\n");
-            if (!line_end) { fail++; break; }
-            *line_end = '\0';
+            const char *next = resp_parse_one(p, end, got, sizeof(got));
+            if (!next) { fail += PER_ENGINE - i; break; }
 
             char expected[64];
             snprintf(expected, sizeof(expected), "val_%06d", i);
 
-            if (strcmp(p, expected) == 0) pass++;
+            if (strcmp(got, expected) == 0) pass++;
             else {
                 fail++;
                 if (fail <= 10)
                     printf("MISMATCH e=%s i=%d: got '%s', expected '%s'\n",
-                           engine_name[e], i, p, expected);
+                           engine_name[e], i, got, expected);
             }
-            p = line_end + 2;
+            p = next;
         }
     }
 
@@ -210,7 +246,7 @@ void verify_100k(int connfd) {
 }
 
 /* ============================================================
- * 发送 SAVE
+ * 发送 SAVE（期望响应 +OK）
  * ============================================================ */
 void send_save(int connfd) {
     char buf[32];
