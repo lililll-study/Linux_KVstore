@@ -43,32 +43,74 @@ static int connect_tcpserver(const char *ip, unsigned short port) {
 }
 
 /* ============================================================
- * RESP 命令拼接
+ * RESP 响应解析（redis-cli 扁平格式）
+ * ============================================================ */
+static const char *resp_parse_one(const char *p, const char *end,
+                                  char *out, int cap) {
+    if (!p || p >= end) return NULL;
+    switch (*p) {
+    case '+':
+    case '-':
+    case ':': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int n = (int)(e - p) - 1;
+        if (n > cap - 1) n = cap - 1;
+        memcpy(out, p + 1, n);
+        out[n] = '\0';
+        return e + 2;
+    }
+    case '$': {
+        const char *e = strstr(p, "\r\n");
+        if (!e || e + 2 > end) return NULL;
+        int len = atoi(p + 1);
+        if (len < 0) {                    /* $-1：空值 */
+            strcpy(out, "nil");
+            return e + 2;
+        }
+        const char *data = e + 2;
+        if (data + len + 2 > end) return NULL;   /* 数据未收完 */
+        if (len > cap - 1) len = cap - 1;
+        memcpy(out, data, len);
+        out[len] = '\0';
+        return data + len + 2;
+    }
+    default:
+        return NULL;
+    }
+}
+
+/* 统计缓冲区中完整 RESP 响应的条数 */
+static int resp_count(const char *buf, int len) {
+    int count = 0;
+    const char *p = buf, *end = buf + len;
+    char tmp[1024];
+    while (p && p < end) {
+        const char *next = resp_parse_one(p, end, tmp, sizeof(tmp));
+        if (!next) break;
+        count++;
+        p = next;
+    }
+    return count;
+}
+
+/* ============================================================
+ * RESP 命令拼接（redis-cli 扁平格式：一条命令 = 一个数组）
+ * 同步测试使用 Hash 引擎：HSET key value / HGET key
  * ============================================================ */
 static int append_set(char *buf, int len, const char *key, const char *value) {
-    len += sprintf(buf + len, "*1\r\n");
     len += sprintf(buf + len,
-                   "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+                   "*3\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
                    (int)strlen(key), key,
                    (int)strlen(value), value);
     return len;
 }
 
 static int append_get(char *buf, int len, const char *key) {
-    len += sprintf(buf + len, "*1\r\n");
     len += sprintf(buf + len,
-                   "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n",
+                   "*2\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n",
                    (int)strlen(key), key);
     return len;
-}
-
-/* 统计 \r\n 个数（响应条数） */
-static int count_responses(const char *buf, int len) {
-    int count = 0, i;
-    for (i = 0; i < len - 1; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n') { count++; i++; }
-    }
-    return count;
 }
 
 /* ============================================================
@@ -93,7 +135,7 @@ static int send_and_recv(int connfd, const char *batch, int batch_len,
         }
     }
 
-    while (count_responses(resp, total) < expected_count) {
+    while (resp_count(resp, total) < expected_count) {
         if (total >= resp_cap - 1) break;
         int n = recv(connfd, resp + total, resp_cap - total - 1, 0);
         if (n <= 0) break;
@@ -130,13 +172,14 @@ static int insert_range(int connfd, int start, int count) {
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
     int ok_count = 0;
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[64];
     for (i = 0; i < count; i++) {
-        char *line_end = strstr(p, "\r\n");
-        if (!line_end) break;
-        *line_end = '\0';
-        if (strcmp(p, "ok") == 0) ok_count++;
-        p = line_end + 2;
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) break;
+        /* HSET 新插入 → :1 */
+        if (strcmp(got, "1") == 0) ok_count++;
+        p = next;
     }
 
     printf("[Insert] range=[%d, %d) count=%d, resp=%d bytes, ok=%d, time=%d ms\n",
@@ -172,23 +215,23 @@ static int verify_range(int connfd, int start, int count) {
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
     int pass = 0, fail = 0;
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[64];
     for (i = 0; i < count; i++) {
-        char *line_end = strstr(p, "\r\n");
-        if (!line_end) { fail++; break; }
-        *line_end = '\0';
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) { fail++; break; }
 
         char expected[32];
         snprintf(expected, sizeof(expected), "val_%06d", start + i);
 
-        if (strcmp(p, expected) == 0) pass++;
+        if (strcmp(got, expected) == 0) pass++;
         else {
             fail++;
             if (fail <= 10)
                 printf("[Verify] MISMATCH key=ps_%06d: got '%s', expected '%s'\n",
-                       start + i, p, expected);
+                       start + i, got, expected);
         }
-        p = line_end + 2;
+        p = next;
     }
 
     printf("[Verify] range=[%d, %d) count=%d, pass=%d, fail=%d, time=%d ms\n",
@@ -225,13 +268,14 @@ static int insert_small(int connfd, int count) {
     int time_used = TIME_SUB_MS(tv_cur, tv_begin);
 
     int ok_count = 0;
-    char *p = resp;
+    const char *p = resp, *end = resp + strlen(resp);
+    char got[64];
     for (i = 0; i < count; i++) {
-        char *line_end = strstr(p, "\r\n");
-        if (!line_end) break;
-        *line_end = '\0';
-        if (strcmp(p, "ok") == 0) ok_count++;
-        p = line_end + 2;
+        const char *next = resp_parse_one(p, end, got, sizeof(got));
+        if (!next) break;
+        /* HSET 新插入 → :1 */
+        if (strcmp(got, "1") == 0) ok_count++;
+        p = next;
     }
 
     printf("[Insert-Small] count=%d, resp=%d bytes, ok=%d, time=%d ms\n",
