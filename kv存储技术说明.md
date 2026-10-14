@@ -1415,3 +1415,20 @@ C 语言跟内存申请相关的函数主要有 calloc, malloc, realloc 等。
 上述所说的是 Linux 进程通过 C 标准库中的内存分配函数 malloc 向系统申请内存，但是到真正与内核交互之间，其实还隔了一层，即**内存分配管理器(memory allocator)**。常见的内存分配器包括：ptmalloc(Glibc)、tcmalloc(Google)、jemalloc(FreeBSD)。MySQL 默认使用的是 glibc 的 ptmalloc 作为内存分配器。
 
 ![7mj3vh74lg](https://ask.qcloudimg.com/http-save/yehe-7053949/7mj3vh74lg.png)
+
+
+
+
+
+10.14 关于crc校验的功能优化
+
+    snap
+    全量持久化数据和crc校验值不能分开，因为全量的数据已经是修改后的值了，所以需要对每个kv都进行crc校验值的计算，并放在数据的末尾。
+    aof
+    增量持久化由于记录的是命令，所以不用计算每条命令的crc，因为如果一条改了，那后面的不能运行了会出错。所以应该计算全文crc。增量持久化要用RESP协议，把旧的兼容协议删除
+
+    整体实现方案：
+    实现方案，aof的数据用解析器解析。snap的读取k，v后直接加载。
+    aof的crc放在文件末尾，解析器读取到标志位后，需要解析最后的crc校验值
+    snap的放在每一条数据后，需要实现解析器
+
