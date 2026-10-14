@@ -550,39 +550,6 @@ void error_test_phase1_correct_sset(int connfd, int count) {
     free(resp);
 }
 
-/* ===== 通用：边发边收,但只统计响应,不校验内容 ===== */
-static void send_and_drain(int connfd, const char *batch, int batch_len,
-                           int expected_count) {
-    int cap = expected_count * 64 + 1;
-    char *big_resp = malloc(cap);          /* 大缓冲 */
-    int big_len = 0;
-    int sent = 0;
-
-    while (sent < batch_len) {
-        int chunk = batch_len - sent;
-        if (chunk > CHUNK_SIZE) chunk = CHUNK_SIZE;
-
-        int n = send(connfd, batch + sent, chunk, 0);
-        if (n <= 0) { perror("send"); break; }
-        sent += n;
-
-        if (big_len < cap - 1) {
-            int n2 = recv(connfd, big_resp + big_len, cap - 1 - big_len, 0);
-            if (n2 <= 0) { perror("recv"); break; }
-            big_len += n2;
-        }
-    }
-
-    /* 收尾：把剩余响应全部收完,不校验内容 */
-    while (resp_count(big_resp, big_len) < expected_count) {
-        if (big_len >= cap - 1) break;
-        int n = recv(connfd, big_resp + big_len, cap - 1 - big_len, 0);
-        if (n <= 0) break;
-        big_len += n;
-    }
-
-    free(big_resp);
-}
 
 /* 阶段 2：参数缺失（SMOD 只给 key 不给 value）→ -ERR invalid arguments */
 void error_test_phase2_bad_resp_smod(int connfd, int count) {
