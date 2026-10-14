@@ -170,6 +170,16 @@ int load_snapshots();
 int append_aof(const char *cmd, const char *key, const char *value);
 int replay_aof(const char *filename);
 long replay_aof_from(const char *filename, long start_offset);
+
+/* ===== AOF 文件尾全文 CRC =====
+ * 文件布局： [扁平RESP命令区][# AOF_CRC:xxxxxxxx\r\n]
+ * 尾部固定 20 字节：前缀 10 + 8位hex + CRLF 2
+ */
+#define AOF_CRC_PREFIX      "# AOF_CRC:"
+#define AOF_CRC_PREFIX_LEN  10
+#define AOF_CRC_HEX_LEN     8
+#define AOF_CRC_TAIL_LEN    20   // 10 + 8 + 2
+
 /* io_uring-backed AOF lifecycle */
 int persistence_init(void);
 int persistence_flush(void);
@@ -299,7 +309,7 @@ typedef struct kvs_conn_ctx {
     int resp_scmd_unit_idx; // 单条命令的元素索引
 
     int resp_token_len; //token的字节数
-    int resp_flat;      // 1: redis-cli 扁平 RESP 请求; 0: 旧嵌套 RESP 请求
+
     char *resp_tokens[KVS_MAX_TOKENS]; // 当前命令已解析的 token 指针数组（支持含空格的值）
     int resp_token_count;   // 当前命令 token 个数
 
@@ -338,9 +348,9 @@ int resp_buf_has_data(kvs_conn_ctx_t *ctx);
 #if ENABLE_SYNC
 #define SYNC_BUFFER_SIZE 2000
 
-// ===== 心跳（RESP 格式） =====
-#define HEARTBEAT_CMD     "*1\r\n*1\r\n$4\r\nPING\r\n"   // 14 字节
-#define HEARTBEAT_CMD_LEN 18
+// ===== 心跳（标准扁平 RESP 格式） =====
+#define HEARTBEAT_CMD     "*1\r\n$4\r\nPING\r\n"   // 14 字节
+#define HEARTBEAT_CMD_LEN 14
 #define HEARTBEAT_INTERVAL 5                        // 秒
 
 extern int g_is_master;
@@ -381,50 +391,12 @@ int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 */
 #if ENABLE_CRC
 
-#define CRC_LIST_SNAP_FILE  "data/crc_snap.dat"
-#define CRC_LIST_AOF_FILE   "data/crc_aof.dat"
-
-// CRC单元：单条CRC记录
-typedef struct {
-    uint32_t crc;   // 本条记录的内容指纹：CRC32(cmd+key+value) 或 CRC32(key+value)
-    uint64_t seq;   // 全局递增序列号，用于对齐
-} crc_uint_t;
-
 uint32_t crc32_calc(const char *data, size_t len);
+/* AOF 全文 CRC 增量累计：crc 初值为 0xFFFFFFFF，全部字节喂完后结果需 ^ 0xFFFFFFFF */
+uint32_t crc32_update(uint32_t crc, const char *data, size_t len);
+/* SNAP 单条 KV 指纹：CRC32(key + ':' + value) */
 uint32_t crc32_calc_snap(const char *key, const char *value);
-uint32_t crc32_calc_aof(const char *cmd, const char *key, const char *value);
 
-// 整个CRC列表容器
-typedef struct {
-    crc_uint_t *units;  // 指向堆上的动态数组，存储所有crc单元
-    int     count;  // 当前有多少个单元
-    int     cap;    // 数组容量
-    uint64_t next_seq;  // 下个单元应该分配哪个 seq
-    pthread_mutex_t  lock;  // 多线程保护
-} crc_list_t;
-
-/* 主机/从机全局列表（在 crc.c 中定义） */
-extern crc_list_t g_crc_list_snap;
-extern crc_list_t g_crc_list_aof;
-
-// 生命周期
-int crc_list_create(crc_list_t *list);
-void crc_list_destroy(crc_list_t *list);
-void crc_list_reset(crc_list_t *list);
-
-// 追加记录
-int crc_list_append(crc_list_t *list, const char *type, const char *key, const char *value);
-
-// 持久化
-int crc_list_save(crc_list_t *list, const char *filename);
-int crc_list_load(crc_list_t *list, const char *filename);
-/* 便利封装：直接落盘到默认文件 */
-int crc_save_snap(void);
-int crc_save_aof(void);
-
-
-int crc_rebuild_snap_list(void);
-long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_t *crc_out);
 #endif
 
 
