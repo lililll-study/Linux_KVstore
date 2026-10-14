@@ -24,14 +24,16 @@
 #define KVS_URING_BATCH    64
 
 /* ===== 内部数据结构 ===== */
-// 表示一个待写入请求
+// 表示一个待提交请求
 // 生命周期：
 // 每次append都会创建一个uring_req_t，插入ctx->head/tail链表，队列尾部
 // 消费：worker_main取出后填入SQE如何提交给uring
+// opcode: 0=WRITE 1=FTRUNCATE（截断到 offset，len 无意义）
 typedef struct kvs_uring_req {
     char *data;
     size_t len;
     off_t offset;
+    int opcode;
     struct kvs_uring_req *next;
 } kvs_uring_req_t;
 
@@ -213,12 +215,19 @@ static int submit_requests(struct kvs_uring *ctx, kvs_uring_req_t **reqs, size_t
         if (!sqe) break;
 
         kvs_uring_req_t *req = reqs[n];
-        sqe->opcode = IORING_OP_WRITE;
-        sqe->fd = ctx->fd;
-        sqe->off = (uint64_t)req->offset;
-        sqe->addr = (uint64_t)(uintptr_t)req->data;
-        sqe->len = (unsigned)req->len;
         sqe->user_data = (uint64_t)(uintptr_t)req;
+        if (req->opcode == 1) {
+            /* 截断文件到 offset */
+            sqe->opcode = IORING_OP_FTRUNCATE;
+            sqe->fd = ctx->fd;
+            sqe->off = (uint64_t)req->offset;
+        } else {
+            sqe->opcode = IORING_OP_WRITE;
+            sqe->fd = ctx->fd;
+            sqe->off = (uint64_t)req->offset;
+            sqe->addr = (uint64_t)(uintptr_t)req->data;
+            sqe->len = (unsigned)req->len;
+        }
     }
 
     if (n == 0) return -EAGAIN;
@@ -398,6 +407,79 @@ int kvs_uring_append(kvs_uring_t *ctx, const void *data, size_t len)
     ctx->queued++;
     ctx->submitted++;
     // 唤醒worker
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
+    return 0;
+}
+
+/* ===== 对外接口：截断 base 后追加命令+尾部（重写 AOF 文件尾 CRC） =====
+ * 按队列顺序依次执行：FTRUNCATE(base) -> WRITE(data@base) -> WRITE(tail@base+len)
+ * base 为命令区末尾偏移（即旧 CRC 尾部起始），由调用方维护。
+ */
+int kvs_uring_append_cmd(kvs_uring_t *ctx, const void *data, size_t len,
+                         const void *tail, size_t tail_len, off_t base)
+{
+    if (!ctx || !data || len == 0 || !tail || tail_len == 0 || base < 0) return -EINVAL;
+    if (len > UINT_MAX || tail_len > UINT_MAX) return -E2BIG;
+
+    pthread_mutex_lock(&ctx->mutex);
+    if (!ctx->running || ctx->fatal_error != 0) {
+        int err = ctx->fatal_error ? ctx->fatal_error : ESHUTDOWN;
+        pthread_mutex_unlock(&ctx->mutex);
+        return -err;
+    }
+
+    /* 1. 截断到 base（去掉旧 CRC 尾部） */
+    kvs_uring_req_t *r_trunc = calloc(1, sizeof(*r_trunc));
+    if (!r_trunc) {
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    r_trunc->opcode = 1;                 // FTRUNCATE
+    r_trunc->offset = base;
+
+    /* 2. 命令数据 */
+    kvs_uring_req_t *r_data = calloc(1, sizeof(*r_data));
+    if (!r_data) {
+        free(r_trunc);
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    r_data->data = malloc(len);
+    if (!r_data->data) { free(r_data); free(r_trunc); pthread_mutex_unlock(&ctx->mutex); return -ENOMEM; }
+    memcpy(r_data->data, data, len);
+    r_data->len = len;
+    r_data->offset = base;
+
+    /* 3. CRC 尾部 */
+    kvs_uring_req_t *r_tail = calloc(1, sizeof(*r_tail));
+    if (!r_tail) {
+        free(r_data->data); free(r_data); free(r_trunc);
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    r_tail->data = malloc(tail_len);
+    if (!r_tail->data) {
+        free(r_tail); free(r_data->data); free(r_data); free(r_trunc);
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    memcpy(r_tail->data, tail, tail_len);
+    r_tail->len = tail_len;
+    r_tail->offset = base + (off_t)len;
+
+    /* 按序入队 */
+    if (ctx->tail) ctx->tail->next = r_trunc;
+    else ctx->head = r_trunc;
+    r_trunc->next = r_data;
+    r_data->next = r_tail;
+    r_tail->next = NULL;
+    ctx->tail = r_tail;
+    ctx->queued += 3;
+    ctx->submitted += 3;
+
+    ctx->next_offset = base + (off_t)len + (off_t)tail_len;
+
     pthread_cond_signal(&ctx->cond);
     pthread_mutex_unlock(&ctx->mutex);
     return 0;
