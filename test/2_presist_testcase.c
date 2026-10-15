@@ -274,36 +274,8 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[2]);
     mode = atoi(argv[3]);
 
-    /* ============================================================
-     * 加载配置
-     * ============================================================ */
-    if (kvs_config_load("config/master.conf") < 0) {
-        printf("Load config failed\n");
-        return -1;
-    }
 
-    /* ============================================================
-     * 根据 mode 校验配置
-     * ============================================================ */
-    if (mode == 1 || mode == 2) {
-        /* AOF 测试：要求 aof.enable = true */
-        if (!g_config.aof_enable) {
-            printf("[ERROR] mode %d requires aof.enable=true in config/master.conf\n", mode);
-            printf("        current aof.enable=false\n");
-            return -1;
-        }
-        printf("[Config] aof.enable=true (OK)\n");
-    }
-    else if (mode == 3 || mode == 4) {
-        /* SNAP 测试：要求 snap.enable = true */
-        if (!g_config.snap_enable) {
-            printf("[ERROR] mode %d requires snap.enable=true in config/master.conf\n", mode);
-            printf("        current snap.enable=false\n");
-            return -1;
-        }
-        printf("[Config] snap.enable=true (OK)\n");
-    }
-    else {
+    if (mode < 1 || mode > 4) {
         printf("[ERROR] Unknown mode: %d\n", mode);
         return -1;
     }

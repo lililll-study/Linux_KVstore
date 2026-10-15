@@ -35,21 +35,18 @@ int connect_tcpserver(const char *ip, unsigned short port) {
 
 /* 追加 RESP SET 到 buf，外层包 *1 */
 static int append_set(char *buf, int len, const char *key, const char *value) {
-    len += sprintf(buf + len, "*1\r\n");       // ← 外层 *1，表示 1 条命令
     len += sprintf(buf + len, "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
                    (int)strlen(key), key, (int)strlen(value), value);
     return len;
 }
 
 static int append_get(char *buf, int len, const char *key) {
-    len += sprintf(buf + len, "*1\r\n");
     len += sprintf(buf + len, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n",
                    (int)strlen(key), key);
     return len;
 }
 
 static int append_save(char *buf, int len) {
-    len += sprintf(buf + len, "*1\r\n");
     len += sprintf(buf + len, "*1\r\n$4\r\nSAVE\r\n");
     return len;
 }
