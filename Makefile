@@ -62,8 +62,6 @@ CFLAGS = -Wall -g $(NET_FLAG) $(INC)
 DATA_DIR  = data
 AOF_FILE  = $(DATA_DIR)/data_aof.aof
 SNAP_FILE = $(DATA_DIR)/data_snap.snap
-CRC_AOF   = $(DATA_DIR)/crc_aof.dat
-CRC_SNAP  = $(DATA_DIR)/crc_snap.dat
 
 # 日志文件
 LOG_DIR  = logs
@@ -132,11 +130,9 @@ clean:
 	@mkdir -p $(DATA_DIR)
 	@: > $(AOF_FILE)      # 清空 AOF
 	@: > $(SNAP_FILE)     # 清空 SNAP
-	@: > $(CRC_AOF)       # 清空 CRC-AOF
-	@: > $(CRC_SNAP)      # 清空 CRC-SNAP
 	@: > $(LOG)      	  # 清空 log
 	@echo "Data and log files cleared:"
-	@ls -l $(AOF_FILE) $(SNAP_FILE) $(CRC_AOF) $(CRC_SNAP) $(LOG)
+	@ls -l $(AOF_FILE) $(SNAP_FILE) $(LOG)
 	@echo "Clean complete"
 
 .PHONY: all clean cleanall dirs submodule reactor ntyco
