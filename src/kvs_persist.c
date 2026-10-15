@@ -194,14 +194,7 @@ static int mmap_parse_resp_command(const char *data, size_t size,
         }                                                               \
     } while (0)
 
-    /* 1. 外层 *N\r\n */
-    if (p >= size) return 0;
-    if (data[p] != '*') return -1;
-    READ_LINE(line, sizeof(line));
-    int outer = atoi(line + 1);
-    if (outer != 1) return -1;
-
-    /* 2. 内层 *M\r\n */
+    /* 扁平 RESP：*M\r\n 数组本身即一条命令（AOF 记录格式） */
     if (p >= size) return 0;
     if (data[p] != '*') return -1;
     READ_LINE(line, sizeof(line));
@@ -309,8 +302,14 @@ static int write_token(FILE *fp, const char *data) {
     return 0;
 }
 
+/* CRC32 值格式化为 8 位十六进制字符串（SNAP 内联 CRC / AOF 尾部用） */
+static const char *crc32_to_hex(uint32_t crc) {
+    static char hexbuf[9];
+    snprintf(hexbuf, sizeof(hexbuf), "%08x", (unsigned)crc);
+    return hexbuf;
+}
+
 /* 底层函数 */
-// 快照保存 需要修改休🍉的地方，此处也应该改为uring的方式进行@@@@@@@@@@@@@@@@@@@@@@@@@
 #if 1
 int save_snapshot_hash(const char *filename) {
     FILE *fp = fopen(filename, "a");
@@ -322,7 +321,9 @@ int save_snapshot_hash(const char *filename) {
         hashnode_t *node = global_hash.nodes[i];
         while (node != NULL) {
             write_token(fp, node->key);
-            write_token(fp, node->value);   // 直接连在一起
+            write_token(fp, node->value);
+            /* 每条 KV 末尾内联 CRC 校验值：$8\r\n<8位hex>\r\n */
+            write_token(fp, crc32_to_hex(crc32_calc_snap(node->key, node->value)));
             node = node->next;
         }
     }
@@ -341,7 +342,9 @@ int save_snapshot_skiptable(const char *filename) {
     kvs_node_t *curr = global_skiptable.header->forward[0];
     while (curr != NULL) {
         write_token(fp, curr->key);
-        write_token(fp, curr->value);   // 直接连在一起
+        write_token(fp, curr->value);
+        /* 每条 KV 末尾内联 CRC 校验值 */
+        write_token(fp, crc32_to_hex(crc32_calc_snap(curr->key, curr->value)));
         curr = curr->forward[0];
     }
     
@@ -394,6 +397,12 @@ static int g_aof_fd = -1;
 // uring封装实例，管理写入队列和worker线程
 static kvs_uring_t *g_aof_uring = NULL;
 
+#if ENABLE_CRC
+// AOF 命令区全文 CRC 累计中间值（初值 0xFFFFFFFF），以及命令区末尾偏移
+static uint32_t g_aof_full_crc = 0xFFFFFFFFu;
+static off_t    g_aof_cmd_end = 0;
+
+#endif
 // 1. 构建写入aof文件的resp数据
 static int build_aof_record(const char *cmd, const char *key, const char *value, char **out_buf, size_t *out_len) {
     if (!cmd || !key || !out_buf || !out_len)
@@ -402,16 +411,16 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     int need;
     // 如果没有value表示是删除del等cmd，有value表示是set等
     if (value) {
-        // *1\r\n*3\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n$LEN(value)\r\nVALUE\r\n
+        // 标准扁平 RESP：*3\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n$LEN(value)\r\nVALUE\r\n
         need = snprintf(NULL, 0,
-                        "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                         strlen(cmd), cmd,
                         strlen(key), key,
                         strlen(value), value);
     } else {
-        // *1\r\n*2\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n
+        // 标准扁平 RESP：*2\r\n$LEN(cmd)\r\nCMD\r\n$LEN(key)\r\nKEY\r\n
         need = snprintf(NULL, 0,
-                        "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                         strlen(cmd), cmd,
                         strlen(key), key);
     }
@@ -422,16 +431,16 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     char *buf = (char *)malloc((size_t)need + 1);
     if (!buf)
         return -ENOMEM;
-    // 按照resp协议格式进行拼接
+    // 按照标准扁平 RESP 协议格式进行拼接
     if (value) {
         snprintf(buf, (size_t)need + 1,
-                "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                 strlen(cmd), cmd,
                 strlen(key), key,
                 strlen(value), value);
     } else {
         snprintf(buf, (size_t)need + 1,
-                "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                 strlen(cmd), cmd,
                 strlen(key), key);
     }
@@ -440,6 +449,50 @@ static int build_aof_record(const char *cmd, const char *key, const char *value,
     *out_len = (size_t)need;
     return 0;
 }
+
+
+#if ENABLE_MMAP && ENABLE_CRC
+/* 扫描已有 AOF 文件：恢复命令区末尾偏移与全文 CRC 累计值（截掉旧尾部） */
+static void aof_scan_existing(void)
+{
+    g_aof_full_crc = 0xFFFFFFFFu;
+    g_aof_cmd_end = 0;
+
+    mmap_file_t mf;
+    if (mmap_file_open(AOF_FILE, &mf) < 0)
+        return;
+    if (mf.size == 0) {
+        mmap_file_close(&mf);
+        return;
+    }
+
+    size_t offset = 0;
+    while (offset < mf.size) {
+        /* 跳过空行 */
+        while (offset < mf.size &&
+               (mf.data[offset] == '\r' || mf.data[offset] == '\n'))
+            offset++;
+        if (offset >= mf.size) break;
+
+        /* 读到 # 标志位：命令区结束 */
+        if (mf.data[offset] == '#') break;
+
+        size_t start = offset;
+        char *tokens[KVS_MAX_TOKENS] = {0};
+        int token_count = 0;
+        int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
+                                               tokens, &token_count);
+        int i;
+        for (i = 0; i < token_count; i++) free(tokens[i]);
+        if (consumed <= 0) break;   /* 半条/损坏，命令区到此为止 */
+
+        g_aof_full_crc = crc32_update(g_aof_full_crc,
+                                      mf.data + start, (size_t)consumed);
+        g_aof_cmd_end = (off_t)offset;
+    }
+    mmap_file_close(&mf);
+}
+#endif
 
 // 2. 进程启动时调用一次，初始化aof的uring环境
 // 调用方：init_kvsengine时
@@ -464,6 +517,11 @@ int persistence_init(void)
         return -err;
     }
 
+#if ENABLE_MMAP && ENABLE_CRC
+    /* 扫描已有命令区，恢复全文 CRC 累计值与命令区末尾偏移 */
+    aof_scan_existing();
+#endif
+
     // 初始化uring子系统，失败就清理fd
     int ret = kvs_uring_init(&g_aof_uring, g_aof_fd, st.st_size);
     if (ret < 0) {
@@ -487,15 +545,6 @@ int persistence_init(void)
 int append_aof(const char *cmd, const char *key, const char *value)
 {
     if (!g_config.aof_enable) return 0;
-#if ENABLE_CRC
-    /*  AOF 每写一条命令，就追加一条 CRC */
-    crc_list_append(&g_crc_list_aof, cmd, key, value);
-
-    /* 每 128 条落一次盘，避免崩溃丢太多 128=0x7F 1024=0x3FF */
-    if ((g_crc_list_aof.count & 0x3FF) == 0) {
-        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-    }
-#endif
     if (!g_aof_uring) return -ESHUTDOWN;    //返回-108：未初始化
 
     char *record = NULL;
@@ -504,8 +553,19 @@ int append_aof(const char *cmd, const char *key, const char *value)
     // 把cmd拼接为aof格式
     int ret = build_aof_record(cmd, key, value, &record, &record_len);
     if (ret < 0) return ret;
-    // 入队@@@
+
+#if ENABLE_CRC
+    /* 增量累计全文 CRC，构造文件尾校验值，一次性截断并重写文件尾 */
+    g_aof_full_crc = crc32_update(g_aof_full_crc, record, record_len);
+    uint32_t final_crc = g_aof_full_crc ^ 0xFFFFFFFFu;
+    char tail[AOF_CRC_TAIL_LEN + 1];
+    snprintf(tail, sizeof(tail), "# AOF_CRC:%08x\r\n", (unsigned)final_crc);
+    ret = kvs_uring_append_cmd(g_aof_uring, record, record_len,
+                               tail, AOF_CRC_TAIL_LEN, g_aof_cmd_end);
+    g_aof_cmd_end += (off_t)record_len;
+#else
     ret = kvs_uring_append(g_aof_uring, record, record_len);
+#endif
     free(record);   // 释放
 
     return ret;
@@ -525,7 +585,12 @@ int persistence_flush(void)
 int persistence_reset_aof(void)
 {
     if (!g_config.aof_enable || !g_aof_uring) return 0;
-    return kvs_uring_reset(g_aof_uring);
+    int ret = kvs_uring_reset(g_aof_uring);
+#if ENABLE_CRC
+    g_aof_full_crc = 0xFFFFFFFFu;
+    g_aof_cmd_end = 0;
+#endif
+    return ret;
 }
 
 // 退出清理：进程退出时清理 AOF 子系统。
@@ -549,6 +614,9 @@ long replay_aof_from(const char *filename, long start_offset) {
     size_t offset = (size_t)start_offset;
     int count = 0;
     long ret = start_offset;
+    uint32_t crc = 0xFFFFFFFFu;
+    /* 仅全量重放（从 0 开始）时对文件尾全文 CRC 做校验 */
+    int verify = (start_offset == 0);
 
     if (mmap_file_open(filename, &mf) < 0) {
         LOG_ERROR("[AOF] mmap_file_open failed: %s\n", filename);
@@ -566,8 +634,54 @@ long replay_aof_from(const char *filename, long start_offset) {
     }
 
     while (offset < mf.size) {
+        /* 跳过空行 / 空白 */
+        while (offset < mf.size &&
+               (mf.data[offset] == '\r' || mf.data[offset] == '\n' ||
+                mf.data[offset] == ' ' || mf.data[offset] == '\t'))
+            offset++;
+
+        if (offset >= mf.size)
+            break;
+
+        /* 标志位：# AOF_CRC: —— 文件尾 CRC，解析最后 8 位 hex 校验值 */
+        if (mf.data[offset] == '#') {
+            uint32_t stored = 0;
+            int ok = 0;
+
+            if (mf.size - offset >= (size_t)AOF_CRC_TAIL_LEN &&
+                strncmp(mf.data + offset, AOF_CRC_PREFIX,
+                        AOF_CRC_PREFIX_LEN) == 0) {
+                char hex[AOF_CRC_HEX_LEN + 1];
+                memcpy(hex, mf.data + offset + AOF_CRC_PREFIX_LEN,
+                       AOF_CRC_HEX_LEN);
+                hex[AOF_CRC_HEX_LEN] = '\0';
+                stored = (uint32_t)strtoul(hex, NULL, 16);
+                ok = 1;
+            }
+
+            if (verify) {
+                if (!ok || stored != (crc ^ 0xFFFFFFFFu)) {
+                    LOG_ERROR("[AOF] CRC MISMATCH: stored=%08x, calc=%08x\n",
+                              ok ? stored : 0, crc ^ 0xFFFFFFFFu);
+                    ret = -1;
+                    break;
+                }
+                LOG_INFO("[AOF] CRC OK: %08x, %d entries\n",
+                         crc ^ 0xFFFFFFFFu, count);
+            } else {
+                /* 增量重放：跳过该尾部行，继续解析后续命令 */
+                char line[64];
+                mmap_read_line(mf.data, mf.size, &offset, line, sizeof(line));
+                continue;
+            }
+
+            ret = (long)offset;
+            break;
+        }
+
         char *tokens[KVS_MAX_TOKENS] = {0};
         int token_count = 0;
+        size_t before = offset;
 
         int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
                                                tokens, &token_count);
@@ -580,15 +694,17 @@ long replay_aof_from(const char *filename, long start_offset) {
             break;
         }
 
+        /* 累计全文 CRC：该命令完整 RESP 字节 */
+        crc = crc32_update(crc, mf.data + before, (size_t)consumed);
+
         /* 执行命令（fd=-1：不写 AOF、不回响应） */
         kvs_filter_protocol(-1, tokens, token_count, NULL);
 
         int i;
         for (i = 0; i < token_count; i++) free(tokens[i]);
         count++;
+        ret = (long)offset;
     }
-
-    ret = (long)offset;
 
     mmap_file_close(&mf);
 
@@ -604,57 +720,6 @@ int replay_aof(const char *filename) {
     long ret = replay_aof_from(filename, 0);
     return (ret < 0) ? -1 : 0;
 }
-
-#if ENABLE_CRC
-long replay_aof_from_with_crc(const char *filename, long start_offset, crc_list_t *crc_out) {
-    mmap_file_t mf;
-    size_t offset = (size_t)start_offset;
-    int count = 0;
-    long ret = start_offset;
-
-    if (mmap_file_open(filename, &mf) < 0) {
-        LOG_ERROR("[AOF] mmap_file_open failed: %s\n", filename);
-        return -1;
-    }
-    if (mf.size == 0) { mmap_file_close(&mf); return start_offset; }
-    if (offset > mf.size) { mmap_file_close(&mf); return -1; }
-
-    while (offset < mf.size) {
-        char *tokens[KVS_MAX_TOKENS] = {0};
-        int token_count = 0;
-
-        int consumed = mmap_parse_resp_command(mf.data, mf.size, &offset,
-                                               tokens, &token_count);
-        if (consumed < 0) {
-            LOG_ERROR("[AOF] FORMAT ERROR at offset=%zu\n", offset);
-            break;
-        }
-        if (consumed == 0) break;   /* 半条命令，等下次 */
-
-#if ENABLE_CRC
-        /* ★ 先追加 CRC，再执行命令 */
-        if (crc_out && token_count >= 2) {
-            const char *cmd   = tokens[0];
-            const char *key   = tokens[1];
-            const char *value = (token_count >= 3) ? tokens[2] : NULL;
-            crc_list_append(crc_out, cmd, key, value);
-        }
-#endif
-
-        kvs_filter_protocol(-1, tokens, token_count, NULL);
-
-        int i;
-        for (i = 0; i < token_count; i++) free(tokens[i]);
-        count++;
-    }
-
-    ret = (long)offset;
-    mmap_file_close(&mf);
-    LOG_INFO("[AOF] replayed(crc) %d entries, offset %ld -> %ld\n",
-           count, start_offset, ret);
-    return ret;
-}
-#endif
 
 #if ENABLE_URING
 int save_snapshots() {
@@ -672,13 +737,8 @@ int save_snapshots() {
         }
     }
 
-#if ENABLE_CRC
-    if (ret == 0) crc_rebuild_snap_list();
-#endif
     return ret;
 }
-
-
 
 
 
@@ -732,7 +792,7 @@ int load_snapshots()
             continue;
         }
 
-        /* 读取 key/value */
+        /* 读取 key/value/CRC */
         if (mf.data[offset] == '$') {
             char *key = mmap_read_token(
                 mf.data, mf.size, &offset);
@@ -751,6 +811,31 @@ int load_snapshots()
                 break;
             }
 
+            /* 读取每条 KV 末尾的内联 CRC 校验值 */
+            char *hex = mmap_read_token(
+                mf.data, mf.size, &offset);
+
+            if (!hex) {
+                LOG_ERROR("[Snap] ERROR: failed to read crc\n");
+                free(key);
+                free(value);
+                break;
+            }
+
+            /* 计算并比对 */
+            uint32_t calc   = crc32_calc_snap(key, value);
+            uint32_t stored = (uint32_t)strtoul(hex, NULL, 16);
+
+            if (stored != calc) {
+                LOG_ERROR("[Snap] CRC MISMATCH key='%s': stored=%08x, calc=%08x\n",
+                          key, stored, calc);
+                free(key);
+                free(value);
+                free(hex);
+                break;
+            }
+
+
             switch (current_engine) {
             case 2:
                 kvs_hash_set(&global_hash, key, value);
@@ -765,12 +850,14 @@ int load_snapshots()
                 LOG_WARN("[Snap] ERROR: unknown engine\n");
                 free(key);
                 free(value);
+                free(hex);
                 mmap_file_close(&mf);
                 return -1;
             }
 
             free(key);
             free(value);
+            free(hex);
             count++;
         } else {
             offset++;
@@ -832,6 +919,26 @@ int load_snapshots() {
                 break;
             }
             
+            /* 读取每条 KV 末尾的内联 CRC 校验值 */
+            char *hex = read_token(fp);
+            if (!hex) {
+                printf("[Snap] ERROR: failed to read crc\n");
+                free(key);
+                free(value);
+                break;
+            }
+
+            uint32_t calc   = crc32_calc_snap(key, value);
+            uint32_t stored = (uint32_t)strtoul(hex, NULL, 16);
+            if (stored != calc) {
+                printf("[Snap] CRC MISMATCH key='%s': stored=%08x, calc=%08x\n",
+                       key, stored, calc);
+                free(key);
+                free(value);
+                free(hex);
+                break;
+            }
+
             // ===== 根据当前引擎分发 =====
             switch (current_engine) {
                 case 2: kvs_hash_set(&global_hash, key, value); break;
@@ -840,6 +947,7 @@ int load_snapshots() {
             
             free(key);
             free(value);
+            free(hex);
             count++;
         }
     }
@@ -876,47 +984,6 @@ int load_snapshots() {
     return ret;
 }
 
-#endif
-
-
-
-#if ENABLE_CRC
-/* 重建 SNAP CRC 列表并落盘到 CRC_LIST_SNAP_FILE
- * 内部流程：reset 全局 g_crc_list_snap → 遍历四引擎 → save
- * 主机 SAVE 后、从机 load_snapshots 后都调它 */
-int crc_rebuild_snap_list(void)
-{
-    crc_list_reset(&g_crc_list_snap);
-
-#if ENABLE_HASH
-    {
-        int i;
-        for (i = 0; i < global_hash.max_slots; i++) {
-            hashnode_t *node = global_hash.nodes[i];
-            while (node != NULL) {
-                crc_list_append(&g_crc_list_snap, "SNAP",
-                                node->key, node->value);
-                node = node->next;
-            }
-        }
-    }
-#endif
-
-#if ENABLE_SKIPTABLE
-    {
-        kvs_node_t *curr = global_skiptable.header->forward[0];
-        while (curr != NULL) {
-            crc_list_append(&g_crc_list_snap, "SNAP",
-                            curr->key, curr->value);
-            curr = curr->forward[0];
-        }
-    }
-#endif
-
-    crc_list_save(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
-    // SYNC_LOG("[CRC] SNAP list rebuilt: %d entries", g_crc_list_snap.count);
-    return 0;
-}
 #endif
 
 
