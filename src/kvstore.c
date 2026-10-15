@@ -110,11 +110,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #if ENABLE_REPBUF
         if (fd >= 0 && fd < MAX_CONN) {
             kvs_conn_ctx_t *pctx = &kvs_conn_ctxs[fd];
-            if (pctx->resp_flat) {
-                const char *pong = "+PONG\r\n";
-                resp_buf_append(pctx, pong, (int)strlen(pong));
-                pctx->send_pending = 1;
-            }
+            const char *pong = "+PONG\r\n";
+            resp_buf_append(pctx, pong, (int)strlen(pong));
+            pctx->send_pending = 1;
         }
 #endif
         return 0;  // 直接返回，不处理
@@ -229,9 +227,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HSET", key, value);
-                }
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -254,9 +250,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HDEL", key, NULL);
-                }
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 不存在 → 0
@@ -269,9 +263,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("HMOD", key, value);
-                }
                 SAFE_APPEND("+OK\r\n");
             } else {
                 SAFE_APPEND("-ERR no such key\r\n");
@@ -294,9 +286,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SSET", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SSET", key, value);
-                }
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -319,9 +309,8 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SDEL", key, NULL);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
                     master_aof_immediate("SDEL", key, NULL);
-                }
+                
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 不存在 → 0
@@ -335,9 +324,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SMOD", key, value);  // 追加AOF
                 // ===== immediate 同步 =====
-                if (g_config.aof_mode == AOF_MODE_IMMEDIATE) {
+                
                     master_aof_immediate("SMOD", key, value);
-                }
+                
                 SAFE_APPEND("+OK\r\n");
             } else {
                 SAFE_APPEND("-ERR no such key\r\n");
@@ -368,7 +357,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 // SAFE_APPEND("+OK\r\n");
                 break;
             }
-
+            if (ret == 0) {
+                persistence_reset_aof();
+            }
             SAFE_APPEND(ret == 0 ? "+OK\r\n" : "-ERR save failed\r\n");
             break;
 #else
@@ -512,30 +503,6 @@ int init_kvengine(void) {
     LOG_INFO("********----  1. Memory-pools init success!  ----********\n");
 #endif
 
-#if ENABLE_CRC
-    /* ★ CRC 列表：必须在任何持久化加载之前初始化 */
-    crc_list_create(&g_crc_list_snap);
-    crc_list_create(&g_crc_list_aof);
-
-    if (g_config.role == ROLE_MASTER) {
-        /* 主机：恢复历史 CRC，保证重启后 seq 不断档 */
-        if (access(CRC_LIST_SNAP_FILE, F_OK) != 0) {
-            LOG_INFO("[CRC] no snap crc file\n");
-        }
-        if (access(CRC_LIST_AOF_FILE, F_OK) != 0) {
-            LOG_INFO("[CRC] no aof crc file\n");
-        }
-        crc_list_load(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
-        crc_list_load(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-        SYNC_LOG("[CRC] master loaded snap=%d aof=%d",
-                 g_crc_list_snap.count, g_crc_list_aof.count);
-    } else {
-        /* 从机：数据来自主机，列表清空 */
-        crc_list_reset(&g_crc_list_snap);
-        crc_list_reset(&g_crc_list_aof);
-        SYNC_LOG("[CRC] slave lists reset");
-    }
-#endif
 
 #if ENABLE_HASH
 	memset(&global_hash, 0, sizeof(kvs_hash_t));
@@ -562,30 +529,16 @@ LOG_INFO("------------ 2. kvs_engine created ----\n");
             if (load_snapshots() != 0) {
                 LOG_INFO("No snapshot found\n");
             }
-#if ENABLE_CRC
-            /* ★ 主机启动：加载 SNAP 后强制重建 SNAP CRC，保证一致 */
-            crc_rebuild_snap_list();
-            SYNC_LOG("[CRC] master SNAP rebuilt crc: %d",
-                    g_crc_list_snap.count);
-#endif
             LOG_INFO("------------ 3. Snapshots loaded ---\n");
         } else {
             LOG_INFO("------------ 3. Snapshots disabled ---\n");
         }
 
         if (g_config.aof_enable) {
-#if ENABLE_CRC
-            /* ★ 主机启动：replay AOF 时同步重建 AOF CRC */
-            crc_list_reset(&g_crc_list_aof);
-            long consumed = replay_aof_from_with_crc(AOF_FILE, 0, &g_crc_list_aof);
-            if (consumed > 0) {
-                crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-                SYNC_LOG("[CRC] master AOF rebuilt crc: %d",
-                        g_crc_list_aof.count);
+            long consumed = replay_aof_from(AOF_FILE, 0);
+            if (consumed < 0) {
+                LOG_INFO("AOF replay failed\n");
             }
-#else
-            replay_aof(AOF_FILE);
-#endif
             LOG_INFO("------------ 4. AOF done ---\n");
 #if ENABLE_URING
             if (persistence_init() != 0) {
@@ -604,12 +557,6 @@ LOG_INFO("------------ 2. kvs_engine created ----\n");
 }
 
 void dest_kvengine(void) {
-#if ENABLE_CRC
-    crc_list_save(&g_crc_list_snap, CRC_LIST_SNAP_FILE);
-    crc_list_save(&g_crc_list_aof,  CRC_LIST_AOF_FILE);
-    crc_list_destroy(&g_crc_list_snap);
-    crc_list_destroy(&g_crc_list_aof);
-#endif
 #if ENABLE_PERSIST
     /* Drain/stop AOF before destroying the KV engine. */
     persistence_shutdown();
