@@ -217,10 +217,12 @@ static int submit_requests(struct kvs_uring *ctx, kvs_uring_req_t **reqs, size_t
         kvs_uring_req_t *req = reqs[n];
         sqe->user_data = (uint64_t)(uintptr_t)req;
         if (req->opcode == 1) {
-            /* 截断文件到 offset */
-            sqe->opcode = IORING_OP_FTRUNCATE;
-            sqe->fd = ctx->fd;
-            sqe->off = (uint64_t)req->offset;
+            /* io_uring 无 ftruncate 操作码：同步执行截断，
+             * 用 NOP 占一个 SQE/CQE 槽位，保持 req 的 CQE 生命周期不变
+             * （req->len == 0，reap_one 期望 res == 0，校验自然通过） */
+            if (ftruncate(ctx->fd, req->offset) < 0) return -errno;
+            sqe->opcode = IORING_OP_NOP;
+            sqe->fd = -1;
         } else {
             sqe->opcode = IORING_OP_WRITE;
             sqe->fd = ctx->fd;
