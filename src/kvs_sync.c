@@ -28,10 +28,8 @@
 typedef struct {
     int fd;                    // 同步连接fd
     int is_active;             // 是否活跃
-    long last_size[1];         // 每个AOF文件的最后大小
     time_t last_heartbeat;     // 上次心跳时间
     pthread_t recv_thread;     // 从节点接收线程
-    pthread_t check_thread;    // 主节点检测线程
     long consumed_offset;      // ← 新增：从机已 replay 到的 AOF 偏移
 } aof_sync_ctx_t;
 
@@ -248,64 +246,24 @@ int send_all_files(int fd) {
 
 /**
  * @func 主节点收到sync，根据同步模式分发数据
- * aof：
- *      立即同步：每条cmd执行aof_master_immediate
- *      定时同步：5s检查aof文件，并发送
+ * aof：立即同步，每条cmd执行aof_master_immediate
  * snap：
  */
-
-// ===== 主节点：定时同步（everysec） =====
-void* master_aof_everysec_thread(void* arg) {
-    while (g_aof_ctx.is_active && g_aof_ctx.fd > 0) {
-        sleep(5);
-        struct stat st;
-        if (stat(AOF_FILE, &st) != 0) continue;
-        long start = g_aof_ctx.last_size[0];
-        long to_send = st.st_size - start;
-        if (to_send <= 0) continue;
-
-        FILE* fp = fopen(AOF_FILE, "r");
-        if (!fp) continue;
-        fseek(fp, start, SEEK_SET);
-
-        char buf[4096];
-        long sent = 0;
-        size_t n;
-        while (sent < to_send &&
-               (n = fread(buf, 1,
-                   (to_send - sent) < (long)sizeof(buf) ?
-                   (size_t)(to_send - sent) : sizeof(buf), fp)) > 0) {
-            if (safe_send(g_aof_ctx.fd, buf, n) < 0) {
-                fclose(fp);
-                goto cleanup;
-            }
-            sent += n;
-        }
-        fclose(fp);
-        g_aof_ctx.last_size[0] = start + sent;
-        SYNC_LOG_M("AOF everysec: sent [%ld, %ld) = %ld bytes", start, start + sent, sent);
-    }
-cleanup:
-    g_aof_ctx.is_active = 0;
-    return NULL;
-}
-
 // ===== 主节点：立即同步 (immediate) =====
 int master_aof_immediate(const char *cmd, const char *key, const char *value) {
-    if (g_config.aof_mode != AOF_MODE_IMMEDIATE) return 0;
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
     char buf[4096];
     int len = 0;
     if (value) {
         len = snprintf(buf, sizeof(buf),
-                       "*1\r\n*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                        strlen(cmd), cmd,
                        strlen(key), key,
                        strlen(value), value);
     } else {
         len = snprintf(buf, sizeof(buf),
-                       "*1\r\n*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                        strlen(cmd), cmd,
                        strlen(key), key);
     }
@@ -351,14 +309,6 @@ int handle_sync_request(int fd) {
             SYNC_ERR("send AOF content failed");
             close(fd);
             return -1;
-        }
-
-        // ★ 关键：last_size = snap_size，而不是发送后的文件大小
-        g_aof_ctx.last_size[0] = snap_size;
-
-        if (g_config.aof_mode == AOF_MODE_EVERYSEC) {
-            pthread_create(&g_aof_ctx.check_thread, NULL, master_aof_everysec_thread, NULL);
-            pthread_detach(g_aof_ctx.check_thread);
         }
 
     } else if (g_config.snap_enable) {
@@ -481,20 +431,12 @@ void* slave_aof_recv_thread(void* arg) {
             /* 超时：把当前攒下的数据一次性 replay */
             struct stat st;
             if (stat(AOF_FILE, &st) == 0 && st.st_size > ctx->consumed_offset) {
-#if ENABLE_CRC
+
                 /*  从 consumed_offset 起，只处理新增部分 */
-                long new_offset = replay_aof_from_with_crc(
-                    AOF_FILE, ctx->consumed_offset, &g_crc_list_aof);
-                if (new_offset > ctx->consumed_offset) {
-                    ctx->consumed_offset = new_offset;
-                    crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-                }
-#else
                 long new_offset = replay_aof_from(AOF_FILE, ctx->consumed_offset);
                 if (new_offset > ctx->consumed_offset) {
                     ctx->consumed_offset = new_offset;
                 }
-#endif
             }
 
             /* 发心跳 */
@@ -528,7 +470,7 @@ void* slave_snap_recv_thread(void* arg) {
         sleep(10);
 
         // 1. 发 SAVE 给主机（SAVE 本身即心跳）
-        const char *save_cmd = "*1\r\n*1\r\n$4\r\nSAVE\r\n";
+        const char *save_cmd = "*1\r\n$4\r\nSAVE\r\n";
         if (safe_send(fd, save_cmd, strlen(save_cmd)) < 0) break;
 
 
@@ -539,9 +481,6 @@ void* slave_snap_recv_thread(void* arg) {
         }
         load_snapshots();
         SYNC_LOG_S("SNAP loaded");
-#if ENABLE_CRC
-        crc_rebuild_snap_list();
-#endif
     }
     ctx->is_active = 0;
     if (fd > 0) {
@@ -563,21 +502,11 @@ void slave_handle_aof_mode(int fd) {
         close(fd);
         return;
     }
-#if ENABLE_CRC
-    /*  从机清空本地 CRC 列表（对齐主机的全量快照点） */
-    crc_list_reset(&g_crc_list_aof);
-#endif
 
     SYNC_LOG_S("AOF stream received, replaying...");
-#if ENABLE_CRC
-    long consumed = replay_aof_from_with_crc(AOF_FILE, 0, &g_crc_list_aof);
-    if (consumed >= 0) {
-        crc_list_save(&g_crc_list_aof, CRC_LIST_AOF_FILE);
-        SYNC_LOG_S("AOF full replay done, crc=%d", g_crc_list_aof.count);
-    }
-#else
+
     long consumed = replay_aof_from(AOF_FILE, 0);
-#endif
+
     if (consumed < 0) {
         SYNC_ERR("replay_aof_from failed");
         close(fd);
@@ -654,7 +583,7 @@ int sync_from_master(const char *master_ip, int port) {
     SYNC_LOG_S("connected to master");
 
     // 发送SYNC命令到master，开始同步
-    const char *sync_cmd = "*1\r\n*1\r\n$4\r\nSYNC\r\n";
+    const char *sync_cmd = "*1\r\n$4\r\nSYNC\r\n";
     if (safe_send(fd, sync_cmd, strlen(sync_cmd)) < 0) {
         perror("send SYNC");
         close(fd);

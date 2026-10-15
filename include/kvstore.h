@@ -372,7 +372,6 @@ int is_slave_save(int fd);
 void init_aof_sync_ctx(void);
 
 // 主节点同步模式及线程函数
-void* master_aof_everysec_thread(void* arg);   //  主机：AOF everysec 模式
 int master_aof_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
 
 
@@ -405,10 +404,6 @@ uint32_t crc32_calc_snap(const char *key, const char *value);
 ==========================================================================================
 */
 
-// AOF 同步方式
-#define AOF_MODE_EVERYSEC   0
-#define AOF_MODE_IMMEDIATE  1
-
 typedef enum {
     ROLE_MASTER = 0,
     ROLE_SLAVE
@@ -423,7 +418,6 @@ typedef struct {
     int snap_enable;
     int aof_enable;
 
-    int aof_mode;       // 0: everysec, 1: immediate
     int log_level;      // 日志级别，见 log_level_t
 } kvs_config_t;
 
