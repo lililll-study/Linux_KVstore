@@ -6,7 +6,6 @@
 // ===== RESP 解析状态枚举 =====
 enum {
     RESP_TOTAL_HEAD = 0,      // 读 *N\r\n (数组头)
-    RESP_CMD_HEAD,           // 读 *N\r\n (命令头)
     RESP_TOKEN,         // 读 $L\r\n (token头)
     RESP_DATA           // 读数据内容
 };
@@ -43,7 +42,6 @@ int kvs_ctx_init(kvs_conn_ctx_t *ctx) {
     ctx->resp_scmd_unit_num = 0;
     ctx->resp_scmd_unit_idx = 0;
     ctx->resp_token_len = 0;
-    ctx->resp_flat = 0;             // 0: 旧嵌套 RESP; 1: redis-cli 扁平 RESP
     memset(ctx->resp_tokens, 0, sizeof(ctx->resp_tokens));
     ctx->resp_token_count = 0;
     ctx->resp_cmd_start = 0;
@@ -145,24 +143,11 @@ static void resp_reset_and_consume(kvs_conn_ctx_t *ctx, int consume_len) {
     ctx->resp_scmd_unit_idx = 0;
     ctx->resp_token_len = 0;
     ctx->resp_cmd_start = 0;
-    ctx->resp_flat = 0;
     resp_free_tokens(ctx);
     if (consume_len <= 0) consume_len = 1;  // 至少跳 1 字节，避免死循环
     kvs_ctx_consume(ctx, consume_len);
 }
 
-/*
-// 解析器收到的数据（两种格式）
-// 1) 旧嵌套格式（本项目客户端 / 主从心跳）
-//    *2\r\n                          // ← 外层数组，2个元素（2条命令）
-//    *3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n  // ← 元素1：数组
-//    *2\r\n $3\r\nGET\r\n $1\r\na\r\n             // ← 元素2：数组
-// 2) redis-cli 扁平格式（一个数组就是一条命令）
-//    *3\r\n $3\r\nSET\r\n $1\r\na\r\n $1\r\n1\r\n
-// 区分方法：读完外层 *N\r\n 后探测下一字节：
-//    '$' = 扁平格式（redis-cli，N 个 token 构成一条命令）
-//    '*' = 嵌套格式（旧客户端，外层数组包 N 条命令）
-*/
 
 
 /**
@@ -234,83 +219,25 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             processed_data = p - data; // 处理过的数据
 
             // ===== 探测下一字节，区分请求格式 =====
-            //   redis-cli 扁平 RESP: *N\r\n$len\r\n... （数组就是一条命令）
-            //   旧嵌套 RESP:        *N\r\n*n\r\n... （外层数组包 N 条命令）
+            // ===== 扁平 RESP：*N\r\n 后的 N 个 token 就是一条命令 =====
+            // （已删除旧嵌套格式兼容协议）
             if (processed_data >= remain) {
                 // 数据还没到（`*N\r\n` 可能就是 buffer 末尾），回退到数组头不消费，等更多数据
                 processed_data = ctx->resp_cmd_start;
                 break;
             }
             if (data[processed_data] == '$') {
-                // 扁平格式（redis-cli）：整条数组是一条命令，N 个 token
-                ctx->resp_flat = 1;
+                // 扁平格式：整条数组是一条命令，N 个 token
                 ctx->resp_scmd_unit_num = ctx->resp_cmd_num;
                 ctx->resp_scmd_unit_idx = 0;
                 ctx->resp_cmd_num = 1;
                 ctx->resp_token_count = 0;
                 ctx->resp_state = RESP_TOKEN;
-            } else if (data[processed_data] == '*') {
-                // 嵌套格式（旧客户端 / 主从心跳）
-                ctx->resp_flat = 0;
-                ctx->resp_cmd_idx = 0;
-                ctx->resp_state = RESP_CMD_HEAD;
             } else {
                 LOG_INFO("[RESP1] ERROR: unexpected char '%c' after *N\\r\\n\n", data[processed_data]);
                 resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
                 break;
             }
-        }
-
-        // 4. 然后找第一个cmd，同样检测头*y\r\n，y代表该cmd的token个数，此处循环检测x次
-        if (ctx->resp_state == RESP_CMD_HEAD) {
-            p = data + processed_data; // 当前数据起始位置
-            left = remain - processed_data; // 当前未处理的数据
-            // 5. 如果没找到也break等数据
-            if (left < 4) break; // 如果剩余数据少于4个，那么继续攒数据
-            if (p[0] != '*') {//如果起始不是*说明数据错误
-                LOG_INFO("[RESP2] ERROR: cmd_head is wrong");
-                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
-                break;
-            }
-
-            // 3. 如果检测到，就把单条single cmd unit的数量记录下来
-            p++; // 跳过*
-            char *num_start = p;
-            int num_len = 0;
-            // 只要p没越界且是数字0-9，就后移
-            while (p < data + remain && (*p >= '0' && *p <= '9')) {
-                num_len++;
-                p++;
-            }
-
-            // 如果没有cmd长度，报错并停止循环
-            if (num_len == 0) {
-                LOG_INFO("[RESP2] ERROR: cmd_unit num is wrong");
-                break;
-            }
-
-            // 如果不是\r\n就等待更多数据
-            if (p >= data + remain || *p != '\r') {
-                break;  // 数据不完整，等待更多
-            }
-            if (p + 1 >= data + remain || *(p + 1) != '\n') {
-                break;  // 数据不完整，等待更多
-            }
-            // 提取数字
-            char cmd_num_buf[32];
-            memcpy(cmd_num_buf, num_start, num_len);
-            cmd_num_buf[num_len] = '\0'; // 确保字符串以结束符结尾
-            ctx->resp_scmd_unit_num = atoi(cmd_num_buf);// 把头值存入resp_sgl_cmd_unit_count
-            ctx->resp_scmd_unit_idx = 0;    // 准备处理第一个元素
-            // printf("debug resp_scmd_unit_num: %d\n", ctx->resp_scmd_unit_num);
-            // 跳过 \r\n
-            p += 2;
-            processed_data = p - data;
-
-            // 开始解析本条命令的 token
-            resp_free_tokens(ctx);
-            ctx->resp_token_count = 0;
-            ctx->resp_state = RESP_TOKEN;
         }
 
         // 6. 如果找到了，检测token头$z\r\n，z代表输入的字节数
@@ -398,14 +325,10 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
                 }
 
                 resp_free_tokens(ctx);
-                ctx->resp_cmd_idx++;
-                if (ctx->resp_cmd_idx >= ctx->resp_cmd_num) {
-                    ctx->resp_state = RESP_TOTAL_HEAD;
-                    ctx->resp_cmd_num = 0;
-                    ctx->resp_cmd_idx = 0;
-                } else {
-                    ctx->resp_state = RESP_CMD_HEAD;
-                }
+                // 扁平格式：一条数组 = 一条命令，执行完直接回到数组头
+                ctx->resp_state = RESP_TOTAL_HEAD;
+                ctx->resp_cmd_num = 0;
+                ctx->resp_cmd_idx = 0;
             } else {
                 ctx->resp_state = RESP_TOKEN;
             }
