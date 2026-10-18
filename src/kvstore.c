@@ -105,8 +105,9 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     // 移除 response == NULL 的检查
     // ===== PING/PONG =====
     //   redis-cli 扁平请求: 回复 +PONG（标准 RESP）
-    //   旧嵌套格式（主从心跳）: 保持静默，避免从机把响应误当 AOF 内容写入
+    //   主从同步连接（复制心跳）: 必须保持静默，避免从机把 /+PONG 误当 AOF 内容写入
     if (strcmp(tokens[0], "PING") == 0 || strcmp(tokens[0], "PONG") == 0) {
+        if (is_sync_peer(fd)) return 0;
 #if ENABLE_REPBUF
         if (fd >= 0 && fd < MAX_CONN) {
             kvs_conn_ctx_t *pctx = &kvs_conn_ctxs[fd];

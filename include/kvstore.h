@@ -39,7 +39,7 @@
 #define ENABLE_SKIPTABLE	 1
 
 #define ENABLE_PERSIST 		 1	 // 开启本地持久化存储
-#define ENABLE_MEMPOOL		 0   // 开启内存池
+#define ENABLE_MEMPOOL		 1   // 开启内存池
 
 #define ENABLE_CMD_BATCH	 1   // 开启cmd批处理
 
@@ -368,6 +368,7 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker);
 // 主从同步改造
 
 int is_slave_save(int fd);
+int is_sync_peer(int fd);       // fd 是否为同步（复制）连接
 
 void init_aof_sync_ctx(void);
 
