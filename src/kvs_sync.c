@@ -251,6 +251,7 @@ int send_all_files(int fd) {
  */
 // ===== 主节点：立即同步 (immediate) =====
 int master_aof_immediate(const char *cmd, const char *key, const char *value) {
+    if (!g_is_master) return 0;      /* 仅主节点推送增量，避免从机重放时把命令回灌给主机 */
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
     char buf[4096];
@@ -273,6 +274,18 @@ int master_aof_immediate(const char *cmd, const char *key, const char *value) {
 // ===== 主节点：判断是不是从机的 SAVE 请求 =====
 int is_slave_save(int fd) {
     return (g_snap_ctx.is_active && g_snap_ctx.fd == fd);
+}
+
+// ===== 判断 fd 是否为同步（复制）连接 =====
+// 复制连接上必须保持静默：从机把收到的任何字节都当作 AOF 追加，
+// 若主机回 +PONG/错误响应，会被写进从机 AOF 并让增量重放卡死。
+int is_sync_peer(int fd) {
+    if (fd < 0) return 0;
+#if ENABLE_AOF_SYNC
+    if (g_aof_ctx.is_active && g_aof_ctx.fd == fd) return 1;
+#endif
+    if (g_snap_ctx.is_active && g_snap_ctx.fd == fd) return 1;
+    return 0;
 }
 
 // ===== 主机：处理 SYNC 请求 =====
