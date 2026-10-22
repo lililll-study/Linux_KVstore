@@ -4,7 +4,7 @@
 
 
 typedef int (*RCALLBACK)(int fd);
-#define BUFFER_LENGTH       1024   // 大约可支持700条request和4096条response批量发
+#define BUFFER_LENGTH       16384  // 单次 recv 容量：覆盖常见流水线批量，避免请求分片
 
 #define ENABLE_HTTP     0
 #define ENABLE_WS       0
