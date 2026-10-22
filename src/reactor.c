@@ -63,29 +63,26 @@ int kvs_response(struct conn *c) {
         char *data = resp_buf_get_data(ctx, &data_len);
         
         if (data && data_len > 0) {
-            int chunk = data_len > 2000 ? 2000 : data_len;
-            int n = send(c->fd, data, chunk, 0);
-            // printf("debug 5: 回发成功, 发送了 %d 字节\n", n);
-            if (n < 0) {
-                perror("send");
-                close(c->fd);
-                epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
-                cleanup_connection(c->fd);
-                return -1;
+            /* 一次事件把待发响应全部发完：避免响应被切成多段触发 Nagle 停顿 */
+            int sent = 0;
+            while (sent < data_len) {
+                int n = send(c->fd, data + sent, data_len - sent, 0);
+                if (n < 0) {
+                    perror("send");
+                    close(c->fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                    cleanup_connection(c->fd);
+                    return -1;
+                }
+                sent += n;
             }
             // 标记数据已发送
-            resp_buf_advance(ctx, n);
-            
-            // 如果还有数据未发送，保持 EPOLLOUT 事件
-            if (resp_buf_has_data(ctx)) {
-                // printf("debug 6: 还有数据未发完，保持EPOLLOUT\n");
-                set_event(c->fd, EPOLLOUT, 0);
-            } else {
-                // 数据全部发送完成，重置状态，切换回 EPOLLIN
-                ctx->send_pending = 0;
-                set_event(c->fd, EPOLLIN, 0);
-            }
-            return n;
+            resp_buf_advance(ctx, sent);
+
+            // 数据全部发送完成，重置状态，切换回 EPOLLIN
+            ctx->send_pending = 0;
+            set_event(c->fd, EPOLLIN, 0);
+            return sent;
         }
     }
     
@@ -178,7 +175,7 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
     // struct conn *c = &conn_list[fd];
-    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
+    // memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
 
     // 阻塞写法
     int data_len = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
