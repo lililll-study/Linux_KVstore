@@ -17,6 +17,10 @@ mempool_t *resp_pool = NULL;
 static const size_t g_string_sizes[]  = KVS_STRING_CLASS_SIZES;
 static const size_t g_string_counts[] = KVS_STRING_CLASS_COUNTS;
 
+// 跳表节点池 size-class 配置
+static const size_t g_skipnode_sizes[]  = KVS_SKIPNODE_CLASS_SIZES;
+static const size_t g_skipnode_counts[] = KVS_SKIPNODE_CLASS_COUNTS;
+
 // 首批批量：上限的 1/64，小池直接全量，降低启动预付
 static size_t _initial_blocks(size_t max_blocks) {
     size_t n = max_blocks / 64;
@@ -251,10 +255,9 @@ int init_mempools(void) {
     }
     
     // 跳表：1024个节点（包含forward数组），2048个字符串
-    skiptable_node_pool = kvs_mempool_create(
-        sizeof(kvs_node_t) + (MAX_LEVEL + 1) * sizeof(kvs_node_t*),
-        KVS_POOL_NODE_COUNT
-    );
+    skiptable_node_pool = kvs_mempool_create_group(
+        g_skipnode_sizes, g_skipnode_counts, KVS_SKIPNODE_CLASSES);
+        
     skiptable_string_pool = kvs_mempool_create_group(g_string_sizes, g_string_counts, KVS_STRING_CLASSES);
     if (!skiptable_node_pool || !skiptable_string_pool){
         // printf("Failed to create skiptable_node_pool\n");
