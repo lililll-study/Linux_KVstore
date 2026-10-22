@@ -8,6 +8,7 @@ kvs_config_t g_config = {
     .master_port = 2000,
     .snap_enable = 1,      // 默认开启快照同步
     .aof_enable = 0,        // 默认关闭 AOF 同步
+    .aof_crc_enable = 1,    // 默认开启aofcrc
     .log_level = LOG_LEVEL_INFO,
 };
 
@@ -113,6 +114,8 @@ int kvs_config_load(const char *filename) {
         } else if (subkey && strcmp(key, "aof") == 0) {
             if (strcmp(subkey, "enable") == 0) {
                 g_config.aof_enable = parse_bool(value);
+            } else if (strcmp(subkey, "crc") == 0) {
+                g_config.aof_crc_enable = parse_bool(value);
             }
         }
         
@@ -139,6 +142,7 @@ void kvs_config_print(void) {
     }
     printf("  snap.enable : %s\n", g_config.snap_enable ? "true" : "false");
     printf("  aof.enable  : %s\n", g_config.aof_enable ? "true" : "false");
+    printf("  aof.crc  : %s\n", g_config.aof_crc_enable ? "true" : "false");
     static const char *lv_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
     int lv = g_config.log_level;
     if (lv < LOG_LEVEL_DEBUG) lv = LOG_LEVEL_DEBUG;
