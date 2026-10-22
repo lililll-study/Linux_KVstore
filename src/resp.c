@@ -176,10 +176,36 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
             // printf("debug RESP_TOTAL_HEAD\n");
             // 2. 如果没检测到直接break，说明数据不够，等更多数据再检测（防止分包粘包问题）
             if (left < 4) break;
-            if (p[0] != '*') {//如果起始不是*说明数据错误
-                LOG_INFO("[RESP1] ERROR: cmd_total_head is wrong");
-                resp_reset_and_consume(ctx, processed_data == 0 ? 1 : processed_data);
-                break;
+            if (p[0] != '*') {
+                /* inline 协议：一行一条命令，空格分隔 */
+                /* （redis-benchmark 的 PING_INLINE、telnet 手敲都是这种格式） */
+                char *line_end = memchr(p, '\n', left);
+                if (!line_end) break;                    /* 行未完整，等更多数据 */
+                int line_len = (int)(line_end - p) + 1;
+
+                char line_buf[512];
+                int copy = line_len;
+                if (copy > 0 && p[copy - 1] == '\n') copy--;
+                if (copy > 0 && p[copy - 1] == '\r') copy--;
+                if (copy >= (int)sizeof(line_buf)) copy = (int)sizeof(line_buf) - 1;
+                if (copy > 0) memcpy(line_buf, p, copy);
+                line_buf[copy] = '\0';
+
+                if (copy > 0) {
+                    char *tokens[KVS_MAX_TOKENS] = {0};
+                    int tcount = 0;
+                    char *save = NULL;
+                    char *tok = strtok_r(line_buf, " \t", &save);
+                    while (tok && tcount < KVS_MAX_TOKENS) {
+                        tokens[tcount++] = tok;
+                        tok = strtok_r(NULL, " \t", &save);
+                    }
+                    if (tcount > 0) {
+                        kvs_filter_protocol(fd, tokens, tcount, NULL);
+                    }
+                }
+                processed_data += line_len;
+                continue;
             }
             // 3. 如果检测到，就把cmd_num记录下来
             p++; // 跳过*
@@ -335,6 +361,8 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
         }
     }
     // ===== 消费已处理的数据 =====
+    // TOKEN/DATA 半读 break 时 processed_data 不推进，指向断点位置，
+    // 消费后半条命令从断点保留在缓冲区开头，下一块数据自然续接。
     if (processed_data > 0) {
         kvs_ctx_consume(ctx, processed_data);
     }
