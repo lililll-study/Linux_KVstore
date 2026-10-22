@@ -106,6 +106,75 @@ static int append_save(char *buf, int len) {
     return len;
 }
 
+
+/* ============================================================
+ * mode 10~13：全量持久化(SAVE)不同频率下的 QPS
+ *   共插入 TOTAL_INSERT 条 HSET，每 interval 条触发一次 SAVE
+ *   mode 10: 1k/次   mode 11: 1w/次
+ *   mode 12: 10w/次  mode 13: 100w/次(仅末尾一次)
+ *   QPS(total) = 总条数 / (写入耗时 + SAVE 耗时)
+ * ============================================================ */
+#define TOTAL_INSERT    1000000     /* 100w */
+#define BENCH_BATCH     1000        /* 每轮发送并收满响应的命令数 */
+
+#define TIME_SUB_US(tv1, tv2) \
+    ((double)((tv1.tv_sec - tv2.tv_sec) * 1000000LL + \
+              (tv1.tv_usec - tv2.tv_usec)))
+
+static int send_all(int connfd, const char *buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(connfd, buf + sent, len - sent, 0);
+        if (n <= 0) { perror("send"); return -1; }
+        sent += n;
+    }
+    return 0;
+}
+
+/* 接收一条完整响应 */
+static int recv_one_resp(int connfd, char *out, int cap) {
+    char buf[256];
+    int len = 0;
+    while (len < (int)sizeof(buf) - 1) {
+        int n = recv(connfd, buf + len, sizeof(buf) - 1 - len, 0);
+        if (n <= 0) { perror("recv"); return -1; }
+        len += n;
+        buf[len] = '\0';
+        if (resp_parse_one(buf, buf + len, out, cap) != NULL)
+            return 0;
+    }
+    return -1;
+}
+
+/* 收满 need 条响应；边解析边消费，防止缓冲区溢出；ok 累计 ":1" 条数 */
+static int drain_responses(int connfd, char *resp, int cap, int *rlen,
+                           int need, int *ok) {
+    int got = 0;
+    while (got < need) {
+        if (*rlen >= cap - 1) return -1;
+        int n = recv(connfd, resp + *rlen, cap - 1 - *rlen, 0);
+        if (n <= 0) { perror("recv"); return -1; }
+        *rlen += n;
+
+        const char *p = resp, *end = resp + *rlen;
+        char out[64];
+        while (got < need) {
+            const char *next = resp_parse_one(p, end, out, sizeof(out));
+            if (!next) break;
+            if (strcmp(out, "1") == 0) (*ok)++;
+            got++;
+            p = next;
+        }
+        int consumed = (int)(p - resp);
+        if (consumed > 0) {
+            memmove(resp, resp + consumed, *rlen - consumed);
+            *rlen -= consumed;
+            resp[*rlen] = '\0';
+        }
+    }
+    return got;
+}
+
 /* 边发边收：每次 send CHUNK_SIZE 字节，发完立刻 recv */
 static int send_and_recv(int connfd, const char *batch, int batch_len,
                          char *resp, int resp_cap, int expected_count) {
@@ -257,16 +326,98 @@ void send_save(int connfd) {
     printf("SAVE: %s", resp);
 }
 
+void bench_save_qps(int connfd, int interval, const char *set_cmd) {
+    int cap  = BENCH_BATCH * 96;
+    int rcap = 65536;
+    char *batch = (char*)malloc(cap);
+    char *resp  = (char*)malloc(rcap);
+    if (!batch || !resp) { free(batch); free(resp); return; }
+
+    int rlen = 0, ok = 0, inserted = 0;
+    long saves = 0;
+    double insert_us = 0, save_us = 0;
+    struct timeval ta0, ta1, t0, t1, ts, te;
+
+    gettimeofday(&ta0, NULL);
+
+    while (inserted < TOTAL_INSERT) {
+        int n = BENCH_BATCH;
+        if (inserted + n > TOTAL_INSERT) n = TOTAL_INSERT - inserted;
+
+        int blen = 0, i;
+        for (i = 0; i < n; i++) {
+            char key[32], value[32];
+            snprintf(key, sizeof(key), "snap_%07d", inserted + i);
+            snprintf(value, sizeof(value), "val_%07d", inserted + i);
+            
+            // 【修改点】使用传入的 set_cmd (HSET 或 SSET)
+            blen = append_resp_cmd(batch, blen, set_cmd, key, value);
+        }
+
+        gettimeofday(&t0, NULL);
+        if (send_all(connfd, batch, blen) < 0) break;
+        if (drain_responses(connfd, resp, rcap, &rlen, n, &ok) < 0) break;
+        gettimeofday(&t1, NULL);
+        insert_us += TIME_SUB_US(t1, t0);
+        inserted += n;
+
+        if (inserted % 100000 == 0)
+            printf("  progress: inserted=%d (%d%%)\n",
+                   inserted, inserted / (TOTAL_INSERT / 100));
+
+        if (inserted % interval == 0 || inserted == TOTAL_INSERT) {
+            char sbuf[32], out[64];
+            int slen = append_save(sbuf, 0);
+            gettimeofday(&ts, NULL);
+            if (send_all(connfd, sbuf, slen) < 0) break;
+            if (recv_one_resp(connfd, out, sizeof(out)) < 0) break;
+            gettimeofday(&te, NULL);
+            if (strcmp(out, "OK") != 0) {
+                printf("[ERROR] SAVE rejected: %s (snap.enable=true?)\n", out);
+                free(batch); free(resp);
+                return;
+            }
+            save_us += TIME_SUB_US(te, ts);
+            saves++;
+        }
+    }
+
+    gettimeofday(&ta1, NULL);
+    double total_us = TIME_SUB_US(ta1, ta0);
+
+    // 精简后的打印
+    printf("\n===== 测试结果 =====\n");
+    printf("引擎: %s | SAVE间隔: %d\n", set_cmd, interval);
+    printf("写入耗时: %.3f s | 总耗时: %.3f s\n", insert_us / 1000000.0, total_us / 1000000.0);
+    printf("SAVE次数: %ld | 平均SAVE耗时: %.2f ms\n", saves, saves ? save_us / saves / 1000.0 : 0.0);
+    printf("QPS(写入): %.0f req/s\n", inserted * 1000000.0 / insert_us);
+    printf("QPS(总计): %.0f req/s\n", inserted * 1000000.0 / total_us);
+
+    // 异常提示保留
+    if (ok < inserted) {
+        printf(">>> 警告: %d 条返回非 :1（key 已存在，请清数据后重测）\n", inserted - ok);
+    }
+
+    free(batch);
+    free(resp);
+}
+
+
 /* ============================================================
  * main
  * ============================================================ */
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <ip> <port> <mode>\n", argv[0]);
+     if (argc != 4 && argc != 5) { 
+        printf("Usage: %s <ip> <port> <mode> [h|s]\n", argv[0]);
+        printf("  [h|s]: h 代表 Hash(HSET), s 代表 Skiptable(SSET), 默认 h\n");
         printf("  mode 1: AOF  - 插入 10w\n");
         printf("  mode 2: AOF  - 验证 10w\n");
         printf("  mode 3: SNAP - 插入 10w + SAVE\n");
         printf("  mode 4: SNAP - 验证 10w\n");
+        printf("  mode 10: 插入 100w，每 1k 条 SAVE 一次，统计 QPS\n");
+        printf("  mode 11: 插入 100w，每 1w 条 SAVE 一次，统计 QPS\n");
+        printf("  mode 12: 插入 100w，每 10w 条 SAVE 一次，统计 QPS\n");
+        printf("  mode 13: 插入 100w，末尾 SAVE 一次，统计 QPS\n");
         return -1;
     }
 
@@ -274,8 +425,20 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[2]);
     mode = atoi(argv[3]);
 
+    // 【修改点】解析第 4 个参数控制数据结构
+    const char *set_cmd = "HSET"; // 默认 Hash
+    if (argc == 5) {
+        if (argv[4][0] == 's' || argv[4][0] == 'S') {
+            set_cmd = "SSET"; // 跳表
+        } else if (argv[4][0] == 'h' || argv[4][0] == 'H') {
+            set_cmd = "HSET";
+        } else {
+            printf("[ERROR] 未知的数据结构参数: %s，请使用 h 或 s\n", argv[4]);
+            return -1;
+        }
+    }
 
-    if (mode < 1 || mode > 4) {
+    if ((mode < 1 || mode > 4) && (mode < 10 || mode > 13)) {
         printf("[ERROR] Unknown mode: %d\n", mode);
         return -1;
     }
@@ -308,7 +471,15 @@ int main(int argc, char *argv[]) {
         printf("===== SNAP 阶段2: 验证 10w =====\n");
         verify_100k(connfd);
     }
-
+    else if (mode >= 10 && mode <= 13) {
+        static const int intervals[4] = {1000, 10000, 100000, 1000000};
+        int interval = intervals[mode - 10];
+        
+        // 【修改点】把 set_cmd 传进去
+        printf("===== mode %d: 引擎 %s, 每 %d 条 SAVE 一次, 共插入 %d 条 =====\n",
+               mode, set_cmd, interval, TOTAL_INSERT);
+        bench_save_qps(connfd, interval, set_cmd);
+    }
     close(connfd);
     return 0;
 }
