@@ -24,15 +24,20 @@ static int _hash(char *key, int size) {
 
 	if (!key) return -1;
 
-	int sum = 0;
+	/* FNV-1a：逐字节异或乘素数，对顺序数字 key 也有充分散布 */
+	unsigned long h = 2166136261UL;
 	int i = 0;
 
 	while (key[i] != 0) {
-		sum += key[i];
+		h ^= (unsigned char)key[i];
+		h *= 16777619UL;
 		i ++;
 	}
 
-	return sum % size;
+	/* 尾部雪崩：把高位熵混入低位，取模前消除低位相关性 */
+	h ^= h >> 16;
+
+	return (int)(h % (unsigned long)size);
 
 }
 
@@ -115,6 +120,9 @@ int kvs_hash_create(kvs_hash_t *hash) {
 	hash->max_slots = MAX_TABLE_SIZE;
 	hash->count = 0; 
 
+	hash->rehash_nodes = NULL;
+	hash->rehash_slots = 0;
+	hash->rehash_idx = -1;
 	return 0;
 }
 
@@ -146,6 +154,19 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 		hash->nodes[i] = NULL;
 	}
 
+	if (hash->rehash_nodes) {
+		for (i = 0; i < hash->rehash_slots; i++) {
+			hashnode_t *rnode = hash->rehash_nodes[i];
+			while (rnode != NULL) {
+				hashnode_t *rtmp = rnode;
+				rnode = rnode->next;
+				_free_node(rtmp);
+			}
+		}
+		kvs_free(hash->rehash_nodes);
+		hash->rehash_nodes = NULL;
+	}
+
 	kvs_free(hash->nodes);
 	hash->nodes = NULL;
 	LOG_INFO("Hash destroyed\n");
@@ -153,29 +174,115 @@ void kvs_hash_destory(kvs_hash_t *hash) {
 
 // 5 + 2
 
+#define HASH_LOAD_FACTOR 1              // 负载因子阈值：count >= slots 时扩容
+#define HASH_MAX_SLOTS   (1 << 22)     // 桶数上限，防止指针数组无限增长
+
+/* 渐进 rehash：每次从旧表迁移 buckets 个桶到新表，摊还一次性迁移的卡顿 */
+static void _rehash_step(kvs_hash_t *hash, int buckets) {
+	if (hash->rehash_idx < 0) return;
+
+	while (buckets-- > 0 && hash->rehash_idx < hash->max_slots) {
+			hashnode_t *node = hash->nodes[hash->rehash_idx];
+			while (node != NULL) {
+				hashnode_t *next = node->next;
+				int nidx = _hash(node->key, hash->rehash_slots);
+				node->next = hash->rehash_nodes[nidx];
+				hash->rehash_nodes[nidx] = node;
+				node = next;
+			}
+			hash->nodes[hash->rehash_idx] = NULL;
+			hash->rehash_idx++;
+	}
+
+	if (hash->rehash_idx >= hash->max_slots) {
+		kvs_free(hash->nodes);
+		hash->nodes = hash->rehash_nodes;
+		hash->max_slots = hash->rehash_slots;
+		hash->rehash_nodes = NULL;
+		hash->rehash_slots = 0;
+		hash->rehash_idx = -1;
+	}
+}
+
+/* 达到负载因子：开 2 倍新表，启动渐进 rehash */
+static void _try_expand(kvs_hash_t *hash) {
+	if (hash->rehash_idx >= 0) return;                    // 迁移中不再开新表
+	if (hash->count < hash->max_slots * HASH_LOAD_FACTOR) return;
+	int new_slots = hash->max_slots * 2;
+	if (new_slots > HASH_MAX_SLOTS) return;
+
+	hashnode_t **nn = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * new_slots);
+	if (!nn) return;
+	memset(nn, 0, sizeof(hashnode_t*) * new_slots);
+
+	hash->rehash_nodes = nn;
+	hash->rehash_slots = new_slots;
+	hash->rehash_idx = 0;
+	LOG_INFO("[Hash] expand: %d -> %d slots (count=%d)\n",
+		 hash->max_slots, new_slots, hash->count);
+}
+
+/* 在单条链上删除 key：0 成功 / 1 不存在 */
+static int _del_in_chain(hashnode_t **headp, char *key) {
+	hashnode_t *head = *headp;
+	if (head == NULL) return 1;
+	if (strcmp(head->key, key) == 0) {
+		*headp = head->next;
+		_free_node(head);
+		return 0;
+	}
+	hashnode_t *cur = head;
+	while (cur->next != NULL) {
+		if (strcmp(cur->next->key, key) == 0) break;
+		cur = cur->next;
+	}
+	if (cur->next == NULL) return 1;
+	hashnode_t *tmp = cur->next;
+	cur->next = tmp->next;
+	_free_node(tmp);
+	return 0;
+}
 // mp
 int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 
 	if (!hash || !key || !value) return -1;
 
-	int idx = _hash(key, MAX_TABLE_SIZE);
+	_rehash_step(hash, 1);
+
+	int idx = _hash(key, hash->max_slots);
 
 	hashnode_t *node = hash->nodes[idx];
-	// LOG_INFO("alloc set hash\n");
-#if 1
+
 	while (node != NULL) {
 		if (strcmp(node->key, key) == 0) { // exist
 			return 1;
 		}
 		node = node->next;
 	}
-#endif
+
+	int nidx = -1;
+	if (hash->rehash_idx >= 0) {
+		nidx = _hash(key, hash->rehash_slots);
+		node = hash->rehash_nodes[nidx];
+		while (node != NULL) {
+			if (strcmp(node->key, key) == 0) { // exist
+				return 1;
+			}
+			node = node->next;
+		}
+	}
 
 	hashnode_t *new_node = _create_node(key, value);
 	if (!new_node) return -1;              // 顺便补上失败检查
 
-	new_node->next = hash->nodes[idx];
-	hash->nodes[idx] = new_node;
+	if (nidx >= 0) {
+		new_node->next = hash->rehash_nodes[nidx];   // 迁移中新键只进新表
+		hash->rehash_nodes[nidx] = new_node;
+	} else {
+		new_node->next = hash->nodes[idx];
+		hash->nodes[idx] = new_node;
+		_try_expand(hash);
+	}
 	
 	hash->count ++;
     // 每 10000 条打印一次
@@ -190,7 +297,9 @@ char * kvs_hash_get(kvs_hash_t *hash, char *key) {
 
 	if (!hash || !key) return NULL;
 
-	int idx = _hash(key, MAX_TABLE_SIZE);
+	_rehash_step(hash, 1);
+
+	int idx = _hash(key, hash->max_slots);
 
 	hashnode_t *node = hash->nodes[idx];
 
@@ -203,6 +312,17 @@ char * kvs_hash_get(kvs_hash_t *hash, char *key) {
 		node = node->next;
 	}
 
+	if (hash->rehash_idx >= 0) {
+		int nidx = _hash(key, hash->rehash_slots);
+		node = hash->rehash_nodes[nidx];
+		while (node != NULL) {
+			if (strcmp(node->key, key) == 0) {
+				return node->value;
+			}
+			node = node->next;
+		}
+	}
+
 	return NULL;
 
 }
@@ -212,7 +332,9 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 
 	if (!hash || !key) return -1;
 
-	int idx = _hash(key, MAX_TABLE_SIZE);
+	_rehash_step(hash, 1);
+
+	int idx = _hash(key, hash->max_slots);
 
 	hashnode_t *node = hash->nodes[idx];
 
@@ -225,6 +347,14 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value) {
 		node = node->next;
 	}
 
+	if (node == NULL && hash->rehash_idx >= 0) {
+		int nidx = _hash(key, hash->rehash_slots);
+		node = hash->rehash_nodes[nidx];
+		while (node != NULL) {
+			if (strcmp(node->key, key) == 0) break;
+			node = node->next;
+		}
+	}
 	if (node == NULL) {
 		return 1;
 	}
@@ -258,6 +388,29 @@ int kvs_hash_count(kvs_hash_t *hash) {
 int kvs_hash_del(kvs_hash_t *hash, char *key) {
 	if (!hash || !key) return -1;	// 参数错误
 	if (!hash->nodes) return 1;  // key不存在
+
+	_rehash_step(hash, 1);
+
+	int idx = _hash(key, hash->max_slots);
+
+	if (_del_in_chain(&hash->nodes[idx], key) == 0) {
+		hash->count --;
+		return 0;	// 删除成功
+	}
+
+	if (hash->rehash_idx >= 0) {
+		int nidx = _hash(key, hash->rehash_slots);
+		if (_del_in_chain(&hash->rehash_nodes[nidx], key) == 0) {
+			hash->count --;
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+#if 0
+static int _del_legacy(kvs_hash_t *hash, char *key) {
 	int idx = _hash(key, MAX_TABLE_SIZE);
 
 	hashnode_t *head = hash->nodes[idx];
@@ -311,7 +464,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
 
 	return 0;
 }
-
+#endif
 
 int kvs_hash_exist(kvs_hash_t *hash, char *key) {
 

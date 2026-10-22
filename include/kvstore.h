@@ -39,7 +39,7 @@
 #define ENABLE_SKIPTABLE	 1
 
 #define ENABLE_PERSIST 		 1	 // 开启本地持久化存储
-#define ENABLE_MEMPOOL		 1   // 开启内存池
+#define ENABLE_MEMPOOL		 0   // 开启内存池
 
 #define ENABLE_CMD_BATCH	 1   // 开启cmd批处理
 
@@ -108,6 +108,9 @@ typedef struct hashtable_s {
 
 	int max_slots;
 	int count;
+	hashnode_t **rehash_nodes;   // 新表：渐进 rehash 期间非 NULL
+	int rehash_slots;            // 新表桶数
+	int rehash_idx;              // 迁移进度：-1 表示未在 rehash
 
 } hashtable_t;
 
@@ -126,7 +129,7 @@ int kvs_hash_exist(kvs_hash_t *hash, char *key);
 #endif
 
 #if ENABLE_SKIPTABLE
-#define MAX_LEVEL 6
+#define MAX_LEVEL 32
 
 typedef struct kvs_node {
     char *key;
@@ -216,7 +219,7 @@ int replay_aof(const char *filename);
 */
 #if ENABLE_MEMPOOL
 
-#define KVS_POOL_NODE_COUNT     500000      // 每个引擎的节点池：容量上限50万块
+#define KVS_POOL_NODE_COUNT     2000000     // 每个引擎的节点池：容量上限200万块（覆盖100w数据集）
 #define RESP_POOL_BLOCK_SIZE    4096
 #define RESP_POOL_BLOCK_COUNT   1024        // 响应池：1024块 × 4KB
 
@@ -224,7 +227,12 @@ int replay_aof(const char *filename);
 // 字符串池按大小分 4 类：
 #define KVS_STRING_CLASSES  4
 #define KVS_STRING_CLASS_SIZES {32, 64, 128, 256}
-#define KVS_STRING_CLASS_COUNTS {1000000, 200000, 50000, 10000}
+#define KVS_STRING_CLASS_COUNTS {2000000, 400000, 100000, 20000}
+
+// 跳表节点池 size-class：按层数分布(p=1/2)分档，避免按 MAX_LEVEL 定死块大小
+#define KVS_SKIPNODE_CLASSES      5
+#define KVS_SKIPNODE_CLASS_SIZES  {40, 56, 88, 152, 280}
+#define KVS_SKIPNODE_CLASS_COUNTS {1500000, 400000, 80000, 18000, 2000}
 
 // 块头：仅 8 字节，用户数据紧随其后；归属由 free 时的段范围+对齐校验推出，不占块内空间
 typedef struct mempool_block_hdr {
@@ -418,7 +426,7 @@ typedef struct {
 
     int snap_enable;
     int aof_enable;
-
+    int aof_crc_enable; // 增量持久化(AOF)全文 CRC 校验开关
     int log_level;      // 日志级别，见 log_level_t
 } kvs_config_t;
 
