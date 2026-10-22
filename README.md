@@ -52,8 +52,8 @@
 git clone git@gitlab.0voice.com:lihongyi/kvs_lhy.git
 cd kvs_lhy
 
-#或直接make
-make reactor
+#或make reactor
+make
 ```
 
 ## 方式二、ntyco 协程模式
@@ -79,10 +79,10 @@ make ntyco
 
 ```bash
 主节点
-./build/kvstore --config config/master.conf
+./build/kvstore --config master.conf
 
 从节点
-./build/kvstore --config config/slave.conf
+./build/kvstore --config slave.conf
 ```
 
 # redis-cli 操作
@@ -307,6 +307,10 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 > `5_mem_test.sh` 内部通过 `1_RESP_testcase 6/7 -1` 完成 100w（2 引擎 × 50w）的插入与删除，对比内存占用。
 
+
+
+
+
 # 性能数据
 
 ## 1. 加入功能后的性能对比
@@ -336,5 +340,92 @@ sudo bash ./test/5_mem_test.sh jemalloc
  测试结果说明**内存表现 （100 万条数据，2 引擎 × 50 万，snap 模式）：**
 
         开始状态下，无内存池仅占 7.1MB RSS（无预付）；内存池因首批块预付占 10.0MB；jemalloc 介于两者之间（9.0MB），但 VmSize 最高（22.4MB）——arena 预映射的虚拟地址空间并不计入 RSS。峰值状态（插入 100w）最能体现单位条目成本：jemalloc 以 90.5MB 最优，比 glibc（117.7MB）低 23%，比内存池（144.9MB）低 37.5%——其精细的 size-class bin 既无 8B/块的管理头、也无 25% 扩容余量；内存池的 144.9MB 高出 glibc 23%，差额正是池化确定性的结构成本（块头 + 预留余量）。结束状态（删除 100w）最能体现回收策略差异：glibc 与内存池的 RSS 均停留在峰值（前者小块释放无法触发堆收缩，后者主动保留空闲块供复用），唯有 jemalloc 将 RSS 归还 87%（90.5→11.9MB）。
+
+
+
+
+
+## 3、增量持久化--开启和关闭下的QPS测试
+
+    --kvstore测试
+    #  服务启动
+    ./build/kvstore --config master.conf
+    #  测试端执行
+    redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 1 -n 100000 PING
+    
+    --redis测试
+    # redis关闭aof
+    redis-cli -p 6379 config set appendonly no
+    # redis开启aof
+    redis-cli -p 6379 config set appendonly yes
+    #查看当前aof状态
+    redis-cli -p 6379 config get appendonly
+    #  测试端执行
+    redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 PING
+
+| 测试项目           | 关闭aof的QPS | 开启aof的QPS |
+| -------------- | --------- | --------- |
+| kvstore的echo测试 | 7476.64   | 7534.12   |
+| redis测试        | 6949.03   | 7228.46   |
+
+
+
+
+
+
+
+## 4、全量持久化--不同save间隔下的QPS测试
+
+    # 共100w条数据,单条插入
+    
+    # 100W/SAVE
+    ./build/2_presist_testcase 127.0.0.1 2000 13 h
+    # 10W/SAVE
+    ./build/2_presist_testcase 127.0.0.1 2000 12 h
+    # 1W/SAVE
+    ./build/2_presist_testcase 127.0.0.1 2000 11 h
+    # 1k/SAVE
+    ./build/2_presist_testcase 127.0.0.1 2000 10 h
+
+| Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE  | 1K/SAVE   |
+| ------ | --------- | -------- | -------- | --------- |
+| QPS    | 2.25w     | 2.17w    | 1.23w    | 0.436w    |
+| 总耗时    | 44.422 s  | 46.068 s | 81.463 s | 229.316 s |
+
+
+
+## 5、批处理--QPS测试
+
+共插10w条数据。
+
+批量10条，20条，40条，80条，160条的qps
+
+```
+# 测试批量10条数据
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 10 -n 100000 -t ping -q
+
+# 测试批量20条数据
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 20 -n 100000 -t ping -q
+
+# 测试批量40条数据
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 40 -n 100000 -t ping -q
+
+# 测试批量80条数据
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 80 -n 100000 -t ping -q
+
+# 测试批量160条数据
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 160 -n 100000 -t ping -q
+```
+
+
+
+|        | 批量10条  | 批量20条  | 批量40条  | 批量80条  | 批量160条  |
+| ------ | ------ | ------ | ------ | ------ | ------- |
+| SNAP模式 | 7.84w  | 15.55w | 30.31w | 59.88w | 116.28w |
+| AOF模式  | 84.46w | 15.13w | 29.85w | 59.53w | 116.28w |
+
+
+
+
 
 

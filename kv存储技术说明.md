@@ -1072,7 +1072,6 @@ Redis 用 5 种类型前缀区分消息--CRLF 边界：
 
         代码实现上，由于之前采用strtok根据空格分割SET KEY VALUE，因此需要改造为resp parse() 协议解析器。整体实现流程如下：
     recv_cb接收数据
-
     kvs_Ctx_append(cmd_buffer)把数据存入缓冲区
 
     kvs_ctx_process()
@@ -1129,8 +1128,6 @@ Redis 用 5 种类型前缀区分消息--CRLF 边界：
     唤醒 persistence thread
           ↓
     io_uring 提交
-
-
     真正做法：做到高并发异步 I/O，实现批量提交
            ┌── request 1 ──┐
            ├── request 2 ──┤
@@ -1186,8 +1183,6 @@ Redis 用 5 种类型前缀区分消息--CRLF 边界：
     kvs_uring_t          ← 对外实例（含 worker 线程、队列、计数）
         └── kvs_ring_t   ← io_uring 裸封装（mmap 区域指针）
                 └── io_uring_sqe / io_uring_cqe  ← 内核数据结构
-
-
     业务线程: kvs_uring_append → 构造 req → 入队 → signal(cond)
                                                       ↓
     worker线程: cond_wait → 批量取 64 个 → submit_requests
@@ -1226,7 +1221,6 @@ Redis 用 5 种类型前缀区分消息--CRLF 边界：
 mmap的方式：直接映射，char *p = mmap(...);内核建立虚拟地址->pc的页表映射，CPU通过p的虚拟地址直接访问pc，少了一次拷贝。关键：<mark>p是虚拟地址，页表把p映射到page cache的物理页，cpu访问p的时候直接访问pagecache。</mark>
     mf->data = mmap(NULL, mf->size, PROT_READ, MAP_PRIVATE, mf->fd, 0);
              让内核自己选映射地址、映射多少字节、只读、只读场景写时复制
-
     一次拷贝
     磁盘
       │ ① DMA 拷贝（磁盘 → page cache）
@@ -1262,8 +1256,6 @@ mmap的方式：直接映射，char *p = mmap(...);内核建立虚拟地址->pc�
     # 主节点配置
     role = master
     port = 2000
-
-
     # snap快照同步
     snap.enable=true
     # 从节点一般不启动aof
@@ -1275,7 +1267,6 @@ mmap的方式：直接映射，char *p = mmap(...);内核建立虚拟地址->pc�
     port=2001
     master_ip=192.168.137.128
     master_port=2000
-
     # snap快照同步
     snap.enable=true
     # 从节点一般不启动aof
@@ -1361,7 +1352,6 @@ A是主机，B是从机
 
 日志格式：
     [时间] [级别] [文件:行] 消息
-
     [2024-01-01 12:00:00] [INFO] [kvstore.c:100] AOF started, offset=0
     [2024-01-01 12:00:01] [ERROR] [kvs_persist.c:200] open data/data_aof.aof failed: No such file
 
@@ -1421,7 +1411,6 @@ C 语言跟内存申请相关的函数主要有 calloc, malloc, realloc 等。
 
 
 10.14 关于crc校验的功能优化
-
     snap
     全量持久化数据和crc校验值不能分开，因为全量的数据已经是修改后的值了，所以需要对每个kv都进行crc校验值的计算，并放在数据的末尾。
     aof
@@ -1432,3 +1421,22 @@ C 语言跟内存申请相关的函数主要有 calloc, malloc, realloc 等。
     aof的crc放在文件末尾，解析器读取到标志位后，需要解析最后的crc校验值
     snap的放在每一条数据后，需要实现解析器
 
+
+
+10-22 关于批量处理的qps问题
+
+
+
+ 三个结论
+
+1. 9-4 的死锁前提已经灭绝。 当年的病根是 wmem/rmem 被钉死在 1~2KB，一批数据还没出客户端内核就把窗口顶到 0。现在上限是 4MB/6MB 自动调优——4.6MB 的批在客户端内核里躺得下，服务端又一直在读，窗口永远不会归零。 "交替分块收发"从救生圈变成了纯开销 ：它当年救的是死锁，现在锁没了，它剩下的只有每 1024B 一对 send+recv 的 syscall 税（这正是你 9-4 记录里"2w~5w QPS"的真正来源，不是连接建立）。
+
+2. 本次修复的适用边界确认不变。 default 16KB/128KB 意味着常规负载下内核缓冲远大于我们的`BUFFER_LENGTH=16384` ，"一次 recv 取完 ≤16KB 批"的前提稳固；唯一残留边界仍是 >16KB 超大批的 recv 分片（无 NODELAY 兜底），批扫描上限定在 P≤1000 即可。（顺带一个巧合：`tcp_wmem` 的 default 恰好也是 16384，和我们新缓冲同值——纯属巧合，两者无关，别写进报告当因果。）
+
+3. 一个极端边角，知道即可。 min=4096 表示内存极度紧张时单 socket 缓冲可缩到 4KB，那时 16KB 批会重新分片、44ms 税回归。但自动调优的方向是"负载越重缓冲越大"，压测场景只会往 max 走，不会往 min 走——实践中碰不到。
+
+ 一个可选的收尾动作
+
+你们自研 harness（ 3_sync_testcase.c 的`send_and_recv` 、`CHUNK_SIZE=1024` 交替收发）现在可以现代化了： 整批 send → 循环 recv 收满 （redis-benchmark 同款形态），去掉交替税，让自研用例测出的 QPS 和 redis-benchmark 口径对齐、可互比。改不改都不影响正确性（交替模式今天依然安全，只是慢）；不改的话至少在 README 里注明"该 harness 为 9-4 死锁时代的交替收发形态，QPS 数据含 syscall 税，与 redis-benchmark 数据不可直接横比"。
+
+需要我把`send_and_recv` 改成整批发+drain 形态的话说一声，我给 diff；不需要的话，这条性能线到此全部闭环：哈希（FNV-1a+rehash）→ 协议（inline+断点续传）→ 网络（单段交互），三层病灶各归其位，剩下的数据都是真实速度了。
