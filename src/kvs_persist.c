@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 extern kvs_hash_t   global_hash;
 extern kvs_skiptable_t global_skiptable;
@@ -139,7 +140,6 @@ static char *mmap_read_token(const char *data, size_t size, size_t *offset)
     return value;
 }
 
-
 /**
  * mmap_read_line：从 mmap 区域读取一行文本。
  * 主要用于读取 Snapshot 中的 # array、# rbtree、# hash、# skiptable 标记。
@@ -247,49 +247,6 @@ format_err:
 #undef READ_LINE
 }
 
-#else
-// ===== 读取一个 token =====
-static char* read_token(FILE *fp) {
-    char line[64];
-    // 读取 $长度\r\n
-    if (!fgets(line, sizeof(line), fp)) return NULL;
-    
-    // 跳过空行
-    while (line[0] == '\n' || line[0] == '\r') {
-        if (!fgets(line, sizeof(line), fp)) return NULL;
-    }
-    
-    // 必须是 $ 开头
-    if (line[0] != '$') {
-        printf("[Snap] ERROR: expected '$', got '%c'\n", line[0]);
-        return NULL;
-    }
-    
-    // 解析长度
-    int len = atoi(line + 1);
-    if (len < 0) return NULL;
-    
-    // 读取数据
-    char *data = (char*)malloc(len + 1);
-    if (!data) return NULL;
-    
-    int n = fread(data, 1, len, fp);
-    if (n != len) {
-        free(data);
-        return NULL;
-    }
-    data[len] = '\0';
-    
-    // 跳过 \r\n 或 \n
-    int c1 = fgetc(fp);
-    if (c1 == '\r') {
-        int c2 = fgetc(fp);
-        if (c2 != '\n' && c2 != EOF) ungetc(c2, fp);
-    }
-    
-    return data;
-}
-
 #endif
 
 
@@ -302,7 +259,7 @@ static int write_token(FILE *fp, const char *data) {
     return 0;
 }
 
-/* CRC32 值格式化为 8 位十六进制字符串（SNAP 内联 CRC / AOF 尾部用） */
+/* CRC32 值格式化为 8 位十六进制字符串（方便存入SNAP/AOF文件中） */
 static const char *crc32_to_hex(uint32_t crc) {
     static char hexbuf[9];
     snprintf(hexbuf, sizeof(hexbuf), "%08x", (unsigned)crc);
@@ -310,7 +267,6 @@ static const char *crc32_to_hex(uint32_t crc) {
 }
 
 /* 底层函数 */
-#if 1
 int save_snapshot_hash(const char *filename) {
     FILE *fp = fopen(filename, "a");
     if (!fp) return -1;
@@ -327,7 +283,18 @@ int save_snapshot_hash(const char *filename) {
             node = node->next;
         }
     }
-    
+
+    /* 渐进 rehash 期间：新表中的节点也要落盘 */
+    for (i = 0; global_hash.rehash_nodes && i < global_hash.rehash_slots; i++) {
+        hashnode_t *node = global_hash.rehash_nodes[i];
+        while (node != NULL) {
+            write_token(fp, node->key);
+            write_token(fp, node->value);
+            write_token(fp, crc32_to_hex(crc32_calc_snap(node->key, node->value)));
+            node = node->next;
+        }
+    }
+
     fclose(fp);
     LOG_INFO("Snapshot hash saved to %s\n", filename);
     return 0;
@@ -352,41 +319,7 @@ int save_snapshot_skiptable(const char *filename) {
     LOG_INFO("Snapshot skiptable saved to %s\n", filename);
     return 0;
 }
-#endif 
-#if 0
-int save_snapshot_hash(const char *filename) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return -1;
-    int i = 0;
-    for (i=0; i<global_hash.max_slots; i++) {
-        // 遍历当前槽位的链表
-        hashnode_t *node = global_hash.nodes[i];
-        while (node != NULL) {
-            fprintf(fp, "%s %s\n", node->key, node->value);
-            node = node->next;
-        }
-    }
-    fclose(fp);
-    printf("Snapshot saved to %s\n", filename);
-    return 0;
-}
 
-int save_snapshot_skiptable(const char *filename) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return -1;
-    // 从第0层开始遍历
-    kvs_node_t *curr = global_skiptable.header->forward[0];
-
-    while (curr != NULL) {
-        fprintf(fp, "%s %s\n", curr->key, curr->value);
-        curr = curr->forward[0];    // 沿着第0层往下走
-    }
-    fclose(fp);
-    printf("Snapshot saved to %s\n", filename);
-    return 0;
-}
-
-#endif
 
 
 
@@ -516,14 +449,26 @@ int persistence_init(void)
         g_aof_fd = -1;
         return -err;
     }
-
+    long base_offset = st.st_size; // 将当前文件大小作为基础偏移
 #if ENABLE_MMAP && ENABLE_CRC
-    /* 扫描已有命令区，恢复全文 CRC 累计值与命令区末尾偏移 */
-    aof_scan_existing();
+    /* 如果config中开启了crc，那么扫描已有命令区，计算全文CRC和命令区的末尾偏移 */
+    if (g_config.aof_crc_enable) {
+        aof_scan_existing();
+    } else if (base_offset > 0) {
+        /* crc 关闭：截掉上次开启时遗留的 CRC 尾，保持文件为纯命令区 */
+        aof_scan_existing();
+        if (g_aof_cmd_end < base_offset) {
+            if (ftruncate(g_aof_fd, g_aof_cmd_end) == 0) {
+                base_offset = g_aof_cmd_end;
+            }
+        }
+        g_aof_full_crc = 0xFFFFFFFFu;
+    }
+    
 #endif
 
     // 初始化uring子系统，失败就清理fd
-    int ret = kvs_uring_init(&g_aof_uring, g_aof_fd, st.st_size);
+    int ret = kvs_uring_init(&g_aof_uring, g_aof_fd, base_offset);
     if (ret < 0) {
         LOG_ERROR("[AOF] io_uring init failed: %s\n",
                strerror(-ret));
@@ -555,17 +500,21 @@ int append_aof(const char *cmd, const char *key, const char *value)
     if (ret < 0) return ret;
 
 #if ENABLE_CRC
-    /* 增量累计全文 CRC，构造文件尾校验值，一次性截断并重写文件尾 */
-    g_aof_full_crc = crc32_update(g_aof_full_crc, record, record_len);
-    uint32_t final_crc = g_aof_full_crc ^ 0xFFFFFFFFu;
-    char tail[AOF_CRC_TAIL_LEN + 1];
-    snprintf(tail, sizeof(tail), "# AOF_CRC:%08x\r\n", (unsigned)final_crc);
-    ret = kvs_uring_append_cmd(g_aof_uring, record, record_len,
-                               tail, AOF_CRC_TAIL_LEN, g_aof_cmd_end);
-    g_aof_cmd_end += (off_t)record_len;
-#else
-    ret = kvs_uring_append(g_aof_uring, record, record_len);
+    if (g_config.aof_crc_enable) {
+        /* 增量累计全文 CRC，构造文件尾校验值，一次性截断并重写文件尾 */
+        g_aof_full_crc = crc32_update(g_aof_full_crc, record, record_len);
+        uint32_t final_crc = g_aof_full_crc ^ 0xFFFFFFFFu;
+        char tail[AOF_CRC_TAIL_LEN + 1];
+        snprintf(tail, sizeof(tail), "# AOF_CRC:%08x\r\n", (unsigned)final_crc);
+        ret = kvs_uring_append_cmd(g_aof_uring, record, record_len,
+                                   tail, AOF_CRC_TAIL_LEN, g_aof_cmd_end);
+        g_aof_cmd_end += (off_t)record_len;
+        free(record);   // 释放
+        return ret;
+    }
 #endif
+
+    ret = kvs_uring_append(g_aof_uring, record, record_len);
     free(record);   // 释放
 
     return ret;
@@ -615,11 +564,19 @@ long replay_aof_from(const char *filename, long start_offset) {
     int count = 0;
     long ret = start_offset;
     uint32_t crc = 0xFFFFFFFFu;
-    /* 仅全量重放（从 0 开始）时对文件尾全文 CRC 做校验 */
-    int verify = (start_offset == 0);
+    /* 仅全量重放（从 0 开始）且 aof.crc 开启时对文件尾全文 CRC 做校验 */
+    int verify = (start_offset == 0) && g_config.aof_crc_enable;
+    int tail_found = 0;
 
-    if (mmap_file_open(filename, &mf) < 0) {
-        LOG_ERROR("[AOF] mmap_file_open failed: %s\n", filename);
+    int open_ret = mmap_file_open(filename, &mf);
+    if (open_ret < 0) {
+        if (open_ret == -ENOENT) {
+            /* 首次运行：AOF 尚未创建，无需重放 */
+            LOG_INFO("[AOF] no aof file yet, nothing to replay: %s\n", filename);
+            return 0;
+        }
+        LOG_ERROR("[AOF] mmap_file_open failed: %s (errno=%d: %s)\n",
+                  filename, -open_ret, strerror(-open_ret));
         return -1;
     }
 
@@ -658,7 +615,7 @@ long replay_aof_from(const char *filename, long start_offset) {
                 stored = (uint32_t)strtoul(hex, NULL, 16);
                 ok = 1;
             }
-
+            if (ok) tail_found = 1;
             if (verify) {
                 if (!ok || stored != (crc ^ 0xFFFFFFFFu)) {
                     LOG_ERROR("[AOF] CRC MISMATCH: stored=%08x, calc=%08x\n",
@@ -708,6 +665,10 @@ long replay_aof_from(const char *filename, long start_offset) {
 
     mmap_file_close(&mf);
 
+    if (verify && ret >= 0 && !tail_found) {
+        LOG_WARN("[AOF] CRC tail missing (file written with aof.crc=false?), skip verification\n");
+    }
+    
     LOG_INFO("Replayed %d entries, offset %ld -> %ld\n",
            count, start_offset, ret);
     return ret;
@@ -721,7 +682,6 @@ int replay_aof(const char *filename) {
     return (ret < 0) ? -1 : 0;
 }
 
-#if ENABLE_URING
 int save_snapshots() {
     // 先清空文件
     FILE *fp = fopen(SNAP_FILE, "w");
@@ -745,14 +705,31 @@ int save_snapshots() {
 #if ENABLE_MMAP
 
 /**
+ * snap_resync_line：解析失败后从 from 起跳到下一个换行之后，
+ * 重新对齐记录边界，使后续记录仍可继续解析。
+ */
+static size_t snap_resync_line(const char *data, size_t size, size_t from)
+{
+    size_t p = from;
+    while (p < size && data[p] != '\n')
+        p++;
+    if (p < size)
+        p++;
+    return p;
+}
+
+/**
  * load_snapshots：使用 mmap 一次性映射 Snapshot 文件，
  * 根据引擎标记解析 key/value，并恢复到对应 KV 引擎。
+ * 单条记录 CRC 不匹配或解析失败时仅跳过该条（记录偏移与 key），
+ * 继续加载其余记录，结尾统一汇总。
  */
 int load_snapshots()
 {
     mmap_file_t mf;
     size_t offset = 0;
     int count = 0;
+    int corrupt = 0;
     int current_engine = -1;
 
     if (mmap_file_open(SNAP_FILE, &mf) < 0) {
@@ -794,21 +771,26 @@ int load_snapshots()
 
         /* 读取 key/value/CRC */
         if (mf.data[offset] == '$') {
+            size_t rec_start = offset;
             char *key = mmap_read_token(
                 mf.data, mf.size, &offset);
 
             if (!key) {
-                LOG_ERROR("[Snap] ERROR: failed to read key\n");
-                break;
+                LOG_ERROR("[Snap] FORMAT ERROR at offset=%zu: failed to read key, skip record\n",
+                          rec_start);
+                corrupt++;
+                offset = snap_resync_line(mf.data, mf.size, rec_start);
+                continue;
             }
 
-            char *value = mmap_read_token(
-                mf.data, mf.size, &offset);
+            char *value = mmap_read_token(mf.data, mf.size, &offset);
 
             if (!value) {
-                LOG_ERROR("[Snap] ERROR: failed to read value\n");
+                LOG_ERROR("[Snap] FORMAT ERROR at offset=%zu: failed to read value, skip record\n", rec_start);
                 free(key);
-                break;
+                corrupt++;
+                offset = snap_resync_line(mf.data, mf.size, rec_start);
+                continue;
             }
 
             /* 读取每条 KV 末尾的内联 CRC 校验值 */
@@ -816,10 +798,12 @@ int load_snapshots()
                 mf.data, mf.size, &offset);
 
             if (!hex) {
-                LOG_ERROR("[Snap] ERROR: failed to read crc\n");
+                LOG_ERROR("[Snap] FORMAT ERROR at offset=%zu: failed to read crc, skip record\n", rec_start);
                 free(key);
                 free(value);
-                break;
+                corrupt++;
+                offset = snap_resync_line(mf.data, mf.size, rec_start);
+                continue;
             }
 
             /* 计算并比对 */
@@ -827,12 +811,13 @@ int load_snapshots()
             uint32_t stored = (uint32_t)strtoul(hex, NULL, 16);
 
             if (stored != calc) {
-                LOG_ERROR("[Snap] CRC MISMATCH key='%s': stored=%08x, calc=%08x\n",
-                          key, stored, calc);
+                LOG_ERROR("[Snap] CRC MISMATCH at offset=%zu key='%s': stored=%08x, calc=%08x, skip record\n",
+                          rec_start, key, stored, calc);
                 free(key);
                 free(value);
                 free(hex);
-                break;
+                corrupt++;
+                continue;
             }
 
 
@@ -847,12 +832,12 @@ int load_snapshots()
                 break;
 
             default:
-                LOG_WARN("[Snap] ERROR: unknown engine\n");
+                LOG_WARN("[Snap] ERROR: unknown engine at offset=%zu, skip record\n", rec_start);
                 free(key);
                 free(value);
                 free(hex);
-                mmap_file_close(&mf);
-                return -1;
+                corrupt++;
+                continue;
             }
 
             free(key);
@@ -866,7 +851,7 @@ int load_snapshots()
 
     mmap_file_close(&mf);
 
-    // LOG_INFO("Loaded %d entries from %s\n", count, SNAP_FILE);
+    LOG_INFO("[Snap] Loaded %d entries, skipped %d corrupt entries from %s\n", count, corrupt, SNAP_FILE);
 
     return 0;
 }
@@ -956,34 +941,6 @@ int load_snapshots() {
     printf("Loaded %d entries from %s\n", count, SNAP_FILE);
     return 0;
 }
-#endif
-
-#else
-
-//snap保存接口
-int save_snapshots() {
-    int ret = 0, i = 0;
-    for (i=0; engine_persist_table[i].name!=NULL; i++) {
-        if (engine_persist_table[i].save_fn(engine_persist_table[i].snap_file)!=0) {
-            printf("failed to save %s snap\n", engine_persist_table[i].name);
-            ret = -1;
-        }
-    }
-    return ret;
-}
-
-//snap加载接口
-int load_snapshots() {
-    int ret = 0, i = 0;
-    for (i=0; engine_persist_table[i].name!=NULL; i++) {
-        if (engine_persist_table[i].load_fn(engine_persist_table[i].snap_file)!=0) {
-            printf("failed to load %s snap\n", engine_persist_table[i].name);
-            ret = -1;
-        }
-    }
-    return ret;
-}
-
 #endif
 
 
