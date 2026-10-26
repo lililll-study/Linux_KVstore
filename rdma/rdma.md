@@ -54,9 +54,17 @@ device node GUID ------ ---------------- siw1 020c29fffe775881
 
 gcc -o rdma_server rdma_server.c -libverbs -lrdmacm
 
+./rdma_server
+
+gcc -o rdma_client rdma_client.c -libverbs -lrdmacm
+
+./rdma_client
 
 
 
+查看端口服务
+
+netstat -anop | grep 9000
 
 
 

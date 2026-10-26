@@ -24,7 +24,6 @@ static int rdma_wait_cm_event(struct rdma_event_channel *channel, enum rdma_cm_e
 
     if (event->event != expect) {   // 失败
         fprintf(stderr, "unexpect RDMA CM event %s, expected = %s\n", rdma_event_str(event->event), rdma_event_str(expect));
-        rdma_ack_cm_event(event);
         ret = -1;
         goto finished;
     }
@@ -80,7 +79,10 @@ int main() {
     memset(&dst_addr, 0, sizeof(dst_addr));
     dst_addr.sin_family = AF_INET;
     dst_addr.sin_port = htons(RDMA_SERVER_PORT);
-    dst_addr.sin_addr.s_addr = inet_addr(RDMA_SERVER_IP);    // 点分十进制
+    if (1 != inet_pton(AF_INET, RDMA_SERVER_IP, &dst_addr.sin_addr)) {
+        perror("inet_pton\n");
+        return 0;
+    }
 
     // 将ip地址解析为rdma地址，如果成功，就把这个RDMA地址绑定到对应的设备上面
     if (0 != rdma_resolve_addr(cm_id, NULL, (struct sockaddr*)&dst_addr, RDMA_TIMEOUT_MS)) {// 解析1s

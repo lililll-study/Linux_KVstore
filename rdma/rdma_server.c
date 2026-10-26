@@ -5,6 +5,26 @@
 
 #define RDMA_SERVER_PORT 9000
 
+static int rdma_wait_cm_event(struct rdma_event_channel *channel, enum rdma_cm_event_type expect) {
+
+    int ret = 0;
+    struct rdma_cm_event *event;
+    if (0 != rdma_get_cm_event(channel, &event)) {
+        perror("rdma_get_cm_event\n");
+        return -1;
+    }
+
+    if (event->event != expect) {   // 失败
+        fprintf(stderr, "unexpect RDMA CM event %s, expected = %s\n", rdma_event_str(event->event), rdma_event_str(expect));
+        ret = -1;
+        goto finished;
+    }
+
+finished:
+    rdma_ack_cm_event(event);
+    return ret;
+}
+
 int main() {
     // 分配事件通道
     struct rdma_event_channel *channel = rdma_create_event_channel();
@@ -32,6 +52,10 @@ int main() {
         perror("rdma_listen\n");
         return 0;
     }
+
+    rdma_wait_cm_event(channel, RDMA_CM_EVENT_CONNECT_REQUEST);
+
+    
     getchar();
     
 }
