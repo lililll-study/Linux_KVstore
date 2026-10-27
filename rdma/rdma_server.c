@@ -10,7 +10,10 @@
 #include <unistd.h>
 #include "rdma.h"
 
-
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 
 
 
@@ -78,14 +81,60 @@ int main() {
         return 0;
     }
     conn_manager_t *cm = id->context;
-    printf("recv: %s\n", cm->rbuffer);
+    // printf("recv: %s\n", cm->rbuffer);
 
+#if 0
     int i=0;
     for (i=0; i<RDMA_BUFFER_SIZE; i++) {
         if (cm->rbuffer[i] == 0x0) break;
         cm->sbuffer[i] = cm->rbuffer[i] - 0x20;
     }
+#else
 
+    file_type_t *type = (file_type_t*)cm->rbuffer;
+    uint32_t magic = type->magic;
+    size_t total = type->total;
+    printf("total: %ld, magic: %x\n", type->total, type->magic);
+
+    printf("open\n");
+    int fd = open(RDMA_FILENAME, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        perror("open\n");
+        return 0;
+    }
+    ftruncate(fd, total); // 创建文件指定大小
+
+    printf("mmap\n");
+    // 把内容映射进文件
+    char *p = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        perror("mmap");
+        return 0;
+    }
+
+    int idx = 0;    // 当前读到文件的位置
+    while (idx < total) {   // 没有读到末尾就循环
+        rdma_post_recv(id);
+        if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
+            perror("rdma_poll_wc\n");
+            return 0;
+        }
+        printf("idx: %d\n", idx);
+        if (idx + RDMA_BUFFER_SIZE < total) {
+            memcpy(p + idx, cm->rbuffer, RDMA_BUFFER_SIZE);
+            idx += RDMA_BUFFER_SIZE;
+        } else {
+            memcpy(p + idx, cm->rbuffer, RDMA_BUFFER_SIZE);
+            idx = total;
+        }
+        
+    }
+    msync(p, total, MS_SYNC);
+    munmap(p, total);
+    close(fd);
+
+#endif
+    sprintf(cm->sbuffer, "sync finished");
     rdma_post_send(id);
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
         perror("rdma_poll_wc\n");
@@ -126,5 +175,6 @@ int main() {
     //     // 释放事件
     //     rdma_ack_cm_event(event);
     // }
-    
+
+
 }

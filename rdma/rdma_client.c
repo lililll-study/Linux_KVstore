@@ -7,16 +7,15 @@
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+
 #include "rdma.h"
 
-
-int main() {
-    // 创建channel和id
-    struct rdma_event_channel *channel = rdma_create_event_channel();
-    if (!channel) {
-        perror("rdma_create_event_channel\n");
-        return 0;
-    }
+static struct rdma_cm_id *rdma_create_cm_id(struct rdma_event_channel *channel, const char *ip, unsigned short port) {
 
     struct rdma_cm_id *cm_id; 
     if (0 != rdma_create_id(channel, &cm_id, NULL, RDMA_PS_TCP)) {
@@ -27,8 +26,8 @@ int main() {
     struct sockaddr_in dst_addr;
     memset(&dst_addr, 0, sizeof(dst_addr));
     dst_addr.sin_family = AF_INET;
-    dst_addr.sin_port = htons(RDMA_SERVER_PORT);
-    if (1 != inet_pton(AF_INET, RDMA_SERVER_IP, &dst_addr.sin_addr)) {
+    dst_addr.sin_port = htons(port);
+    if (1 != inet_pton(AF_INET, ip, &dst_addr.sin_addr)) {
         perror("inet_pton\n");
         return 0;
     }
@@ -54,6 +53,20 @@ int main() {
     }
 
     rdma_wait_cm_event(channel, RDMA_CM_EVENT_ROUTE_RESOLVED, NULL);
+
+    return cm_id;
+}
+
+
+int main() {
+    // 创建channel和id
+    struct rdma_event_channel *channel = rdma_create_event_channel();
+    if (!channel) {
+        perror("rdma_create_event_channel\n");
+        return 0;
+    }
+
+    struct rdma_cm_id *cm_id = rdma_create_cm_id(channel, RDMA_SERVER_IP, RDMA_SERVER_PORT);
 
     // 构建队列
     struct ibv_pd *pd;
@@ -81,14 +94,69 @@ int main() {
     printf("rdma connect success\n");
 
     conn_manager_t *cm = cm_id->context;
-    sprintf(cm->sbuffer, "abcdefghijklmnopqrstuvwxyz");
+    // sprintf(cm->sbuffer, "abcdefghijklmnopqrstuvwxyz");
+
+// openfile
+    int fd = open(RDMA_FILENAME, O_RDWR);
+    if (fd < 0) {
+        perror("open\n");
+        return 0;
+    }
+    // 判断文件大小的方法：
+    // 1：libc fseek();
+    // 2：POSIX API
+    struct stat st;
+    if(0 != fstat(fd, &st)) {
+        perror("fstat\n");
+        return 0;
+    }
+
+    size_t total = st.st_size;
+    printf("total: %ld\n", total);
+
+
+// readfile
+    char *p = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        perror("mmap");
+        return 0;
+    }
+
+
+
+// 把p的内容放进sendbuffer中
+    int idx = 0;    // 当前读到文件的位置
+    struct ibv_wc wc;
+
+    file_type_t type = {0};
+    type.magic = 0x12345678;
+    type.total = total;
+    memcpy(cm->sbuffer, &type, sizeof(file_type_t));
     rdma_post_send(cm_id);
 
-    struct ibv_wc wc;
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
         perror("rdma_poll_wc\n");
         return 0;
     }
+
+    while (idx < total) {   // 没有读到末尾就循环
+        if (idx + RDMA_BUFFER_SIZE < total) { // 如果剩余内容超过512字节，就读满512字节
+            memcpy(cm->sbuffer, p + idx, RDMA_BUFFER_SIZE);
+            idx += RDMA_BUFFER_SIZE;
+        } else {    // 如果剩余内容小于512字节，就把剩下的都读掉
+            memcpy(cm->sbuffer, p + idx, total - idx);
+            idx = total;
+        }
+        printf("idx: %d\n", idx);
+        rdma_post_send(cm_id);
+        if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
+            perror("rdma_poll_wc\n");
+            return 0;
+        }
+    }
+
+    munmap(p, total);
+    close(fd);
 
     rdma_post_recv(cm_id);
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
@@ -101,6 +169,8 @@ int main() {
 
     getchar();
 
+    rdma_free_buffer(cm_id); 
+    rdma_destroy_queuepair(cm_id, pd, cq);
 }
 
 

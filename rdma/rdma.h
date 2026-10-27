@@ -8,9 +8,11 @@
 #define RDMA_CLIENT_IP      "192.168.137.137"
 
 
-#define RDMA_TIMEOUT_MS     1000
-#define RDMA_CQ_DEPTH     32
-#define RDMA_BUFFER_SIZE 512
+#define RDMA_TIMEOUT_MS     2000
+#define RDMA_CQ_DEPTH       4096
+#define RDMA_BUFFER_SIZE    1024 * 1024
+
+#define RDMA_FILENAME       "a.jpg"
 
 typedef struct conn_manager_s {
 
@@ -22,6 +24,11 @@ typedef struct conn_manager_s {
     char *rbuffer;
     char *sbuffer;
 } conn_manager_t;
+
+typedef struct file_type_s {
+    uint32_t magic; // 0x12345678
+    size_t total;
+} file_type_t;
 
 
 
@@ -78,6 +85,17 @@ static int rdma_create_queuepair(struct rdma_cm_id *id, struct ibv_pd **pd, stru
 
 }
 
+static int rdma_destroy_queuepair(struct rdma_cm_id *id, struct ibv_pd *pd, struct ibv_cq *cq) {
+
+    rdma_destroy_qp(id);
+
+    ibv_destroy_cq(cq);
+
+    ibv_dealloc_pd(pd);
+
+    return 0;
+}
+
 static int rdma_alloc_buffer(struct rdma_cm_id *cm_id, struct ibv_pd *pd) {
 
     conn_manager_t *cm = (conn_manager_t *)calloc(1, sizeof(conn_manager_t));
@@ -94,6 +112,20 @@ static int rdma_alloc_buffer(struct rdma_cm_id *cm_id, struct ibv_pd *pd) {
     cm_id->context = cm;
 
 }
+
+static int rdma_free_buffer(struct rdma_cm_id *cm_id) {
+
+    conn_manager_t *cm = cm_id->context;
+
+    ibv_dereg_mr(cm->send_mr);
+    ibv_dereg_mr(cm->recv_mr);
+
+    free(cm->rbuffer);
+    free(cm->sbuffer);
+
+    return 0;
+}
+
 
 static int rdma_post_recv(struct rdma_cm_id *cm_id) {
     conn_manager_t *cm = (conn_manager_t *) cm_id->context;
@@ -130,7 +162,7 @@ static int rdma_post_send(struct rdma_cm_id *cm_id) {
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
 
-    ibv_post_send(cm_id->qp, &wr, &bad);
+    return ibv_post_send(cm_id->qp, &wr, &bad);
 }
 // push 一次等待结果返回
 static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
@@ -143,15 +175,22 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
             usleep(0);
             continue;
         }
+
         if (wc.status != IBV_WC_SUCCESS) {
             perror("ibv_poll_cq\n");
             return -1;
         }
+        
         if(out) *out = wc;
         return 0;
     }
 
 }
+
+static int open_file(char *filename) {
+
+}
+
 
 #endif
 

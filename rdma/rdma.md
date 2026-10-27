@@ -28,6 +28,10 @@
 
 # 二、Task
 
+    使用RDMA功能实现数据互传
+
+使用RDMA实现文件互传：服务端如何确定文件的SIZE大小？
+
         将RDMA功能，应用到KVSTORE中的主从数据同步功能中。
 
 
@@ -111,4 +115,29 @@ wc：work complete——>cq
 
 
 
+这里可以类比为，channel是epoll，然后id是fd，可以创建多个id，由channel进行统一管理
+
+queuepair实际上是两个队列，send_q和recv_q
+
+
+
 # 四、Result
+
+
+
+问题：
+
+客户端发起
+
+ibv_poll_cq: No space left on device
+rdma_poll_wc: No space left on device
+
+异步情况，客户端一直在发数据，但是服务端没取
+
+
+
+解法：
+
+文件发送时，可以一块一块的发送
+
+而RDMA发送时，可以一次发一个G，本端mr开1G，对端mr就有1G，是一个内存共享的方式，不用考虑多次的方式，
