@@ -9,10 +9,10 @@
 
 
 #define RDMA_TIMEOUT_MS     2000
-#define RDMA_CQ_DEPTH       4096
-#define RDMA_BUFFER_SIZE    1024 * 1024
+#define RDMA_CQ_DEPTH       32
+#define RDMA_BUFFER_SIZE    1024 * 1024 * 64 //4096
 
-#define RDMA_FILENAME       "a.jpg"
+#define RDMA_FILENAME       "m.mp4"
 
 typedef struct conn_manager_s {
 
@@ -81,7 +81,14 @@ static int rdma_create_queuepair(struct rdma_cm_id *id, struct ibv_pd **pd, stru
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
 
-    rdma_create_qp(id, *pd, &attr);
+    int ret = rdma_create_qp(id, *pd, &attr);
+
+    if (ret != 0) {
+        fprintf(stderr, "rdma_create_qp failed: %d\n", ret);
+        return -1;
+    }
+
+    return 0;
 
 }
 
@@ -145,17 +152,21 @@ static int rdma_post_recv(struct rdma_cm_id *cm_id) {
     return ibv_post_recv(cm_id->qp, &wr, &bad);
 }
 
-static int rdma_post_send(struct rdma_cm_id *cm_id) {
-    conn_manager_t *cm = (conn_manager_t *) cm_id->context;
+static int rdma_post_send(struct rdma_cm_id *cm_id, size_t length) {
+    conn_manager_t *cm = cm_id->context;
 
-    struct ibv_sge sge;
-    memset(&sge, 0, sizeof(struct ibv_sge));
+    if (length == 0 || length > RDMA_BUFFER_SIZE) {
+        return -1;
+    }
+
+    struct ibv_sge sge = {0};
     sge.addr = (uintptr_t)cm->sbuffer;
-    sge.length = RDMA_BUFFER_SIZE;
+    sge.length = (uint32_t)length;
     sge.lkey = cm->send_mr->lkey;
 
-    struct ibv_send_wr wr, *bad = NULL;
-    memset(&wr, 0, sizeof(struct ibv_send_wr));
+    struct ibv_send_wr wr = {0};
+    struct ibv_send_wr *bad = NULL;
+
     wr.wr_id = (uintptr_t)cm;
     wr.sg_list = &sge;
     wr.num_sge = 1;
@@ -184,7 +195,6 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
         if(out) *out = wc;
         return 0;
     }
-
 }
 
 static int open_file(char *filename) {

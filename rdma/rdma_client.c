@@ -94,6 +94,13 @@ int main() {
     printf("rdma connect success\n");
 
     conn_manager_t *cm = cm_id->context;
+    // 提前提交接收请求，等待服务端最终确认
+    if (rdma_post_recv(cm_id) != 0) {
+        fprintf(stderr, "rdma_post_recv failed\n");
+        return -1;
+    }
+
+    printf("Client RECV posted, waiting for server ACK\n");
     // sprintf(cm->sbuffer, "abcdefghijklmnopqrstuvwxyz");
 
 // openfile
@@ -125,46 +132,73 @@ int main() {
 
 
 // 把p的内容放进sendbuffer中
-    int idx = 0;    // 当前读到文件的位置
+    size_t idx = 0;    // 当前读到文件的位置
     struct ibv_wc wc;
 
     file_type_t type = {0};
     type.magic = 0x12345678;
     type.total = total;
     memcpy(cm->sbuffer, &type, sizeof(file_type_t));
-    rdma_post_send(cm_id);
+    rdma_post_send(cm_id, sizeof(file_type_t));
 
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
         perror("rdma_poll_wc\n");
         return 0;
     }
+    printf("header send success\n");
+    usleep(100000);
 
-    while (idx < total) {   // 没有读到末尾就循环
-        if (idx + RDMA_BUFFER_SIZE < total) { // 如果剩余内容超过512字节，就读满512字节
-            memcpy(cm->sbuffer, p + idx, RDMA_BUFFER_SIZE);
-            idx += RDMA_BUFFER_SIZE;
-        } else {    // 如果剩余内容小于512字节，就把剩下的都读掉
-            memcpy(cm->sbuffer, p + idx, total - idx);
-            idx = total;
+
+    while (idx < total) {
+
+        size_t length = total - idx;
+
+        if (length > RDMA_BUFFER_SIZE) {
+            length = RDMA_BUFFER_SIZE;
         }
-        printf("idx: %d\n", idx);
-        rdma_post_send(cm_id);
-        if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
-            perror("rdma_poll_wc\n");
-            return 0;
+
+        memcpy(cm->sbuffer, p + idx, length);
+
+        printf("send idx=%zu, length=%zu\n", idx, length);
+
+        if (rdma_post_send(cm_id, length) != 0) {
+            fprintf(stderr, "rdma_post_send failed\n");
+            return -1;
         }
+
+        if (rdma_poll_wc(cq, &wc) != 0 || wc.opcode != IBV_WC_SEND) {
+            fprintf(stderr, "send completion failed\n");
+            return -1;
+        }
+
+        idx += length;
+
+        usleep(100000);  // 暂时保留，用于验证
     }
 
     munmap(p, total);
     close(fd);
 
-    rdma_post_recv(cm_id);
+    // 前面已经提交过 RECV，这里不能重复提交
+    printf("Waiting for server ACK...\n");
+
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
         perror("rdma_poll_wc\n");
         return 0;
     }
-    printf("Recv: %s\n", cm->rbuffer);
 
+
+    if (wc.byte_len == 0 || wc.byte_len > RDMA_BUFFER_SIZE) {
+        fprintf(stderr, "Invalid ACK length: %u\n", wc.byte_len);
+        return -1;
+    }
+
+    if (memchr(cm->rbuffer, '\0', wc.byte_len) == NULL) {
+        fprintf(stderr, "ACK is not null-terminated\n");
+        return -1;
+    }
+
+    printf("Server ACK: %s\n", cm->rbuffer);
 
 
     getchar();

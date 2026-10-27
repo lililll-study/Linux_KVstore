@@ -114,67 +114,49 @@ int main() {
 
     int idx = 0;    // 当前读到文件的位置
     while (idx < total) {   // 没有读到末尾就循环
-        rdma_post_recv(id);
+
+        printf("Before post_recv, idx=%d\n", idx);
+
+        int ret = rdma_post_recv(id);
+        if (ret != 0) {
+            fprintf(stderr, "rdma_post_recv failed: %d\n", ret);
+            return -1;
+        }
+
+        // printf("post_recv success, idx=%d\n", idx);
+
         if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
-            perror("rdma_poll_wc\n");
-            return 0;
+            perror("rdma_poll_wc || wc.opcode\n");
+            return -1;
         }
-        printf("idx: %d\n", idx);
-        if (idx + RDMA_BUFFER_SIZE < total) {
-            memcpy(p + idx, cm->rbuffer, RDMA_BUFFER_SIZE);
-            idx += RDMA_BUFFER_SIZE;
-        } else {
-            memcpy(p + idx, cm->rbuffer, RDMA_BUFFER_SIZE);
-            idx = total;
+
+        printf("recv complete: idx=%d, byte_len=%u\n", idx, wc.byte_len);
+
+        size_t remaining = total - idx;
+
+        if (wc.byte_len == 0 || wc.byte_len > remaining) {
+            fprintf(stderr, "Invalid received length: %u\n", wc.byte_len);
+            return -1;
         }
-        
+
+        memcpy(p + idx, cm->rbuffer, wc.byte_len);
+        idx += wc.byte_len;
+
+        printf("write complete: idx=%d\n", idx);
     }
     msync(p, total, MS_SYNC);
     munmap(p, total);
     close(fd);
 
 #endif
-    sprintf(cm->sbuffer, "sync finished");
-    rdma_post_send(id);
+    const char *msg = "sync finished";
+    strcpy(cm->sbuffer, msg);
+    rdma_post_send(id, strlen(msg) + 1);
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
         perror("rdma_poll_wc\n");
         return 0;
     }
 
     getchar();
-
-
-    // // 必须用 while 循环去拿事件，因为 rdma_get_cm_event 会直接给指针
-    // while (rdma_get_cm_event(channel, &event) == 0) {
-        
-    //     if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-    //         printf("Server: got connect request!\n");
-
-    //         // 1. 获取客户端发来的 ID
-    //         struct rdma_cm_id *child_cm_id = event->id;
-            
-    //         // 2. 为这个新连接创建 QP 和 CQ (复用你的函数)
-    //         struct ibv_pd *pd;
-    //         struct ibv_cq *cq;
-    //         rdma_create_queuepair(child_cm_id, &pd, &cq);
-
-    //         // 3. 准备接受参数
-    //         struct rdma_conn_param conn_param;
-    //         memset(&conn_param, 0, sizeof(conn_param));
-    //         conn_param.responder_resources = 1;
-    //         conn_param.initiator_depth = 1;
-
-    //         // 4. 关键步：调用 rdma_accept() 回应客户端
-    //         if (rdma_accept(child_cm_id, &conn_param) != 0) {
-    //             perror("rdma_accept");
-    //         } else {
-    //             printf("Server: accepted client\n");
-    //         }
-    //     }
-        
-    //     // 释放事件
-    //     rdma_ack_cm_event(event);
-    // }
-
 
 }
