@@ -36,7 +36,7 @@
 
 # 三、Action
 
-
+Linux操作流程：
 
 1 创建SoftiWARP设备
 
@@ -65,6 +65,26 @@ gcc -o rdma_client rdma_client.c -libverbs -lrdmacm
 查看端口服务
 
 netstat -anop | grep 9000
+
+
+
+WARP代码实现流程：
+
+server端
+
+rdma_create_event_channel();
+
+rdma_create_id();    创建通道和id，然后把id绑定一个本地IP
+
+rdma_bind_addr(); 使得它进入listen的状态
+
+rdma_listen();    ——rdma_wait_cm_event();
+
+rdma_accept();    ——rdma_wait_cm_event();
+
+相较于TCP server而言，TCP是阻塞在accept()处，而RDMA是阻塞在rdma_wait_cm_event处,也就是说，在RDMA中accept时，连接已经建立了。
+
+
 
 
 
