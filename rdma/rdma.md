@@ -86,6 +86,29 @@ rdma_accept();    ——rdma_wait_cm_event();
 
 
 
+把数据放进用户空间的buffer后，会mmap映射到内核中的mr区域，然后这块区域通过RDMA自动映射到其他机器中，这个过程是把数据放进去就自动映射的。
+
+```c
+typedef struct conn_manager_s {
+
+    struct ibv_mr *recv_mr;
+    struct ibv_mr *send_mr;
+
+    char *rbuffer;
+    char *sbuffer;
+}
+```
+
+也就是我们把数据放到sbuffer中，对方的rbuffer就会收到数据。把数据放到rbuffer中，对方的sbuffer就会收到数据
+
+rdma具有三个队列（queue）：sq、rq、cq，完成的数据都是放在cq中的，也就说rdma是一个异步的，类似io_uring，都是高性能io组件。
+
+wr：work request  ——>sq、rq
+
+wc：work complete——>cq
+
+
+
 
 
 # 四、Result

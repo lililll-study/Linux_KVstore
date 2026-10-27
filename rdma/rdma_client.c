@@ -5,7 +5,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
+#include <stdlib.h>
+#include <unistd.h>
 #include "rdma.h"
 
 
@@ -17,7 +18,7 @@ int main() {
         return 0;
     }
 
-    struct rdma_cm_id *cm_id;
+    struct rdma_cm_id *cm_id; 
     if (0 != rdma_create_id(channel, &cm_id, NULL, RDMA_PS_TCP)) {
         perror("rdma_create_id\n");
         return 0;
@@ -59,6 +60,8 @@ int main() {
     struct ibv_cq *cq;
     rdma_create_queuepair(cm_id, &pd, &cq);
 
+    rdma_alloc_buffer(cm_id, pd);
+
     // 分配buffer
     struct rdma_conn_param param;
     memset(&param, 0, sizeof(param));
@@ -76,6 +79,28 @@ int main() {
     }
 
     printf("rdma connect success\n");
+
+    conn_manager_t *cm = cm_id->context;
+    sprintf(cm->sbuffer, "abcdefghijklmnopqrstuvwxyz");
+    rdma_post_send(cm_id);
+
+    struct ibv_wc wc;
+    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
+        perror("rdma_poll_wc\n");
+        return 0;
+    }
+
+    rdma_post_recv(cm_id);
+    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
+        perror("rdma_poll_wc\n");
+        return 0;
+    }
+    printf("Recv: %s\n", cm->rbuffer);
+
+
+
+    getchar();
+
 }
 
 

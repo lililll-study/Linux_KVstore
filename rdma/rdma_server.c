@@ -5,7 +5,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdlib.h>
 
+#include <unistd.h>
 #include "rdma.h"
 
 
@@ -52,6 +54,10 @@ int main() {
         return 0;
     }
 
+    rdma_alloc_buffer(id, pd);
+
+    rdma_post_recv(id);
+
     struct rdma_conn_param param;
     memset(&param, 0, sizeof(param));
     param.responder_resources = 1;
@@ -66,9 +72,27 @@ int main() {
     // 连接建立完了，拿到了ID，接着可以进行数据传输
     rdma_wait_cm_event(id->channel, RDMA_CM_EVENT_ESTABLISHED, NULL);
 
+    struct ibv_wc wc;
+    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
+        perror("rdma_poll_wc\n");
+        return 0;
+    }
+    conn_manager_t *cm = id->context;
+    printf("recv: %s\n", cm->rbuffer);
 
+    int i=0;
+    for (i=0; i<RDMA_BUFFER_SIZE; i++) {
+        if (cm->rbuffer[i] == 0x0) break;
+        cm->sbuffer[i] = cm->rbuffer[i] - 0x20;
+    }
 
-    // getchar();
+    rdma_post_send(id);
+    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
+        perror("rdma_poll_wc\n");
+        return 0;
+    }
+
+    getchar();
 
 
     // // 必须用 while 循环去拿事件，因为 rdma_get_cm_event 会直接给指针
