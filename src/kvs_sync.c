@@ -142,6 +142,9 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
     return 0;
 }
 
+
+
+
 // ===== 从节点：循环接收内容写入 filepath，遇到 end_marker 停止并截断 =====
 int recv_file_content(int fd, const char *filepath, const char *end_marker) {
     if (!filepath || !end_marker) return -1;
@@ -207,43 +210,6 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
 }
 
 
-#if 0
-// 主节点
-int send_all_files(int fd) {
-    int i = 0;
-    const char *files[] = {
-        SNAP_FILE,
-        NULL
-    };
-    // 发送文件
-    for (i = 0; files[i]; i++) {
-        if (access(files[i], R_OK) == 0) {
-            send_file(fd, files[i]);
-        }
-    }
-#if ENABLE_NOBLOCK
-    // 发送结束标记（循环发送，处理 EAGAIN）
-    const char *end = "END\n";
-    size_t end_len = 4;
-    size_t sent = 0;
-    while (sent < end_len) {
-        int n = send(fd, end + sent, end_len - sent, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            return -1;
-        }
-        sent += n;
-    }
-#else
-    // 发送结束标记
-    send(fd, "END\n", 4, 0);
-#endif
-    return 0;
-}
-#endif
-
 /**
  * @func 主节点收到sync，根据同步模式分发数据
  * aof：立即同步，每条cmd执行aof_master_immediate
@@ -281,16 +247,28 @@ int is_slave_save(int fd) {
 // 若主机回 +PONG/错误响应，会被写进从机 AOF 并让增量重放卡死。
 int is_sync_peer(int fd) {
     if (fd < 0) return 0;
-#if ENABLE_AOF_SYNC
+    #if ENABLE_AOF_SYNC
     if (g_aof_ctx.is_active && g_aof_ctx.fd == fd) return 1;
-#endif
+    #endif
     if (g_snap_ctx.is_active && g_snap_ctx.fd == fd) return 1;
     return 0;
 }
 
+
+
 // ===== 主机：处理 SYNC 请求 =====
 int handle_sync_request(int fd) {
-    // printf("Handling SYNC request on fd %d\n", fd);
+
+ #if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        pthread_t rdma_tid;
+        if (pthread_create(&rdma_tid, NULL, master_rdma_thread, NULL) != 0) {
+            LOG_INFO("create rdma thread failed\n");
+        } else {
+            pthread_detach(rdma_tid);
+        }
+    }
+ #endif
 
     // 1. 发送模式
     if (g_config.aof_enable) {
@@ -314,11 +292,11 @@ int handle_sync_request(int fd) {
 
         // ★ 记录发送开始时的文件大小，作为快照边界
         struct stat st;
-        long snap_size = 0;
-        if (stat(AOF_FILE, &st) == 0) snap_size = st.st_size;
+        long shot_size = 0;
+        if (stat(AOF_FILE, &st) == 0) shot_size = st.st_size;
 
-        // 只发送 snap_size 字节，末尾加 marker
-        if (send_file_content(fd, AOF_FILE, snap_size, "AOF_SYNC_OK\n") < 0) {
+        // 只发送 shot_size 字节，末尾加 marker
+        if (send_file_content(fd, AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
             SYNC_ERR("send AOF content failed");
             close(fd);
             return -1;
@@ -338,78 +316,6 @@ int handle_sync_request(int fd) {
 }
 
 
-
-#if 0
-// ===== 从节点：解析并执行一条同步命令 =====
-// line: 已去掉 \n 的一条命令字符串，如 "SET lhy2 AAAA..."
-static void aof_slave_exec_line(const char *line)
-{
-    // ===== 使用动态分配，支持大 value =====
-    char cmd[64];
-    char key[256];
-    char *val = NULL;
-
-    size_t line_len = strlen(line);
-
-    // 拷贝到临时缓冲做字段切分
-    char *temp = (char*)malloc(line_len + 1);
-    if (!temp) {
-        printf("[AOF Sync] malloc failed for line (%zu bytes)\n", line_len);
-        return;
-    }
-    memcpy(temp, line, line_len + 1);
-
-    char *space1 = strchr(temp, ' ');
-    if (!space1) {
-        free(temp);
-        return; // 只有一个字段，不是合法命令
-    }
-    *space1 = '\0';
-    strncpy(cmd, temp, sizeof(cmd) - 1);
-    cmd[sizeof(cmd) - 1] = '\0';
-
-    char *rest = space1 + 1;
-    char *space2 = strchr(rest, ' ');
-
-    if (!space2) {
-        // 只有两个字段 (DEL 类命令)
-        strncpy(key, rest, sizeof(key) - 1);
-        key[sizeof(key) - 1] = '\0';
-
-        char *tokens[4] = {cmd, key, NULL, NULL};
-        kvs_filter_protocol(-1, tokens, 2, NULL);
-        free(temp);
-        return;
-    }
-
-    *space2 = '\0';
-    strncpy(key, rest, sizeof(key) - 1);
-    key[sizeof(key) - 1] = '\0';
-
-    // value 从 space2+1 开始，可能很大
-    char *value_start = space2 + 1;
-    size_t value_len = strlen(value_start);
-
-    printf("[AOF Sync] cmd=%s, key=%s, value_len=%zu bytes\n",
-           cmd, key, value_len);
-
-    // 动态分配 value 内存
-    val = (char*)malloc(value_len + 1);
-    if (!val) {
-        printf("[AOF Sync] malloc failed for value_len=%zu\n", value_len);
-        free(temp);
-        return;
-    }
-    memcpy(val, value_start, value_len + 1);
-
-    // 执行命令（append_aof 会在 kvs_filter_protocol 内部完成，写入从机 AOF）
-    char *tokens[4] = {cmd, key, val, NULL};
-    kvs_filter_protocol(-1, tokens, 3, NULL);
-
-    free(val);
-    free(temp);
-}
-#endif
 #if ENABLE_SYNC_MODIFY
 
 /**
@@ -621,6 +527,16 @@ int sync_from_master(const char *master_ip, int port) {
     mode[strcspn(mode, "\r\n")] = '\0';
     SYNC_LOG_S("master mode: %s", mode);
 
+ #if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        if (slave_rdma_start() != 0) {
+            SYNC_ERR("rdma connect test failed");
+        } else {
+            SYNC_LOG_S("RDMA test connection ok");
+        }
+    }
+ #endif
+
     if (strcmp(mode, "aof") == 0) {
         slave_handle_aof_mode(fd);
     } else if (strcmp(mode, "snap") == 0) {
@@ -639,7 +555,7 @@ int sync_from_master(const char *master_ip, int port) {
 int handle_sync_request(int fd) {
     printf("Handling SYNC request on fd %d\n", fd);
 
-// 1. 发送 OK
+    // 1. 发送 OK
 
     if (send(fd, "OK\n", 3, 0) < 0) {
         perror("send OK");
@@ -663,7 +579,7 @@ int handle_sync_request(int fd) {
     }
     
 
-#if ENABLE_AOF_SYNC
+ #if ENABLE_AOF_SYNC
     if (g_config.aof_enable) {
         printf("[AOF Sync] Switching to sync mode...\n");
         // 初始化上下文
@@ -700,12 +616,12 @@ int handle_sync_request(int fd) {
         close(fd);
     }
     return 0;    
-#endif
+ #endif
 }
 
 // ============ 从节点：发起 SYNC ============
 // 全量同步和增量同步，都从从节点发送sync开始
-int sync_from_master(const char *master_ip, int port) {
+int sync_from_master(const char *master_ip, int port) { 
 
     printf("Connecting to master %s:%d\n", master_ip, port);
 
@@ -778,7 +694,7 @@ int sync_from_master(const char *master_ip, int port) {
         printf("Slave AOF cleared\n");
     }
     
-#if ENABLE_AOF_SYNC
+ #if ENABLE_AOF_SYNC
     // ===== 关键改动：不关闭连接，等待 AOF 增量同步 =====
     // 接收 AOF_SYNC_OK
     if(g_config.aof_enable) {
@@ -821,7 +737,7 @@ int sync_from_master(const char *master_ip, int port) {
 
     
     return 0;
-#else
+ #else
     close(fd);
     
     // 重新加载数据
@@ -831,7 +747,7 @@ int sync_from_master(const char *master_ip, int port) {
     printf("Sync completed\n");
     return 0;
 
-#endif
+ #endif
 }
 
 
