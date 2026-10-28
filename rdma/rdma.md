@@ -121,6 +121,22 @@ queuepair实际上是两个队列，send_q和recv_q
 
 
 
+RDMA用于已有数据的同步，准确来说，主机是AOF模式时，只在第一次备份用RDMA同步，后续的实时同步暂时不变。
+
+在SNAP中，SAVE保存的文件同步也用RDMA
+
+当前的代码逻辑是：
+
+先判断主机模式
+
+主机SNAP：那么收到SYNC后，记录从机sockfd，g_snap_ctx.is_active置位，然后判断从机是否发送SAVE指令，收到SAVE后，调用
+
+send_file_content把文件内容发送过去
+
+主机AOF：收到SYNC后，g_aof_ctx.fd = fd; g_aof_ctx.is_active = 1;置位，然后直接把当前的AOF文件内容send_file_content发送到对端
+
+
+
 # 四、Result
 
 

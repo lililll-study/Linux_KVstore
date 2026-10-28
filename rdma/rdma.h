@@ -52,7 +52,7 @@ static int rdma_wait_cm_event(struct rdma_event_channel *channel, enum rdma_cm_e
         return 0;
     }
 
-finished:
+ finished:
     rdma_ack_cm_event(event);
     return ret;
 }
@@ -175,6 +175,7 @@ static int rdma_post_send(struct rdma_cm_id *cm_id, size_t length) {
 
     return ibv_post_send(cm_id->qp, &wr, &bad);
 }
+
 // push 一次等待结果返回
 static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
 
@@ -195,10 +196,6 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
         if(out) *out = wc;
         return 0;
     }
-}
-
-static int open_file(char *filename) {
-
 }
 
 
