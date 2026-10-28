@@ -3,12 +3,14 @@
 // ===== 全局配置默认值 =====
 kvs_config_t g_config = {
     .role = ROLE_MASTER,
-    .port = 2000,
-    .master_ip = "192.168.137.128",
+    .master_ip = "192.168.137.134",
     .master_port = 2000,
+    .slave_ip = "192.168.137.135",
+    .slave_port = 2001,
     .snap_enable = 1,      // 默认开启快照同步
     .aof_enable = 0,        // 默认关闭 AOF 同步
     .aof_crc_enable = 1,    // 默认开启aofcrc
+    .rdma_enable = 1,       // 默认开启 RDMA
     .log_level = LOG_LEVEL_INFO,
 };
 
@@ -97,13 +99,20 @@ int kvs_config_load(const char *filename) {
             } else if (strcmp(value, "slave") == 0) {
                 g_config.role = ROLE_SLAVE;
             }
-        } else if (strcmp(key, "port") == 0) {
-            g_config.port = atoi(value);
         } else if (strcmp(key, "master_ip") == 0) {
             strncpy(g_config.master_ip, value, sizeof(g_config.master_ip) - 1);
         } else if (strcmp(key, "master_port") == 0) {
             g_config.master_port = atoi(value);
-        } else if (strcmp(key, "log.level") == 0 || strcmp(key, "log_level") == 0) {
+        } else if (strcmp(key, "slave_ip") == 0) {
+            strncpy(g_config.slave_ip, value, sizeof(g_config.slave_ip) - 1);
+        } else if (strcmp(key, "slave_port") == 0) {
+            g_config.slave_port = atoi(value);
+        } else if (subkey && strcmp(key, "rdma") == 0) {
+            if (strcmp(subkey, "enable") == 0) {
+                g_config.rdma_enable = parse_bool(value);
+            }
+        }
+        else if (strcmp(key, "log.level") == 0 || strcmp(key, "log_level") == 0) {
             g_config.log_level = parse_log_level(value);
         }
         // ===== 处理 key.subkey 格式 =====
@@ -118,11 +127,6 @@ int kvs_config_load(const char *filename) {
                 g_config.aof_crc_enable = parse_bool(value);
             }
         }
-        
-        
-        
-        
-        
         else {
             printf("[Config] Unknown key: %s\n", key);
         }
@@ -136,13 +140,18 @@ int kvs_config_load(const char *filename) {
 void kvs_config_print(void) {
     printf("========== Config ==========\n");
     printf("  role        : %s\n", g_config.role == ROLE_MASTER ? "master" : "slave");
-    printf("  port        : %d\n", g_config.port);
-    if (g_config.role == ROLE_SLAVE) {
+
+    if (g_config.role == ROLE_MASTER) {
         printf("  master      : %s:%d\n", g_config.master_ip, g_config.master_port);
     }
+    if (g_config.role == ROLE_SLAVE) {
+        printf("  slave       : %s:%d\n", g_config.slave_ip, g_config.slave_port);
+    }
+    
     printf("  snap.enable : %s\n", g_config.snap_enable ? "true" : "false");
     printf("  aof.enable  : %s\n", g_config.aof_enable ? "true" : "false");
-    printf("  aof.crc  : %s\n", g_config.aof_crc_enable ? "true" : "false");
+    printf("  aof.crc     : %s\n", g_config.aof_crc_enable ? "true" : "false");
+    printf("  rdma.enable : %s\n", g_config.rdma_enable ? "true" : "false");
     static const char *lv_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
     int lv = g_config.log_level;
     if (lv < LOG_LEVEL_DEBUG) lv = LOG_LEVEL_DEBUG;
