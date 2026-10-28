@@ -684,7 +684,8 @@ int main(int argc, char *argv[]) {
     kvs_config_print();
     // 设置全局角色
     g_is_master = (g_config.role == ROLE_MASTER);
-    int port = g_config.port;
+
+    int port = (g_config.role == ROLE_MASTER) ? g_config.master_port : g_config.slave_port;
 
 #if ENABLE_PERSIST // 检查data目录是否存在
     if (check_datafile_exist()== -1) return -1;
