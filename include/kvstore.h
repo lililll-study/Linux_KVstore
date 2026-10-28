@@ -51,6 +51,7 @@
 
 #define ENABLE_CRC          1   // 打开crc校验功能
 
+#define ENABLE_RDMA         1   // 打开RDMA功能
 
 
 /* ===== 主机工作标记 ===== */
@@ -420,14 +421,18 @@ typedef enum {
 
 typedef struct {
     kvs_role_t role;
-    int port;
     char master_ip[64];
     int master_port;
+    char slave_ip[64];
+    int slave_port;
 
     int snap_enable;
     int aof_enable;
     int aof_crc_enable; // 增量持久化(AOF)全文 CRC 校验开关
     int log_level;      // 日志级别，见 log_level_t
+
+    // RDMA 同步
+    int rdma_enable;
 } kvs_config_t;
 
 extern kvs_config_t g_config;
@@ -480,4 +485,27 @@ void *kvs_malloc (size_t size);
 #define SYNC_LOG_M(fmt, ...) LOG_INFO ("[SYNC][MASTER] " fmt, ##__VA_ARGS__)
 #define SYNC_LOG_S(fmt, ...) LOG_INFO ("[SYNC][SLAVE] " fmt, ##__VA_ARGS__)
 #define SYNC_ERR(fmt, ...)   LOG_ERROR("[SYNC] " fmt, ##__VA_ARGS__)
+
+
+
+
+/*
+======================================= 9.  RDMA ======================================
+==========================================================================================
+*/
+#if ENABLE_RDMA
+int  master_rdma_start(void);
+int  slave_rdma_start(void);
+void *master_rdma_thread(void *arg);
+#endif
+
+
+
+
+
+
+
+
+
+
 #endif
