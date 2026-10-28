@@ -27,7 +27,7 @@ TEST_SRCS = $(TEST_DIR)/4_crc_testcase.c \
 			$(TEST_DIR)/3_sync_testcase.c \
 			$(TEST_DIR)/2_presist_testcase.c \
 			$(TEST_DIR)/1_RESP_testcase.c \
-            $(TEST_DIR)/aof_snap_test.c
+            $(TEST_DIR)/6_aof_snap_test.c
 
 # ===== 每个测试用例对应的可执行文件 =====
 TEST_TARGETS = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_SRCS))
@@ -45,14 +45,15 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(NET_SRC) \
        $(SRC_DIR)/kvs_sync.c \
 	   $(SRC_DIR)/log.c \
-	   $(SRC_DIR)/crc.c
+	   $(SRC_DIR)/crc.c \
+	   $(SRC_DIR)/kvs_rdma.c
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 INC = -I$(INC_DIR) $(NET_INC)
 # reactor 模式不依赖 libntyco；LIBS = -lpthread -ldl
-LIBS = $(NET_LIB) -lpthread -ldl
+LIBS = $(NET_LIB) -lpthread -ldl -lrdmacm -libverbs
 # 测试端只链接 -lpthread -ldl，不链接 -lntyco
 TEST_LIBS = -lpthread -ldl
 CFLAGS = -Wall -g $(NET_FLAG) $(INC)
