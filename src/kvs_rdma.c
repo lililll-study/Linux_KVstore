@@ -287,8 +287,10 @@ int master_rdma_start() {
     rdma_post_send(id, strlen(cm->sbuffer));
     printf("[RDMA] master echo done\n");
 
-    rdma_free_buffer(cm_id); 
-    rdma_destroy_queuepair(cm_id, pd, cq);
+    rdma_free_buffer(id); 
+    rdma_destroy_queuepair(id, pd, cq);
+    rdma_destroy_id(cm_id);
+    rdma_destroy_event_channel(channel);
 
     return 0;
 }
