@@ -38,6 +38,26 @@ typedef struct conn_manager_s {
     char *sbuffer;
 } conn_manager_t;
 
+typedef enum {
+    RDMA_MSG_DATA = 1,    // 正文块
+    RDMA_MSG_MARKER,      // 结束标记（payload 里放 marker 字符串）
+} rdma_msg_type_t;
+
+typedef struct {
+    uint32_t type;
+    uint32_t length;      // 本块 payload 有效字节数
+} rdma_msg_t;             // 8字节头，后面跟 payload
+
+static struct rdma_cm_id *g_conn_id = NULL;
+static struct ibv_pd     *g_conn_pd = NULL;
+static struct ibv_cq     *g_conn_cq = NULL;
+static conn_manager_t    *g_conn_cm = NULL;
+static struct rdma_event_channel *g_conn_channel = NULL;
+static struct rdma_cm_id         *g_listen_id    = NULL;
+static pthread_mutex_t    g_rdma_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+
+
 // RDMA API
 
 // 等待事件
@@ -134,12 +154,15 @@ static int rdma_alloc_buffer(struct rdma_cm_id *cm_id, struct ibv_pd *pd) {
 static int rdma_free_buffer(struct rdma_cm_id *cm_id) {
 
     conn_manager_t *cm = cm_id->context;
+    if (!cm) return -1;
 
     ibv_dereg_mr(cm->send_mr);
     ibv_dereg_mr(cm->recv_mr);
 
     free(cm->rbuffer);
     free(cm->sbuffer);
+    free(cm);
+    cm_id->context = NULL;
 
     return 0;
 }
@@ -253,7 +276,6 @@ int master_rdma_start() {
     }
 
     rdma_alloc_buffer(id, pd);
-    rdma_post_recv(id); // 提前启动接收数据
 
     // 初始化连接参数
     struct rdma_conn_param param;
@@ -270,6 +292,17 @@ int master_rdma_start() {
     // 连接建立完了，拿到了ID，接着可以进行数据传输
     rdma_wait_cm_event(id->channel, RDMA_CM_EVENT_ESTABLISHED, NULL);
 
+
+ #if 1
+    g_conn_id = id;
+    g_conn_pd = pd;
+    g_conn_cq = cq;
+    g_conn_cm = (conn_manager_t *)id->context;
+    g_conn_channel = channel;      // 事件通道，退出时要销毁
+    g_listen_id    = cm_id;        // 监听 id，退出时要销毁
+    printf("[RDMA] master connection established\n");
+    return 0;
+ #else
     struct ibv_wc wc;
     if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
         perror("rdma_poll_wc\n");
@@ -293,6 +326,7 @@ int master_rdma_start() {
     rdma_destroy_event_channel(channel);
 
     return 0;
+ #endif
 }
 
 // 从节点创建id的过程
@@ -375,15 +409,18 @@ int slave_rdma_start() {
 
     printf("rdma connect success\n");
 
-    struct ibv_wc wc;
-    conn_manager_t *cm = cm_id->context;
-    
+    // struct ibv_wc wc;
+    // conn_manager_t *cm = cm_id->context;
 
-    // 提前提交接收请求，等待服务端最终确认
-    if (rdma_post_recv(cm_id) != 0) {
-        fprintf(stderr, "rdma_post_recv failed\n");
-        return -1;
-    }
+ #if 1
+    g_conn_id = cm_id;
+    g_conn_pd = pd;
+    g_conn_cq = cq;
+    g_conn_cm = (conn_manager_t *)cm_id->context;
+    g_conn_channel = channel;      // 从机只有这一个 id，没有 g_listen_id
+    printf("[RDMA] slave connection established\n");
+    return 0;
+ #else
     printf("Client RECV posted, waiting for server ACK\n");
 
 
@@ -407,17 +444,202 @@ int slave_rdma_start() {
     rdma_destroy_queuepair(cm_id, pd, cq);
 
     return 0;
+ #endif
 }
 
+
+
+
+
+// 发一个块，阻塞到发送完成
+static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t type, const char *payload, uint32_t len) {
+    conn_manager_t *cm = (conn_manager_t *)id->context;
+    if (len > RDMA_BUFFER_SIZE - sizeof(rdma_msg_t)) return -1;
+
+    rdma_msg_t *msg = (rdma_msg_t *)cm->sbuffer;
+    msg->type = type;
+    msg->length = len;
+    char *dst = cm->sbuffer + sizeof(rdma_msg_t);
+    if (len > 0 && payload != dst) {
+        memcpy(dst, payload, len);
+    }
+
+    if (0 != rdma_post_send(id, sizeof(rdma_msg_t) + len)) return -1;
+    if (rdma_poll_wc(cq, NULL) != 0) return -1;      // 等 SEND 完成
+
+    return 0;
+}
+
+// 接收一个块
+static int rdma_recv_block(struct rdma_cm_id *id, struct ibv_cq *cq) {
+    if (rdma_post_recv(id) != 0) return -1;
+    struct ibv_wc wc;
+    if (rdma_poll_wc(cq, &wc) != 0 || wc.opcode != IBV_WC_RECV) return -1;
+    return 0;
+}
+
+
+int rdma_send_file(const char *filepath, long total, const char *end_marker) {
+    if (!filepath || !end_marker) return -1;
+
+    /* 等连接就绪（主机监听线程是异步起的，最多等 5s） */
+    int wait = 0;
+    while (g_conn_id == NULL && wait++ < 50) usleep(100 * 1000);
+    if (g_conn_id == NULL) {
+        fprintf(stderr, "[RDMA] connection not ready\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_rdma_mtx);
+
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return -1;
+    }
+    long to_send = st.st_size;
+    if (total > 0 && total < to_send) to_send = total;
+
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) {
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return -1;
+    }
+
+    int rc = 0;
+    long sent = 0;
+    /* 直接读进 sbuffer 的 payload 区，避免二次拷贝 */
+    char *payload = g_conn_cm->sbuffer + sizeof(rdma_msg_t);
+    size_t cap = RDMA_BUFFER_SIZE - sizeof(rdma_msg_t);
+
+    while (sent < to_send) {
+        size_t chunk = (to_send - sent) < (long)cap ? (size_t)(to_send - sent) : cap;
+        if (fread(payload, 1, chunk, fp) != chunk) { rc = -1; break; }
+
+        if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_DATA, payload, chunk) != 0) {
+            rc = -1; break;
+        }
+        sent += chunk;
+    }
+    fclose(fp);
+
+    if (rc == 0 &&
+        rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER,
+                        end_marker, (uint32_t)strlen(end_marker)) != 0) {
+        rc = -1;
+    }
+
+    pthread_mutex_unlock(&g_rdma_mtx);
+    if (rc == 0)
+        printf("[RDMA] sent %ld bytes from %s\n", sent, filepath);
+    return rc;
+}
+
+/* 从机调用：接收文件写入 filepath，直到收到 end_marker。语义与 recv_file_content 一致 */
+int rdma_recv_file(const char *filepath, const char *end_marker) {
+    if (!filepath || !end_marker) return -1;
+    if (g_conn_id == NULL) return -1;
+
+    pthread_mutex_lock(&g_rdma_mtx);
+
+    FILE *fp = fopen(filepath, "wb");
+    if (!fp) {
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return -1;
+    }
+
+    int end_len = (int)strlen(end_marker);
+    int done = 0, rc = 0;
+    long total = 0;
+
+    while (!done) {
+        if (rdma_recv_block(g_conn_id, g_conn_cq) != 0) { rc = -1; break; }
+
+        rdma_msg_t *msg = (rdma_msg_t *)g_conn_cm->rbuffer;
+        char *payload = g_conn_cm->rbuffer + sizeof(rdma_msg_t);
+
+        if (msg->type == RDMA_MSG_MARKER) {
+            if ((int)msg->length != end_len ||
+                memcmp(payload, end_marker, end_len) != 0) {
+                fprintf(stderr, "[RDMA] marker mismatch\n");
+                rc = -1;
+            }
+            done = 1;
+        } else if (msg->type == RDMA_MSG_DATA) {
+            fwrite(payload, 1, msg->length, fp);
+            total += msg->length;
+        } else {
+            fprintf(stderr, "[RDMA] bad msg type %u\n", msg->type);
+            rc = -1; done = 1;
+        }
+    }
+
+    fclose(fp);
+    pthread_mutex_unlock(&g_rdma_mtx);
+    if (rc == 0)
+        printf("[RDMA] received %ld bytes -> %s\n", total, filepath);
+    return rc;
+}
 
 // 主机端的rdma线程
 void *master_rdma_thread(void *arg) {
     (void)arg;
-    if (master_rdma_start() != 0) {
+    pthread_mutex_lock(&g_rdma_mtx);
+    if (g_conn_id != NULL) {                    // 已建立过连接，直接返回
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return NULL;
+    }
+    pthread_mutex_unlock(&g_rdma_mtx);
+    if (0 != master_rdma_start()) {
         LOG_INFO("[RDMA] master handshake failed\n");
     }
     return NULL;
 }
+
+
+/* 程序退出时调用：拆掉常驻连接，释放所有 RDMA 资源 */
+void rdma_shutdown(void) {
+    pthread_mutex_lock(&g_rdma_mtx);
+    if (g_conn_id == NULL) {
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return;
+    }
+
+    /* 1. 先断开：通知对端，同时会在本地触发一个 DISCONNECTED 事件 */
+    rdma_disconnect(g_conn_id);
+
+    /* 2. 把这个 DISCONNECTED 事件收掉，否则 rdma_destroy_id 可能一直等事件被 reap */
+    if (g_conn_channel) {
+        struct rdma_cm_event *ev = NULL;
+        if (0 == rdma_get_cm_event(g_conn_channel, &ev)) {
+            rdma_ack_cm_event(ev);
+        }
+    }
+
+    /* 3. 销毁顺序不能乱：dereg MR → destroy QP → destroy CQ → dealloc PD */
+    rdma_free_buffer(g_conn_id);                                  /* 里面 dereg send_mr/recv_mr */
+    rdma_destroy_queuepair(g_conn_id, g_conn_pd, g_conn_cq);      /* destroy_qp + destroy_cq + dealloc_pd */
+    rdma_destroy_id(g_conn_id);
+
+    g_conn_id = NULL;
+    g_conn_pd = NULL;
+    g_conn_cq = NULL;
+    g_conn_cm = NULL;
+
+    /* 4. 最后销毁监听 id 和事件通道 */
+    if (g_listen_id) {
+        rdma_destroy_id(g_listen_id);
+        g_listen_id = NULL;
+    }
+    if (g_conn_channel) {
+        rdma_destroy_event_channel(g_conn_channel);
+        g_conn_channel = NULL;
+    }
+
+    pthread_mutex_unlock(&g_rdma_mtx);
+    printf("[RDMA] shutdown done\n");
+}
+
 
 
 #endif
