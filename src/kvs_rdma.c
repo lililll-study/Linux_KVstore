@@ -38,9 +38,13 @@ typedef struct conn_manager_s {
     char *sbuffer;
 } conn_manager_t;
 
+/* 给RDMA添加READY 和 ACK的同步机制，确保数据传输顺序 */
 typedef enum {
     RDMA_MSG_DATA = 1,    // 正文块
-    RDMA_MSG_MARKER,      // 结束标记（payload 里放 marker 字符串）
+    RDMA_MSG_MARKER = 2,      // 结束标记（payload 里放 marker 字符串）
+    RDMA_MSG_READY = 3,
+    RDMA_MSG_FINISHED = 4,
+    RDMA_MSG_ERROR = 5
 } rdma_msg_type_t;
 
 typedef struct {
@@ -279,8 +283,18 @@ int master_rdma_start() {
         return 0;
     }
 
-    rdma_alloc_buffer(id, pd);
+    if (rdma_alloc_buffer(id, pd) != 0) {
+        fprintf(stderr, "[RDMA] alloc buffer failed\n");
+        return -1;
+    }
 
+    /* 提前准备接收从机的第一条 READY */
+    if (rdma_post_recv(id) != 0) {
+        fprintf(stderr, "[RDMA] master initial RECV failed\n");
+        return -1;
+    }
+
+    printf("[RDMA] master initial RECV posted\n");
     // 初始化连接参数
     struct rdma_conn_param param;
     memset(&param, 0, sizeof(param));
@@ -424,9 +438,6 @@ int slave_rdma_start() {
     g_conn_channel = channel;      // 从机只有这一个 id，没有 g_listen_id
     printf("[RDMA] slave connection established\n");
 
-    /* 连接一建立就挂上第一个 recv，让主机可以立即发数据 */
-    rdma_post_recv(cm_id);
-
     return 0;
  #else
     printf("Client RECV posted, waiting for server ACK\n");
@@ -471,18 +482,65 @@ static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t ty
     if (len > 0 && payload != dst) {
         memcpy(dst, payload, len);
     }
+    printf("[RDMA] posting SEND type=%u len=%u\n", type, len);
+    int ret = rdma_post_send(id, sizeof(rdma_msg_t) + len);
 
-    if (0 != rdma_post_send(id, sizeof(rdma_msg_t) + len)) return -1;
-    if (rdma_poll_wc(cq, NULL) != 0) return -1;      // 等 SEND 完成
+    if (ret != 0) {
+        fprintf(stderr,
+            "[RDMA] ibv_post_send failed: %d (%s)\n",
+            ret, strerror(ret));
+        return -1;
+    }
+    struct ibv_wc wc;
 
+    if (rdma_poll_wc(cq, &wc) != 0)
+        return -1;
+
+    printf("[RDMA] SEND completion opcode=%d status=%d\n",
+        wc.opcode, wc.status);
+
+    if (wc.opcode != IBV_WC_SEND)
+        return -1;
+
+    printf("[RDMA] SEND type=%u, length=%u\n", type, len);
     return 0;
 }
 
 // 接收一个块
-static int rdma_recv_block(struct rdma_cm_id *id, struct ibv_cq *cq) {
-    if (rdma_post_recv(id) != 0) return -1;
+static int rdma_recv_block(struct rdma_cm_id *id, struct ibv_cq *cq, struct ibv_wc *out) {
     struct ibv_wc wc;
     if (rdma_poll_wc(cq, &wc) != 0 || wc.opcode != IBV_WC_RECV) return -1;
+
+    if (wc.byte_len < sizeof(rdma_msg_t) || wc.byte_len > RDMA_BUFFER_SIZE) {
+        perror("[RDMA] invalid recv size\n");
+        return -1;
+    }
+    *out = wc;
+    return 0;
+}
+
+// 收发控制的辅助函数
+static int rdma_send_control(uint32_t type) {
+
+    return rdma_send_block( g_conn_id, g_conn_cq, type, NULL, 0);
+
+}
+
+static int rdma_wait_control(uint32_t expected) {
+
+    struct ibv_wc wc;
+
+    if (rdma_recv_block( g_conn_id, g_conn_cq, &wc) != 0)
+        return -1;
+
+    rdma_msg_t *msg = (rdma_msg_t *)g_conn_cm->rbuffer;
+
+    if (wc.byte_len != sizeof(rdma_msg_t) || msg->length != 0 || msg->type != expected) {
+
+        fprintf(stderr, "[RDMA] control mismatch: expected=%u, actual=%u, bytes=%u\n", expected, msg->type, wc.byte_len);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -492,8 +550,9 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
 
     /* 等连接就绪（主机监听线程是异步起的，最多等 5s） */
     int wait = 0;
-    printf("wait connection\n");
+
     while (g_conn_id == NULL && wait++ < 50) usleep(100 * 1000);
+
     if (g_conn_id == NULL) {
         fprintf(stderr, "[RDMA] connection not ready\n");
         return -1;
@@ -501,49 +560,101 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
 
     pthread_mutex_lock(&g_rdma_mtx);
 
+    int rc = -1;
+    FILE *fp = NULL;
+
     struct stat st;
     if (stat(filepath, &st) != 0) {
-        pthread_mutex_unlock(&g_rdma_mtx);
-        return -1;
+        perror("stat");
+        goto out;
     }
+
     long to_send = st.st_size;
+
     if (total > 0 && total < to_send) to_send = total;
 
-    printf("fopen send file\n");
-
-    FILE *fp = fopen(filepath, "rb");
+    fp = fopen(filepath, "rb");
     if (!fp) {
-        pthread_mutex_unlock(&g_rdma_mtx);
-        return -1;
+        perror("fopen");
+        goto out;
     }
 
-    int rc = 0;
-    long sent = 0;
+
     /* 直接读进 sbuffer 的 payload 区，避免二次拷贝 */
     char *payload = g_conn_cm->sbuffer + sizeof(rdma_msg_t);
-    size_t cap = RDMA_BUFFER_SIZE - sizeof(rdma_msg_t);
-    printf("cap: %ld\n", cap);
-    while (sent < to_send) {
-        size_t chunk = (to_send - sent) < (long)cap ? (size_t)(to_send - sent) : cap;
-        if (fread(payload, 1, chunk, fp) != chunk) { rc = -1; break; }
 
-        if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_DATA, payload, chunk) != 0) {
-            rc = -1; break;
+    size_t cap = RDMA_BUFFER_SIZE - sizeof(rdma_msg_t);
+
+    long sent = 0;
+    
+
+    while (sent < to_send) {
+
+        /* 等待从机准备好接收 DATA */
+        if (rdma_wait_control(RDMA_MSG_READY) != 0)
+            goto out;
+
+        /*
+         * 在发送当前 DATA 前，先准备接收
+         * 下一轮 READY。
+         *
+         * 避免从机发 READY 时主机还没 post_recv。
+         */
+        if (rdma_post_recv(g_conn_id) != 0)
+            goto out;
+        
+        size_t remaining = (size_t)(to_send - sent);
+        size_t chunk = remaining < cap ? remaining : cap;
+
+        if (fread(payload, 1, chunk, fp) != chunk) {
+            fprintf(stderr, "[RDMA] fread failed\n");
+            goto out;
         }
-        sent += chunk;
-        // usleep(100000);  // 暂时保留，用于验证
+
+        if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_DATA, payload, (uint32_t)chunk) != 0) {
+            goto out;
+        }
+        sent += (long)chunk;
+
+        printf("[RDMA] sent chunk=%zu total=%ld/%ld\n", chunk, sent, to_send);
     }
-    fclose(fp);
-    printf("rdma_send_block\n");
-    if (rc == 0 &&
-        rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER,
-                        end_marker, (uint32_t)strlen(end_marker)) != 0) {
-        rc = -1;
+
+    /*
+     * 从机处理完最后一块 DATA 后，
+     * 会再次发送 READY，表示可以接收 MARKER。
+     */
+    if (rdma_wait_control(RDMA_MSG_READY) != 0)
+        goto out;
+
+    /*
+     * 提前准备接收最终 FINISHED。
+     */
+    if (rdma_post_recv(g_conn_id) != 0)
+        goto out;
+
+
+    printf("FINISHED\n");
+    if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER, end_marker, (uint32_t)strlen(end_marker)) != 0) {
+        goto out;
     }
+
+    /* 等待从机确认整个文件写入成功 */
+    if (rdma_wait_control(RDMA_MSG_FINISHED) != 0)
+        goto out;
+
+    /* 为下一轮 SNAP 同步提前准备 RECV */
+    if (rdma_post_recv(g_conn_id) != 0)
+        goto out;
+
+    printf("[RDMA] file sync finished: %ld bytes\n", sent);
+
+    rc = 0;
+
+out:
+    if (fp)
+        fclose(fp);
 
     pthread_mutex_unlock(&g_rdma_mtx);
-    if (rc == 0)
-        printf("[RDMA] sent %ld bytes from %s\n", sent, filepath);
     return rc;
 }
 
@@ -554,42 +665,113 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
 
     pthread_mutex_lock(&g_rdma_mtx);
 
-    FILE *fp = fopen(filepath, "wb");
+    int rc = -1;
+    FILE *fp = NULL;
+    long total = 0;
+    int done = 0;
+
+    fp = fopen(filepath, "rb+");
+
+    if (fp == NULL) {
+        fp = fopen(filepath, "wb");
+    }
     if (!fp) {
-        pthread_mutex_unlock(&g_rdma_mtx);
-        return -1;
+        perror("fopen");
+        goto out;
     }
 
-    int end_len = (int)strlen(end_marker);
-    int done = 0, rc = 0;
-    long total = 0;
+    size_t end_len = strlen(end_marker);
 
     while (!done) {
-        if (rdma_recv_block(g_conn_id, g_conn_cq) != 0) { rc = -1; break; }
-
-        rdma_msg_t *msg = (rdma_msg_t *)g_conn_cm->rbuffer;
-        char *payload = g_conn_cm->rbuffer + sizeof(rdma_msg_t);
-
-        if (msg->type == RDMA_MSG_MARKER) {
-            if ((int)msg->length != end_len ||
-                memcmp(payload, end_marker, end_len) != 0) {
-                fprintf(stderr, "[RDMA] marker mismatch\n");
-                rc = -1;
-            }
-            done = 1;
-        } else if (msg->type == RDMA_MSG_DATA) {
-            fwrite(payload, 1, msg->length, fp);
-            total += msg->length;
-        } else {
-            fprintf(stderr, "[RDMA] bad msg type %u\n", msg->type);
-            rc = -1; done = 1;
+        // 第一步：先提交请求
+        if (rdma_post_recv(g_conn_id) != 0) {
+            fprintf(stderr, "[RDMA] post_recv failed\n");
+            goto out;
         }
+
+        // 第二步：告诉主机可以发下一条消息
+        if (rdma_send_control(RDMA_MSG_READY) != 0) {
+            fprintf(stderr, "[RDMA] send READY failed\n");
+            goto out;
+        }
+
+        // 第三步：等待主机发送DATA | MARKER
+        struct ibv_wc wc;
+        if (rdma_recv_block(g_conn_id, g_conn_cq, &wc) != 0) goto out;
+
+        rdma_msg_t *msg =(rdma_msg_t *)g_conn_cm->rbuffer;
+        char *payload = g_conn_cm->rbuffer + sizeof(rdma_msg_t);
+        uint32_t actual_len = wc.byte_len - sizeof(rdma_msg_t);
+        printf("[RDMA] recv type=%u, wc.byte_len=%u, payload=%u\n", msg->type, wc.byte_len, msg->length);
+        if (msg->length != actual_len) {
+            fprintf(stderr, "[RDMA] length mismatch: header=%u actual=%u\n", msg->length, actual_len);
+            goto out;
+        }
+
+        if (msg->type == RDMA_MSG_DATA) {
+            size_t written = fwrite(payload, 1, msg->length, fp);
+
+            if (written != msg->length) {
+                fprintf(stderr, "[RDMA] fwrite failed\n");
+                goto out;
+            }
+
+            total += (long)written;
+
+            printf("[RDMA] written=%zu total=%ld\n", written, total);
+
+        } else if (msg->type == RDMA_MSG_MARKER) {
+            if (msg->length != end_len || memcmp(payload, end_marker, end_len) != 0) {
+                fprintf(stderr, "[RDMA] marker mismatch\n");
+                goto out;
+            }
+
+            done = 1;
+
+        } else {
+            fprintf(stderr, "[RDMA] unknown msg type=%u\n", msg->type);
+            goto out;
+        }
+        /*
+         * 当前消息已经完全处理。
+         * 下一轮循环才重新 post_recv，
+         * 不会提前覆盖 rbuffer。
+         */
+
     }
 
-    fclose(fp);
+    if (fflush(fp) != 0) {
+        perror("fflush");
+        goto out;
+    }
+
+    if (ftruncate(fileno(fp), total) != 0)
+        goto out;
+        
+    if (fsync(fileno(fp)) != 0) {
+        perror("fsync");
+        goto out;
+    }
+
+    if (fclose(fp) != 0) {
+        fp = NULL;
+        perror("fclose");
+        goto out;
+    }
+    fp = NULL;
+    /*
+     * 文件写入成功后发送最终确认。
+     */
+
+    if (rdma_send_control(RDMA_MSG_FINISHED) != 0) goto out;
+    printf("[RDMA] received %ld bytes -> %s\n", total, filepath);
+    rc = 0;
+
+out:
+    if (fp)
+        fclose(fp);
+
     pthread_mutex_unlock(&g_rdma_mtx);
-    if (rc == 0)
-        printf("[RDMA] received %ld bytes -> %s\n", total, filepath);
     return rc;
 }
 
