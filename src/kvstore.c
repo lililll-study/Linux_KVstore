@@ -354,7 +354,15 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             ret = save_snapshots();
             // 如果是从机的 SAVE 请求，发送 SNAP
             if (g_config.snap_enable && is_slave_save(fd)) {
+#if ENABLE_RDMA
+                if (g_config.rdma_enable) {
+                    rdma_send_file(SNAP_FILE, 0, "SNAP_END\n");
+                } else {
+                    send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
+                }
+#else
                 send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
+#endif
                 // SAFE_APPEND("+OK\r\n");
                 break;
             }
@@ -711,6 +719,12 @@ int main(int argc, char *argv[]) {
 #elif (NET_SELECT == NET_NTYCO)
     ntyco_start(port, kvs_protocol);
 #endif
+#if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        rdma_shutdown();       /* 必须在网络主循环退出之后、进程结束之前 */
+    }
+#endif
+
     dest_kvengine();
     
     LOG_INFO("kvstore stopped");   /* ★ 可选：退出前打一条 */
