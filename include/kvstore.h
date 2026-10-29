@@ -497,6 +497,9 @@ void *kvs_malloc (size_t size);
 int  master_rdma_start(void);
 int  slave_rdma_start(void);
 void *master_rdma_thread(void *arg);
+int  rdma_send_file(const char *filepath, long total, const char *end_marker);
+int  rdma_recv_file(const char *filepath, const char *end_marker);
+void rdma_shutdown(void);
 #endif
 
 
