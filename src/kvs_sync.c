@@ -294,7 +294,19 @@ int handle_sync_request(int fd) {
         struct stat st;
         long shot_size = 0;
         if (stat(AOF_FILE, &st) == 0) shot_size = st.st_size;
-
+#if ENABLE_RDMA
+        if (g_config.rdma_enable) {
+            if (rdma_send_file(AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
+                SYNC_ERR("rdma send AOF failed");
+                close(fd);
+                return -1;
+            }
+        } else if (send_file_content(fd, AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
+            SYNC_ERR("send AOF content failed");
+            close(fd);
+            return -1;
+        }
+#else
         // 只发送 shot_size 字节，末尾加 marker
         if (send_file_content(fd, AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
             SYNC_ERR("send AOF content failed");
@@ -302,6 +314,7 @@ int handle_sync_request(int fd) {
             return -1;
         }
 
+#endif
     } else if (g_config.snap_enable) {
         SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
 
@@ -392,12 +405,23 @@ void* slave_snap_recv_thread(void* arg) {
         const char *save_cmd = "*1\r\n$4\r\nSAVE\r\n";
         if (safe_send(fd, save_cmd, strlen(save_cmd)) < 0) break;
 
-
+#if ENABLE_RDMA
+        if (g_config.rdma_enable) {
+            if (rdma_recv_file(SNAP_FILE, "SNAP_END\n") < 0) {
+                SYNC_ERR("rdma recv SNAP failed");
+                break;
+            }
+        } else if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
+            SYNC_ERR("SNAP recv content failed");
+            break;
+        }
+#else
         /* 2. 接收 SNAP 内容并写入 SNAP_FILE */
         if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
             SYNC_ERR("SNAP recv content failed");
             break;
         }
+#endif
         load_snapshots();
         SYNC_LOG_S("SNAP loaded");
     }
@@ -415,6 +439,19 @@ void slave_handle_aof_mode(int fd) {
     // ===== 1. 接收 AOF 文件（全量） =====
     SYNC_LOG_S("receiving AOF full stream...");
 
+#if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        if (rdma_recv_file(AOF_FILE, "AOF_SYNC_OK\n") < 0) {
+            SYNC_ERR("rdma recv AOF failed");
+            close(fd);
+            return;
+        }
+    } else if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
+        SYNC_ERR("recv AOF content failed");
+        close(fd);
+        return;
+    }
+#else
     /* 接收 AOF 内容并写入本地 AOF */
     if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
         SYNC_ERR("recv AOF content failed");
@@ -422,6 +459,7 @@ void slave_handle_aof_mode(int fd) {
         return;
     }
 
+#endif
     SYNC_LOG_S("AOF stream received, replaying...");
 
     long consumed = replay_aof_from(AOF_FILE, 0);
