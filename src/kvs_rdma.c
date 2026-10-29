@@ -23,7 +23,7 @@
 
 #define RDMA_TIMEOUT_MS     2000
 #define RDMA_CQ_DEPTH       32
-#define RDMA_BUFFER_SIZE    1024 //4096
+#define RDMA_BUFFER_SIZE    1024 * 1024 * 6 //4096
 
 #if ENABLE_RDMA
 
@@ -222,8 +222,11 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
             continue;
         }
 
+
         if (wc.status != IBV_WC_SUCCESS) {
-            perror("ibv_poll_cq\n");
+            fprintf(stderr, "[RDMA] poll_cq failed: status=%s(%d), vendor_err=0x%x, opcode=%d, byte_len=%u\n",
+                ibv_wc_status_str(wc.status), wc.status,
+                wc.vendor_err, wc.opcode, wc.byte_len);
             return -1;
         }
         
@@ -262,6 +265,7 @@ int master_rdma_start() {
         perror("rdma_listen\n");
         return 0;
     }
+    printf("[RDMA] master listening on %s:%d\n", g_config.master_ip, RDMA_SERVER_PORT);
     // 此时连接已经建立
     struct rdma_cm_event *event = NULL;
     rdma_wait_cm_event(channel, RDMA_CM_EVENT_CONNECT_REQUEST, &event);
@@ -419,6 +423,10 @@ int slave_rdma_start() {
     g_conn_cm = (conn_manager_t *)cm_id->context;
     g_conn_channel = channel;      // 从机只有这一个 id，没有 g_listen_id
     printf("[RDMA] slave connection established\n");
+
+    /* 连接一建立就挂上第一个 recv，让主机可以立即发数据 */
+    rdma_post_recv(cm_id);
+
     return 0;
  #else
     printf("Client RECV posted, waiting for server ACK\n");
@@ -484,6 +492,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
 
     /* 等连接就绪（主机监听线程是异步起的，最多等 5s） */
     int wait = 0;
+    printf("wait connection\n");
     while (g_conn_id == NULL && wait++ < 50) usleep(100 * 1000);
     if (g_conn_id == NULL) {
         fprintf(stderr, "[RDMA] connection not ready\n");
@@ -500,6 +509,8 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
     long to_send = st.st_size;
     if (total > 0 && total < to_send) to_send = total;
 
+    printf("fopen send file\n");
+
     FILE *fp = fopen(filepath, "rb");
     if (!fp) {
         pthread_mutex_unlock(&g_rdma_mtx);
@@ -511,7 +522,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
     /* 直接读进 sbuffer 的 payload 区，避免二次拷贝 */
     char *payload = g_conn_cm->sbuffer + sizeof(rdma_msg_t);
     size_t cap = RDMA_BUFFER_SIZE - sizeof(rdma_msg_t);
-
+    printf("cap: %ld\n", cap);
     while (sent < to_send) {
         size_t chunk = (to_send - sent) < (long)cap ? (size_t)(to_send - sent) : cap;
         if (fread(payload, 1, chunk, fp) != chunk) { rc = -1; break; }
@@ -520,9 +531,10 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
             rc = -1; break;
         }
         sent += chunk;
+        // usleep(100000);  // 暂时保留，用于验证
     }
     fclose(fp);
-
+    printf("rdma_send_block\n");
     if (rc == 0 &&
         rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER,
                         end_marker, (uint32_t)strlen(end_marker)) != 0) {
