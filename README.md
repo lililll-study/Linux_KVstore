@@ -32,9 +32,13 @@
 
 * 内存管理：仿jemalloc实现的字符串分级内存池
 
+* 已有数据同步：RDMA
+
+* 实时数据同步：ebpf
+
 # 环境要求
 
-* Linux 5.1+（依赖 epoll / io _uring）
+* Ubuntu2404以上版本，Linux 6.8+（依赖 epoll / io _uring / ebpf）
 * gcc
 * make
 * git（构建 ntyco 模式时需要，用于自动拉取 submodule）
@@ -43,6 +47,21 @@
 | ------- | ------------------ | -------------------- | ----------- |
 | reactor | 单线程 IO 多路复用（epoll） | 否                    | 通用部署，构建路径最短 |
 | ntyco   | 同步写法 + 协程（NtyCo 库） | 是                    | 高并发连接场景     |
+
+
+
+新系统需要安装的软件包
+
+```bash
+#make支持
+sudo apt install make
+#gcc编译器
+sudo apt install -y build-essential
+#rdma库
+sudo apt install -y librdmacm-dev libibverbs-dev
+```
+
+
 
 # 编译
 
@@ -423,8 +442,6 @@ redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 160 -n 100000 -t ping -q
 | ------ | ------ | ------ | ------ | ------ | ------- |
 | SNAP模式 | 7.84w  | 15.55w | 30.31w | 59.88w | 116.28w |
 | AOF模式  | 84.46w | 15.13w | 29.85w | 59.53w | 116.28w |
-
-
 
 
 

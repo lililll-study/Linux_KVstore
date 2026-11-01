@@ -53,6 +53,8 @@
 
 #define ENABLE_RDMA         1   // 打开RDMA功能
 
+#define ENABLE_EBPF         1   // 打开ebpf功能
+
 
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
