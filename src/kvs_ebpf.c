@@ -70,6 +70,7 @@ int main(int argc, char **argv)
     }
 
     /* 1. 打开 + 加载 */
+    // 打开并加载 skeleton
     struct aof_capture_bpf *skel = aof_capture_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "加载 BPF 失败：检查 root / BTF / verifier\n");
@@ -85,10 +86,7 @@ int main(int argc, char **argv)
     }
 
     /* 3. 挂到 append_aof */
-    LIBBPF_OPTS(bpf_uprobe_opts, opts,
-        .func_name = "append_aof",
-        .retprobe  = false,
-    );
+    LIBBPF_OPTS(bpf_uprobe_opts, opts, .func_name = "append_aof", .retprobe  = false,);
     struct bpf_link *link = bpf_program__attach_uprobe_opts(
         skel->progs.on_append_aof, target_pid, bin_path, 0, &opts);
     if (!link) {
@@ -126,8 +124,7 @@ int main(int argc, char **argv)
     ring_buffer__free(rb);
 
     u64 lost = 0;
-    if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.lost_count),
-                            &key, &lost) == 0)
+    if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.lost_count), &key, &lost) == 0)
         printf("\n共捕获 %llu 条，ringbuf 丢弃 %llu 条\n",
                (unsigned long long)g_event_count,
                (unsigned long long)lost);

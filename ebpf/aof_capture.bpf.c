@@ -1,8 +1,12 @@
-// /home/lhy/share/kvs_lhy/ebpf/aof_capture.bpf.c
+
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "aof_capture.h"
+
+
+// 内核侧 BPF 程序
+
 
 /* 目标进程 pid：0 表示不做过滤 */
 struct {
@@ -26,6 +30,8 @@ struct {
     __type(value, u64);
 } lost_count SEC(".maps");
 
+// 挂到目标进程的 append_aof 函数上
+// PID 过滤 → 读 rdi/rsi/rdx 字符串 → 填 aof_event
 SEC("uprobe")
 int on_append_aof(struct pt_regs *ctx)
 {
@@ -74,7 +80,7 @@ int on_append_aof(struct pt_regs *ctx)
         if (n >= (long)sizeof(e->value))
             e->truncated = 1;
     }
-
+    // 写入ringbuf，给用户态读取
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
