@@ -386,6 +386,14 @@ void init_aof_sync_ctx(void);
 // 主节点同步模式及线程函数
 int master_aof_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
 
+// 主节点：把一条命令拼成 RESP 并推给从机（同步链路唯一出口，eBPF 线程也走这里）
+int master_aof_sync_send(const char *cmd, const char *key, const char *value);
+// 只拼不发：批量转发时先攒进大缓冲，减少 send() 系统调用次数
+int master_aof_format_cmd(char *buf, int cap,
+                          const char *cmd, const char *key, const char *value);
+// 把一块已经拼好的 RESP 一次性推给从机（批量刷出用）
+int master_aof_send_raw(const char *data, int len);
+
 
 // 从节点处理同步数据线程，以及接口函数
 void* slave_aof_recv_thread(void* arg); 
@@ -435,6 +443,9 @@ typedef struct {
 
     // RDMA 同步
     int rdma_enable;
+
+    // eBPF 实时捕获转发--主节点
+    int ebpf_enable;
 } kvs_config_t;
 
 extern kvs_config_t g_config;
@@ -507,7 +518,20 @@ void rdma_shutdown(void);
 
 
 
+/*
+======================================= 10. eBPF 实时捕获 ======================================
+==========================================================================================
+*/
+#if ENABLE_EBPF
+/* 启动：加载 BPF 对象 + 挂 uprobe 到本进程的 append_aof + 起 ringbuf 消费线程 */
+int  master_ebpf_start(const char *bin_path, int target_pid);
+/* 是否真的跑起来了：加载/attach 失败时主节点要降级回同步直发 */
+int  ebpf_capture_is_running(void);
+/* 0：只消费不转发（全量同步窗口内）；1：正常增量转发 */
+void ebpf_capture_set_forward(int on);
+void ebpf_capture_stop(void);
 
+#endif
 
 
 
