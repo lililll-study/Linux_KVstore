@@ -6,6 +6,16 @@ SRC_DIR = src
 TEST_DIR = test
 INC_DIR = include
 
+# ===== eBPF 产物 =====
+EBPF_DIR    = ebpf
+BPF_SRC     = $(EBPF_DIR)/aof_capture.bpf.c
+BPF_HDR     = $(EBPF_DIR)/aof_capture.h
+BPF_VMLINUX = $(EBPF_DIR)/vmlinux.h
+BPF_OBJ     = $(BUILD_DIR)/aof_capture.bpf.o
+BPF_SKEL    = $(BUILD_DIR)/aof_capture.skel.h
+BPF_CLANG  ?= clang
+BPFTOOL    ?= bpftool
+
 # ===== 网络模式开关：reactor 或 ntyco =====
 # 与 include/kvstore.h 中 NET_SELECT 联动：此处决定是否编译/链接 NtyCo
 NETWORK ?= reactor
@@ -46,14 +56,15 @@ SRCS = $(SRC_DIR)/kvstore.c \
        $(SRC_DIR)/kvs_sync.c \
 	   $(SRC_DIR)/log.c \
 	   $(SRC_DIR)/crc.c \
-	   $(SRC_DIR)/kvs_rdma.c
+	   $(SRC_DIR)/kvs_rdma.c \
+	   $(SRC_DIR)/kvs_ebpf.c
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
-INC = -I$(INC_DIR) $(NET_INC)
+INC = -I$(INC_DIR) -I$(BUILD_DIR) -I$(EBPF_DIR) $(NET_INC)
 # reactor 模式不依赖 libntyco；LIBS = -lpthread -ldl
-LIBS = $(NET_LIB) -lpthread -ldl -lrdmacm -libverbs
+LIBS = $(NET_LIB) -lpthread -ldl -lrdmacm -libverbs -lbpf -lelf -lz
 # 测试端只链接 -lpthread -ldl，不链接 -lntyco
 TEST_LIBS = -lpthread -ldl
 CFLAGS = -Wall -g $(NET_FLAG) $(INC)
@@ -123,6 +134,20 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 $(BUILD_DIR)/kvs_sync.o: $(SRC_DIR)/kvs_sync.c
 	$(CC) $(CFLAGS) -DSYNC_RAW_IO -c $< -o $@
 	@echo "Build complete (raw IO): $@"
+
+# ===== eBPF 构建链：clang 编 BPF 对象 → bpftool 生成 skeleton → 编入 kvstore =====
+$(BPF_OBJ): $(BPF_SRC) $(BPF_HDR) $(BPF_VMLINUX) | dirs
+	$(BPF_CLANG) -g -O2 -target bpf -D__TARGET_ARCH_x86 -I$(EBPF_DIR) -c $< -o $@
+	@echo "Build complete (bpf object): $@"
+
+$(BPF_SKEL): $(BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+	@echo "Build complete (bpf skeleton): $@"
+
+# kvs_ebpf.o 依赖 skeleton 头文件，所以必须显式声明依赖（不能只靠通用规则）
+$(BUILD_DIR)/kvs_ebpf.o: $(SRC_DIR)/kvs_ebpf.c $(BPF_SKEL) $(BPF_HDR)
+	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "Build complete (ebpf module): $@"
 
 
 
