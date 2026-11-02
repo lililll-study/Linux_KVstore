@@ -16,10 +16,12 @@ struct {
     __type(value, u32);
 } target_pid SEC(".maps");
 
-/* 事件队列：内核 → 用户态 */
+/* 事件队列：内核 → 用户态
+ * 单个事件 1312B，1<<26 = 64MB 可缓存约 5 万个事件，
+ * 足以兜住"1 秒内插入 5 万条"的突发，不会在消费者追赶期间丢事件 */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20);
+    __uint(max_entries, 1 << 26);
 } events SEC(".maps");
 
 /* ringbuf 满时的丢弃计数 */
