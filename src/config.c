@@ -11,6 +11,7 @@ kvs_config_t g_config = {
     .aof_enable = 0,        // 默认关闭 AOF 同步
     .aof_crc_enable = 1,    // 默认开启aofcrc
     .rdma_enable = 1,       // 默认开启 RDMA
+    .ebpf_enable = 0,       // 默认关闭 eBPF 转发（需 root，配置里显式打开）
     .log_level = LOG_LEVEL_INFO,
 };
 
@@ -126,6 +127,10 @@ int kvs_config_load(const char *filename) {
             } else if (strcmp(subkey, "crc") == 0) {
                 g_config.aof_crc_enable = parse_bool(value);
             }
+        } else if (subkey && strcmp(key, "ebpf") == 0) {
+            if (strcmp(subkey, "enable") == 0) {
+                g_config.ebpf_enable = parse_bool(value);
+            }
         }
         else {
             printf("[Config] Unknown key: %s\n", key);
@@ -152,6 +157,7 @@ void kvs_config_print(void) {
     printf("  aof.enable  : %s\n", g_config.aof_enable ? "true" : "false");
     printf("  aof.crc     : %s\n", g_config.aof_crc_enable ? "true" : "false");
     printf("  rdma.enable : %s\n", g_config.rdma_enable ? "true" : "false");
+    printf("  ebpf.enable : %s\n", g_config.ebpf_enable ? "true" : "false");
     static const char *lv_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
     int lv = g_config.log_level;
     if (lv < LOG_LEVEL_DEBUG) lv = LOG_LEVEL_DEBUG;
