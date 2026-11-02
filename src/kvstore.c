@@ -722,7 +722,7 @@ int main(int argc, char *argv[]) {
         if (n <= 0) {
             strncpy(self, argv[0], sizeof(self) - 1);
         }
-        if (ebpf_capture_start(self, (int)getpid()) != 0) {
+        if (master_ebpf_start(self, (int)getpid()) != 0) {
             LOG_ERROR("[EBPF] 启动失败，降级为同步直发模式（功能不受影响）");
         }
     }
