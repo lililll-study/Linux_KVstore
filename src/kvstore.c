@@ -714,10 +714,27 @@ int main(int argc, char *argv[]) {
         // pthread_detach(cli_tid);
     }
 
+#if ENABLE_EBPF
+    /* ★ 主节点：把 eBPF 加载器搬进本进程，uprobe 挂在自身的 append_aof 上 */
+    if (g_is_master && g_config.ebpf_enable) {
+        char self[512] = {0};
+        ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (n <= 0) {
+            strncpy(self, argv[0], sizeof(self) - 1);
+        }
+        if (ebpf_capture_start(self, (int)getpid()) != 0) {
+            LOG_ERROR("[EBPF] 启动失败，降级为同步直发模式（功能不受影响）");
+        }
+    }
+#endif
+
 #if (NET_SELECT == NET_REACTOR)
     reactor_start(port, kvs_protocol);
 #elif (NET_SELECT == NET_NTYCO)
     ntyco_start(port, kvs_protocol);
+#endif
+#if ENABLE_EBPF
+    ebpf_capture_stop();
 #endif
 #if ENABLE_RDMA
     if (g_config.rdma_enable) {

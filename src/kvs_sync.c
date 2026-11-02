@@ -217,6 +217,17 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
  */
 // ===== 主节点：立即同步 (immediate) =====
 int master_aof_immediate(const char *cmd, const char *key, const char *value) {
+    if (!g_is_master) return 0;
+#if ENABLE_EBPF
+    /* eBPF 已接管：命令由 append_aof 的 uprobe 捕获后异步转发，这里直接放手。
+       只有 eBPF 真的跑起来了才放手，否则（加载失败/非 root）走原来的同步直发，不影响功能 */
+    if (g_config.ebpf_enable && ebpf_capture_is_running()) return 0;
+#endif
+    return master_aof_sync_send(cmd, key, value);
+}
+
+// ===== 主节点：立即同步 (immediate) =====
+int master_aof_sync_send(const char *cmd, const char *key, const char *value) {
     if (!g_is_master) return 0;      /* 仅主节点推送增量，避免从机重放时把命令回灌给主机 */
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
@@ -255,7 +266,6 @@ int is_sync_peer(int fd) {
 }
 
 
-
 // ===== 主机：处理 SYNC 请求 =====
 int handle_sync_request(int fd) {
 
@@ -286,6 +296,18 @@ int handle_sync_request(int fd) {
         SYNC_LOG_M("handle SYNC request on fd=%d, mode=%s", fd,
            g_config.aof_enable ? "aof" : (g_config.snap_enable ? "snap" : "none"));
 
+#if ENABLE_EBPF
+        /* ★ 全量窗口开始：先关转发。
+           此刻 ringbuf 里残留的事件都属于"全量"范围，转发出去会和全量 AOF 重复 */
+        int ebpf_live = (g_config.ebpf_enable && ebpf_capture_is_running());
+        if (ebpf_live) {
+            ebpf_capture_set_forward(0);
+            /* ★ append_aof 是 io_uring 异步入队，不 flush 就 stat，
+               shot_size 会漏掉还在队列里的命令 → 全量缺数据 → 从机永久丢 */
+            persistence_flush();
+        }
+#endif
+
         init_aof_sync_ctx();
         g_aof_ctx.fd = fd;
         g_aof_ctx.is_active = 1;
@@ -314,6 +336,15 @@ int handle_sync_request(int fd) {
             return -1;
         }
 
+#endif
+
+#if ENABLE_EBPF
+        /* ★ 全量发送完毕。reactor 是单线程，刚才阻塞在这里期间不会产生新命令，
+           所以现在重新打开增量转发，既不会漏也不会重 */
+        if (ebpf_live) {
+            ebpf_capture_set_forward(1);
+            SYNC_LOG_M("全量同步完成，eBPF 增量转发已开启 fd=%d", fd);
+        }
 #endif
     } else if (g_config.snap_enable) {
         SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
