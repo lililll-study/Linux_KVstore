@@ -226,25 +226,45 @@ int master_aof_immediate(const char *cmd, const char *key, const char *value) {
     return master_aof_sync_send(cmd, key, value);
 }
 
+// ===== 主节点：把一条命令拼成 RESP 到调用方给的缓冲区（只拼不发） =====
+// 给批量转发复用，避免 RESP 格式在两处各写一份
+// 返回拼好的字节数；参数非法或缓冲区不够返回 -1
+int master_aof_format_cmd(char *buf, int cap,
+                          const char *cmd, const char *key, const char *value) {
+    if (!buf || cap <= 0 || !cmd || !key) return -1;
+
+    int len = 0;
+    if (value) {
+        len = snprintf(buf, cap,
+                       "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       strlen(cmd), cmd,
+                       strlen(key), key,
+                       strlen(value), value);
+    } else {
+        len = snprintf(buf, cap,
+                       "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                       strlen(cmd), cmd,
+                       strlen(key), key);
+    }
+    if (len < 0 || len >= cap) return -1;   /* 单条命令超过缓冲区 */
+    return len;
+}
+
+// ===== 主节点：把一块已经拼好的 RESP 一次性推给从机（批量刷出用） =====
+int master_aof_send_raw(const char *data, int len) {
+    if (!g_is_master) return 0;
+    if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
+    return safe_send(g_aof_ctx.fd, data, len);
+}
+
 // ===== 主节点：立即同步 (immediate) =====
 int master_aof_sync_send(const char *cmd, const char *key, const char *value) {
     if (!g_is_master) return 0;      /* 仅主节点推送增量，避免从机重放时把命令回灌给主机 */
     if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
 
     char buf[4096];
-    int len = 0;
-    if (value) {
-        len = snprintf(buf, sizeof(buf),
-                       "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                       strlen(cmd), cmd,
-                       strlen(key), key,
-                       strlen(value), value);
-    } else {
-        len = snprintf(buf, sizeof(buf),
-                       "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                       strlen(cmd), cmd,
-                       strlen(key), key);
-    }
+    int len = master_aof_format_cmd(buf, sizeof(buf), cmd, key, value);
+    if (len < 0) return -1;
     return safe_send(g_aof_ctx.fd, buf, len);
 }
 
