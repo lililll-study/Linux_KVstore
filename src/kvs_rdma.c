@@ -425,7 +425,7 @@ int slave_rdma_start() {
         return -1;
     }
 
-    printf("rdma connect success\n");
+    LOG_INFO("rdma connect success\n");
 
     // struct ibv_wc wc;
     // conn_manager_t *cm = cm_id->context;
