@@ -57,7 +57,8 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(SRC_DIR)/log.c \
 	   $(SRC_DIR)/crc.c \
 	   $(SRC_DIR)/kvs_rdma.c \
-	   $(SRC_DIR)/kvs_ebpf.c
+	   $(SRC_DIR)/kvs_ebpf.c \
+	   $(SRC_DIR)/kvs_mem_leak.c
 
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
