@@ -30,7 +30,7 @@
 
 * 数据加载：mmap
 
-* 内存管理：仿jemalloc实现的字符串分级内存池
+* 内存管理：仿jemalloc的分级内存池
 
 * 已有数据同步：RDMA
 
@@ -61,6 +61,19 @@ sudo apt install -y build-essential
 sudo apt install -y librdmacm-dev libibverbs-dev
 ```
 
+开启RDMA功能需要绑定虚拟网卡
+
+```bash
+# 1 创建SoftiWARP设备
+sudo rdma link add siw1 type siw netdev ens33
+# 2 打印ibv设备
+ibv_devices
+会看到
+device node GUID ------ ---------------- siw1 020c29fffe775881
+```
+
+
+
 
 
 # 编译
@@ -70,8 +83,6 @@ sudo apt install -y librdmacm-dev libibverbs-dev
 ```bash
 git clone git@gitlab.0voice.com:lihongyi/kvs_lhy.git
 cd kvs_lhy
-
-#或make reactor
 make
 ```
 
@@ -85,7 +96,7 @@ cd kvs_lhy
 make ntyco
 ```
 
-已经克隆reactor后导入
+已经克隆reactor后，git导入协程子模块
 
 ```bash
 git submodule update --init --recursive
@@ -98,10 +109,10 @@ make ntyco
 
 ```bash
 主节点
-./build/kvstore --config master.conf
+sudo ./build/kvstore --config master.conf
 
 从节点
-./build/kvstore --config slave.conf
+sudo ./build/kvstore --config slave.conf
 ```
 
 # redis-cli 操作
@@ -205,18 +216,32 @@ make clean
 ```bash
 # 主节点配置
 role=master
-port=2000
-# 不启动snap
+master_port=2000
+master_ip=192.168.137.139
+# snap全量同步
 snap.enable=false
-# 启动aof
+# aof增量同步：从节点一般不启动aof
 aof.enable=true
+# aof全文CRC校验开关
+aof.crc=true
+# RDMA开关：开启后SNAP文件和aof的初次数据同步走RDMA
+rdma.enable=true
+# eBPF开关：开启后aof的增量数据通过bpf捕获
+ebpf.enable=true
+# 内存泄漏检测：仅调试诊断用（有额外内存和性能开销）
+leak.enable=false
+# 日志级别：debug/info/warn/error/fatal（也可用数字0-4）
+log.level=debug
 ```
 
 
 
-测试
+测试：插入10w条数据（hash和跳表各5w）
 
 ```bash
+# 启动主机
+sudo ./build/kvstore --config master.conf
+
 # AOF 测试
 ./build/2_presist_testcase 127.0.0.1 2000 1
 # 插入完成后，重启服务端
@@ -234,18 +259,31 @@ aof.enable=true
 ```bash
 # 主节点配置
 role=master
-port=2000
-# 启动snap
+master_port=2000
+master_ip=192.168.137.139
+# snap全量同步
 snap.enable=true
-# 不启动aof
+# aof增量同步：从节点一般不启动aof
 aof.enable=false
+# aof全文CRC校验开关
+aof.crc=false
+# RDMA开关：开启后SNAP文件和aof的初次数据同步走RDMA
+rdma.enable=true
+# eBPF开关：开启后aof的增量数据通过bpf捕获
+ebpf.enable=true
+# 内存泄漏检测：仅调试诊断用（有额外内存和性能开销）
+leak.enable=false
+# 日志级别：debug/info/warn/error/fatal（也可用数字0-4）
+log.level=debug
 ```
 
 
 
-测试
+测试：插入10w条数据（hash和跳表各5w）
 
 ```bash
+# 启动主机
+sudo ./build/kvstore --config master.conf
 
 # SNAP 测试
 ./build/2_presist_testcase 127.0.0.1 2000 3
@@ -259,23 +297,23 @@ aof.enable=false
 
 ```bash
 make clean
-make reactor
+make
 # 1. 启动主机
-./build/kvstore --config config/master.conf
+sudo ./build/kvstore --config master.conf
 
 # 测试端：连接主机并插入5w条数据
-./build/3_sync_testcase 192.168.137.134 2000 1
+./build/3_sync_testcase 192.168.137.139 2000 1
 
 # 2. 启动从机
-./build/kvstore --config config/slave.conf
+sudo ./build/kvstore --config slave.conf
 
 
 # 测试端：再向主机插入5w条数据
-./build/3_sync_testcase 192.168.137.134 2000 2
+./build/3_sync_testcase 192.168.137.139 2000 2
 
 
 # 测试端：连从机，验证 10w
-./build/3_sync_testcase 192.168.137.135 2001 3
+./build/3_sync_testcase 192.168.137.140 2000 3
 ```
 
 ## 四、数据校验
@@ -309,12 +347,12 @@ make reactor
 ```bash
 # ===== 步骤 1：无内存池 =====
 make clean 
-make reactor
+make
 sudo bash ./test/5_mem_test.sh nopool
 
 # ===== 步骤 2：有内存池 =====
 make clean 
-make reactor
+make
 sudo bash ./test/5_mem_test.sh pool
 
 # ===== 步骤 3：jemalloc =====
@@ -442,5 +480,3 @@ redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 160 -n 100000 -t ping -q
 | ------ | ------ | ------ | ------ | ------ | ------- |
 | SNAP模式 | 7.84w  | 15.55w | 30.31w | 59.88w | 116.28w |
 | AOF模式  | 84.46w | 15.13w | 29.85w | 59.53w | 116.28w |
-
-
