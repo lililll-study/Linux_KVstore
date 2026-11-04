@@ -16,10 +16,10 @@ typedef int (*RCALLBACK)(int fd);
 struct conn {
     int fd;
 
-    char rbuffer[BUFFER_LENGTH*2];
+    char *rbuffer;      // 按需分配：accept 时 malloc，断开时 free
     int rlength;
 
-    char wbuffer[BUFFER_LENGTH*2];
+    char *wbuffer;
     int wlength;
 
     char *payload;  // 解码后的数据

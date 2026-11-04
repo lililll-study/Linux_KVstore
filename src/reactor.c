@@ -43,6 +43,19 @@ int set_event(int fd, int event, int flag);
 typedef int (*msg_handler)(int fd, char *msg, int length, char *response);
 static msg_handler kvs_handler;
 
+// 断开连接时释放按需分配的缓冲
+static void conn_release(int fd) {
+    if (conn_list[fd].rbuffer) { 
+        free(conn_list[fd].rbuffer);
+        conn_list[fd].rbuffer = NULL; 
+    }
+    if (conn_list[fd].wbuffer) {
+        free(conn_list[fd].wbuffer);
+        conn_list[fd].wbuffer = NULL;
+    }
+    conn_list[fd].fd = -1;
+}
+
 int kvs_request(struct conn *c) {
 
     c-> wlength = kvs_handler(c->fd, c->rbuffer, c->rlength, c->wbuffer);
@@ -71,6 +84,7 @@ int kvs_response(struct conn *c) {
                     perror("send");
                     close(c->fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                    conn_release(c->fd);
                     cleanup_connection(c->fd);
                     return -1;
                 }
@@ -123,8 +137,20 @@ int event_register(int fd, int event) {
     conn_list[fd].r_action.recv_callback = recv_cb;
     conn_list[fd].send_callback = send_cb;
 
+    // 按需分配读写缓冲（改前是静态数组常驻 64KB/连接）
+    conn_list[fd].rbuffer = (char*)malloc(BUFFER_LENGTH * 2);
+    conn_list[fd].wbuffer = (char*)malloc(BUFFER_LENGTH * 2);
+    if (!conn_list[fd].rbuffer || !conn_list[fd].wbuffer) {
+        free(conn_list[fd].rbuffer);
+        free(conn_list[fd].wbuffer);
+        conn_list[fd].fd = -1;
+        close(fd);
+        return -1;
+    }
     memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
     conn_list[fd].rlength = 0;
+    memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
+    conn_list[fd].wlength = 0;
 
 #if ENABLE_REPBUF
      // 不用wbuffer，用resp缓冲区替代wbuffer
@@ -137,6 +163,7 @@ int event_register(int fd, int event) {
     set_event(fd, event, 1);
     return 0;
 }
+
 
 
 // listenfd(sockfd) --> EPOLLIN --> accept_cb
@@ -184,13 +211,15 @@ int recv_cb(int fd) {
         printf("client disconnect: %d\n", fd);
         close(fd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);   // unfinished 
+        conn_release(fd);
         cleanup_connection(fd);
         return 0;
     } else if (data_len < 0) {
         printf("count: %d, errno: %d, %s\n", data_len, errno, strerror(errno));
         close(fd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-
+        conn_release(fd);
+        cleanup_connection(fd);
         return 0;
     }
     if (data_len > 0) {// 确保字符以\0结尾
