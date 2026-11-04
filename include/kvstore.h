@@ -39,7 +39,7 @@
 #define ENABLE_SKIPTABLE	 1
 
 #define ENABLE_PERSIST 		 1	 // 开启本地持久化存储
-#define ENABLE_MEMPOOL		 0   // 开启内存池
+#define ENABLE_MEMPOOL		 1   // 开启内存池
 
 #define ENABLE_CMD_BATCH	 1   // 开启cmd批处理
 

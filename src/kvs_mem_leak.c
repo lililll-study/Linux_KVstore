@@ -50,6 +50,7 @@ void kvs_leak_free(void *ptr, const char *file, int line) {
 
 // 程序结束时簿上剩下的就是疑似泄漏
 void kvs_leak_report(void) {
+    if (!g_leak_on) return;             // 诊断开关关闭：不打报告（atexit/SIGTERM 两条路径都走这里）
     if (!g_live) { LOG_INFO("[LEAK] clean, no leak\n"); return; }
     LOG_INFO("[LEAK] %zu suspected leak(s):\n", g_live);
     leak_rec_t *r;

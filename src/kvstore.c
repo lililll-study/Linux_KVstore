@@ -16,6 +16,7 @@ static void on_sigterm(int sig) {
 #if ENABLE_LEAK
     kvs_leak_report();          // 4. 销毁之后再报告，剩下的才是真泄漏
 #endif
+    LOG_INFO(" ++++++++++++++++++++++++ KVSTORE END +++++++++++++++++++++++++ \n");
     kvs_log_fini();
     _exit(0);
 }
@@ -704,6 +705,8 @@ int main(int argc, char *argv[]) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     kvs_log_init("logs/kvs.log", LOG_LEVEL_INFO);
+
+
     struct sigaction sa, sa2;                        // ← 加这 5 行
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigterm;
@@ -732,6 +735,7 @@ int main(int argc, char *argv[]) {
     }
     // 配置文件中的日志级别覆盖默认值
     kvs_log_set_level(g_config.log_level);
+    LOG_INFO(" ++++++++++++++++++++++++ KVSTORE BEGIN +++++++++++++++++++++++++ \n");
 #if ENABLE_LEAK
     // 泄漏检测：init 注册退出报告，开关由配置 leak.enable 控制
     // （必须在配置加载之后调用 set_enable，否则读到的是默认值）
@@ -794,8 +798,9 @@ int main(int argc, char *argv[]) {
 #endif
 
     dest_kvengine();
-    
     LOG_INFO("kvstore stopped");   /* ★ 可选：退出前打一条 */
     kvs_log_fini();                /* ★ 关闭日志，刷盘 */
+
+
     return 0;
 }

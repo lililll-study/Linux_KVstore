@@ -141,6 +141,7 @@ void kvs_skiptable_destory(kvs_skiptable_t *inst) {
     free_node(inst->header);
     inst->header = NULL;
     inst->level = 0;
+    LOG_INFO("Destroying skiptable done\n");
 }
 
 int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
@@ -176,7 +177,7 @@ int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value) {
             update[i] = inst->header;
         }
         // ===== 新增：跳表层数增长打印 =====
-        LOG_DEBUG("[Skiptable] Level up: %d -> %d (key=%s)\n",
+        LOG_INFO("[Skiptable] Level up: %d -> %d (key=%s)\n",
                inst->level, level, key);
         inst->level = level;
     }

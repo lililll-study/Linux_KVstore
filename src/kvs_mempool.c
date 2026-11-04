@@ -409,6 +409,10 @@ void kvs_mempool_stats(mempool_t *pool, const char *name) {
 }
 
 void kvs_mempool_stats_all(void) {
+
+#if ENABLE_LEAK
+    if (!kvs_leak_enabled()) return;    // 诊断开关关闭：不打统计（leak.enable=false 时静默）
+#endif
     memset(&mempool_state_s, 0, sizeof(mempool_state_s));
     LOG_INFO("[MEMPOOL] ============== 内存池统计 BEGIN ==============");
 

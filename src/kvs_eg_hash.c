@@ -285,10 +285,6 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
 	}
 	
 	hash->count ++;
-    // 每 10000 条打印一次
-    if (hash->count % 10000 == 0) {
-        LOG_INFO("[Hash]      Progress: %d keys loaded\n", hash->count);
-    }
 	return 0;
 }
 

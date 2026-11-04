@@ -114,7 +114,8 @@ int kvs_config_load(const char *filename) {
                 g_config.rdma_enable = parse_bool(value);
             }
         }
-        else if (strcmp(key, "log.level") == 0 || strcmp(key, "log_level") == 0) {
+        else if ((strcmp(key, "log") == 0 && strcmp(subkey, "level") == 0) ||
+                strcmp(key, "log_level") == 0) {
             g_config.log_level = parse_log_level(value);
         }
         // ===== 处理 key.subkey 格式 =====
