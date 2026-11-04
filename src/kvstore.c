@@ -2,7 +2,23 @@
 #include "server.h"
 #include "kvstore.h"
 
+#include <signal.h>
 
+void dest_kvengine(void);   // 前置声明：on_sigterm 在 dest_kvengine 定义之前
+
+static void on_sigterm(int sig) {
+    (void)sig;
+#if ENABLE_MEMPOOL
+    kvs_mempool_trim_all();     // 1. 先回收空闲段（反映 trim 效果）
+    kvs_mempool_stats_all();    // 2. 打池统计（销毁前的账本）
+#endif
+    dest_kvengine();            // 3. 销毁全部数据结构：hash / skiptable / 内存池 / 持久化
+#if ENABLE_LEAK
+    kvs_leak_report();          // 4. 销毁之后再报告，剩下的才是真泄漏
+#endif
+    kvs_log_fini();
+    _exit(0);
+}
 
 extern kvs_hash_t global_hash;
 extern kvs_skiptable_t global_skiptable;
@@ -16,6 +32,9 @@ int g_is_master = 1;  // 1: 主节点, 0: 从节点
 #endif
 
 
+// ENABLE_LEAK 开启时，kvs_malloc/kvs_free 已被宏劫持为泄漏版本，
+// 这两个包装定义必须跳过编译，否则宏会破坏函数定义语法
+#if !ENABLE_LEAK
 void *kvs_malloc (size_t size) {
     return malloc(size);
 }
@@ -23,6 +42,7 @@ void *kvs_malloc (size_t size) {
 void kvs_free(void *ptr) {
     return free(ptr);
 }
+#endif
 
 
 const char *command[] = {
@@ -98,6 +118,12 @@ int kvs_split_token(char *msg, char *tokens[]) {
 }
 
 int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
+    static int g_cmd_cnt = 0;
+    if (++g_cmd_cnt % 1000000 == 0) {
+#if ENABLE_MEMPOOL
+        kvs_mempool_stats_all();   // 每 100w 条命令打一次快照
+#endif
+    }
 // SET KEY VALUE
 // tokens[0]: SET ; tokens[1]: KEY; tokens[0]: VALUE
 // 进行协议数据过滤
@@ -510,6 +536,7 @@ int init_kvengine(void) {
         return -1;
     }
     LOG_INFO("********----  1. Memory-pools init success!  ----********\n");
+    kvs_mempool_stats_all();     // ← 开始状态：看"预付"了多少
 #endif
 
 
@@ -577,7 +604,8 @@ void dest_kvengine(void) {
 	kvs_skiptable_destory(&global_skiptable);
 #endif
 #if ENABLE_MEMPOOL
-    // 最后销毁内存池
+    // 最后销毁内存池（销毁前打一次，看"结束状态"还剩多少没还）
+    kvs_mempool_stats_all();
     dest_mempools();
 #endif
 
@@ -662,6 +690,12 @@ void* cli_thread(void* arg) {
     return NULL;
 }
 
+static void on_sigusr2(int sig) {
+    (void)sig;
+#if ENABLE_MEMPOOL
+    kvs_mempool_trim_all();    // 手动触发回收
+#endif
+}
 
 int main(int argc, char *argv[]) {
 
@@ -670,6 +704,16 @@ int main(int argc, char *argv[]) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     kvs_log_init("logs/kvs.log", LOG_LEVEL_INFO);
+    struct sigaction sa, sa2;                        // ← 加这 5 行
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigterm;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+
+    memset(&sa2, 0, sizeof(sa2));
+    sa2.sa_handler = on_sigusr2;
+    sigaction(SIGUSR2, &sa2, NULL);
+
 /*=====================加载配置========================*/
     const char *config_file = NULL;
     int i = 0;
@@ -688,6 +732,13 @@ int main(int argc, char *argv[]) {
     }
     // 配置文件中的日志级别覆盖默认值
     kvs_log_set_level(g_config.log_level);
+#if ENABLE_LEAK
+    // 泄漏检测：init 注册退出报告，开关由配置 leak.enable 控制
+    // （必须在配置加载之后调用 set_enable，否则读到的是默认值）
+    kvs_leak_init();
+    kvs_leak_set_enable(g_config.leak_enable);
+    LOG_INFO("[LEAK] runtime %s", g_config.leak_enable ? "ON" : "OFF");
+#endif
     // 打印配置
     kvs_config_print();
     // 设置全局角色
