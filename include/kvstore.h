@@ -54,7 +54,7 @@
 #define ENABLE_RDMA         1   // 打开RDMA功能
 
 #define ENABLE_EBPF         1   // 打开ebpf功能
-
+#define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
@@ -249,16 +249,23 @@ typedef struct mempool_block_hdr {
 // 池按照chunk增长，每段是一块连续内存，段之间用链表连接；首次分配小批量，不够再翻倍。
 typedef struct mempool_chunk_s {
     struct mempool_chunk_s *next;
+    struct mempool_block_hdr *free_list;
+    size_t free_cnt;
     size_t blocks;              // 本段块数，块数据紧随其后
 } mempool_chunk_t;
+
+
 
 // 内存池结构（sub_pools 非空时为 size-class 组池外壳，子池数组以 NULL 结尾）
 typedef struct mempool_s{
     size_t block_size;      // 每块总大小（含块头，8字节对齐）
     size_t max_blocks;      // 容量上限
-    void* free_list;        // 空闲链表头指针
     mempool_chunk_t *chunks;    // 已分配段链表（最新段在前，段头记录各段块数）
+    mempool_chunk_t *spare;     // ← 新增：trim 退页后囤起来的空段（虚拟地址保留）
     struct mempool_s **sub_pools;      // 组池子池数组，NULL 结尾；普通池为 NULL
+
+    size_t fallback_alloc_cnt; // 池装不下，降级的次数
+    size_t double_free_cnt;    // 检测到的double-free次数
 } mempool_t;
 
 extern mempool_t *resp_pool;
@@ -280,6 +287,14 @@ void kvs_mempool_reset(mempool_t *pool);
 void kvs_mempool_destroy(mempool_t *pool);
 int init_mempools(void);
 void dest_mempools(void);
+
+size_t kvs_mempool_trim_all(void);
+
+// 内存池统计，打印单个池状态
+void kvs_mempool_stats(mempool_t *pool, const char *name);
+
+// 汇总打印5个全局池和chunk 总量 / 有效负载 / 浪费 / 降级次数
+void kvs_mempool_stats_all(void);
 #endif
 
 
@@ -446,6 +461,9 @@ typedef struct {
 
     // eBPF 实时捕获转发--主节点
     int ebpf_enable;
+
+    // 内存泄漏检测运行时开关（编译由 ENABLE_LEAK 控制）
+    int leak_enable;
 } kvs_config_t;
 
 extern kvs_config_t g_config;
@@ -534,7 +552,7 @@ void ebpf_capture_stop(void);
 #endif
 
 
-
+#include "kvs_mem_leak.h"
 
 
 #endif
