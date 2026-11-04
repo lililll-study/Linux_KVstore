@@ -251,7 +251,7 @@ aof.enable=false
 ./build/2_presist_testcase 127.0.0.1 2000 3
 # 插入完成后，重启服务端
 ./build/kvstore --config config/master.conf
-# 测试端读取aof加载的数据
+# 测试端读取snap加载的数据
 ./build/2_presist_testcase 127.0.0.1 2000 4
 ```
 
