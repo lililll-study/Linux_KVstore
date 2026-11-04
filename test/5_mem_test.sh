@@ -116,6 +116,15 @@ AFTER_DELETE_RSS=$(sample_rss)
 AFTER_DELETE_VSZ=$(sample_vsz)
 echo "[AFTER_DELETE] VmSize=${AFTER_DELETE_VSZ} kB, VmRSS=${AFTER_DELETE_RSS} kB"
 
+
+# ===== 6.5 手动触发内存池回收 =====
+kill -USR2 $SERVER_PID
+sleep 1
+AFTER_TRIM_RSS=$(sample_rss)
+AFTER_TRIM_VSZ=$(sample_vsz)
+echo "[AFTER_TRIM] VmSize=${AFTER_TRIM_VSZ} kB, VmRSS=${AFTER_TRIM_RSS} kB"
+
+
 # ===== 7. 停采样 =====
 kill $SAMPLER_PID 2>/dev/null
 wait $SAMPLER_PID 2>/dev/null
@@ -133,7 +142,7 @@ printf "%-14s %12s %12s\n" "start"        "$START_VSZ"        "$START_RSS"
 printf "%-14s %12s %12s\n" "peak"         "$PEAK_VSZ"         "$PEAK_RSS"
 printf "%-14s %12s %12s\n" "after_insert" "$AFTER_INSERT_VSZ" "$AFTER_INSERT_RSS"
 printf "%-14s %12s %12s\n" "after_delete" "$AFTER_DELETE_VSZ" "$AFTER_DELETE_RSS"
-
+printf "%-14s %12s %12s\n" "after_trim"   "$AFTER_TRIM_VSZ"   "$AFTER_TRIM_RSS"
 # 追加到汇总文件
 echo "$MODE $START_VSZ $START_RSS $PEAK_VSZ $PEAK_RSS $AFTER_INSERT_VSZ $AFTER_INSERT_RSS $AFTER_DELETE_VSZ $AFTER_DELETE_RSS" \
     >> /tmp/mem_results.txt
