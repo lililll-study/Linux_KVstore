@@ -228,7 +228,7 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
 
 
         if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "[RDMA] poll_cq failed: status=%s(%d), vendor_err=0x%x, opcode=%d, byte_len=%u\n",
+            LOG_ERROR("[RDMA] poll_cq failed: status=%s(%d), vendor_err=0x%x, opcode=%d, byte_len=%u",
                 ibv_wc_status_str(wc.status), wc.status,
                 wc.vendor_err, wc.opcode, wc.byte_len);
             return -1;
@@ -269,7 +269,7 @@ int master_rdma_start() {
         perror("rdma_listen\n");
         return 0;
     }
-    printf("[RDMA] master listening on %s:%d\n", g_config.master_ip, RDMA_SERVER_PORT);
+    LOG_INFO("[RDMA] master listening on %s:%d", g_config.master_ip, RDMA_SERVER_PORT);
     // 此时连接已经建立
     struct rdma_cm_event *event = NULL;
     rdma_wait_cm_event(channel, RDMA_CM_EVENT_CONNECT_REQUEST, &event);
@@ -284,17 +284,17 @@ int master_rdma_start() {
     }
 
     if (rdma_alloc_buffer(id, pd) != 0) {
-        fprintf(stderr, "[RDMA] alloc buffer failed\n");
+        LOG_ERROR("[RDMA] alloc buffer failed");
         return -1;
     }
 
     /* 提前准备接收从机的第一条 READY */
     if (rdma_post_recv(id) != 0) {
-        fprintf(stderr, "[RDMA] master initial RECV failed\n");
+        LOG_ERROR("[RDMA] master initial RECV failed");
         return -1;
     }
 
-    printf("[RDMA] master initial RECV posted\n");
+
     // 初始化连接参数
     struct rdma_conn_param param;
     memset(&param, 0, sizeof(param));
@@ -318,7 +318,7 @@ int master_rdma_start() {
     g_conn_cm = (conn_manager_t *)id->context;
     g_conn_channel = channel;      // 事件通道，退出时要销毁
     g_listen_id    = cm_id;        // 监听 id，退出时要销毁
-    printf("[RDMA] master connection established\n");
+    LOG_INFO("[RDMA] master connection established");
     return 0;
  #else
     struct ibv_wc wc;
@@ -336,7 +336,7 @@ int master_rdma_start() {
         cm->sbuffer[i] = cm->rbuffer[i] - 0x20;
     }
     rdma_post_send(id, strlen(cm->sbuffer));
-    printf("[RDMA] master echo done\n");
+    LOG_INFO("[RDMA] master echo done");
 
     rdma_free_buffer(id); 
     rdma_destroy_queuepair(id, pd, cq);
@@ -436,7 +436,7 @@ int slave_rdma_start() {
     g_conn_cq = cq;
     g_conn_cm = (conn_manager_t *)cm_id->context;
     g_conn_channel = channel;      // 从机只有这一个 id，没有 g_listen_id
-    printf("[RDMA] slave connection established\n");
+    LOG_INFO("[RDMA] slave connection established");
 
     return 0;
  #else
@@ -456,7 +456,7 @@ int slave_rdma_start() {
         perror("rdma_poll_wc\n");
         return 0;
     }
-    printf("[RDMA] slave got echo: %s\n", cm->rbuffer);
+    LOG_INFO("[RDMA] slave got echo: %s", cm->rbuffer);
 
 
     rdma_free_buffer(cm_id); 
@@ -482,12 +482,11 @@ static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t ty
     if (len > 0 && payload != dst) {
         memcpy(dst, payload, len);
     }
-    printf("[RDMA] posting SEND type=%u len=%u\n", type, len);
+    LOG_INFO("[RDMA] posting SEND type=%u len=%u", type, len);
     int ret = rdma_post_send(id, sizeof(rdma_msg_t) + len);
 
     if (ret != 0) {
-        fprintf(stderr,
-            "[RDMA] ibv_post_send failed: %d (%s)\n",
+        LOG_ERROR("[RDMA] ibv_post_send failed: %d (%s)",
             ret, strerror(ret));
         return -1;
     }
@@ -496,13 +495,13 @@ static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t ty
     if (rdma_poll_wc(cq, &wc) != 0)
         return -1;
 
-    printf("[RDMA] SEND completion opcode=%d status=%d\n",
+    LOG_INFO("[RDMA] SEND completion opcode=%d status=%d",
         wc.opcode, wc.status);
 
     if (wc.opcode != IBV_WC_SEND)
         return -1;
 
-    printf("[RDMA] SEND type=%u, length=%u\n", type, len);
+    LOG_INFO("[RDMA] SEND type=%u, length=%u", type, len);
     return 0;
 }
 
@@ -537,7 +536,7 @@ static int rdma_wait_control(uint32_t expected) {
 
     if (wc.byte_len != sizeof(rdma_msg_t) || msg->length != 0 || msg->type != expected) {
 
-        fprintf(stderr, "[RDMA] control mismatch: expected=%u, actual=%u, bytes=%u\n", expected, msg->type, wc.byte_len);
+        LOG_ERROR("[RDMA] control mismatch: expected=%u, actual=%u, bytes=%u", expected, msg->type, wc.byte_len);
         return -1;
     }
 
@@ -554,7 +553,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
     while (g_conn_id == NULL && wait++ < 50) usleep(100 * 1000);
 
     if (g_conn_id == NULL) {
-        fprintf(stderr, "[RDMA] connection not ready\n");
+        LOG_ERROR("[RDMA] connection not ready");
         return -1;
     }
 
@@ -607,7 +606,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         size_t chunk = remaining < cap ? remaining : cap;
 
         if (fread(payload, 1, chunk, fp) != chunk) {
-            fprintf(stderr, "[RDMA] fread failed\n");
+            LOG_ERROR("[RDMA] fread failed");
             goto out;
         }
 
@@ -616,7 +615,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         }
         sent += (long)chunk;
 
-        printf("[RDMA] sent chunk=%zu total=%ld/%ld\n", chunk, sent, to_send);
+        LOG_INFO("[RDMA] sent chunk=%zu total=%ld/%ld", chunk, sent, to_send);
     }
 
     /*
@@ -633,7 +632,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         goto out;
 
 
-    printf("FINISHED\n");
+    LOG_INFO("FINISHED");
     if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER, end_marker, (uint32_t)strlen(end_marker)) != 0) {
         goto out;
     }
@@ -646,7 +645,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
     if (rdma_post_recv(g_conn_id) != 0)
         goto out;
 
-    printf("[RDMA] file sync finished: %ld bytes\n", sent);
+    LOG_INFO("[RDMA] file sync finished: %ld bytes", sent);
 
     rc = 0;
 
@@ -685,13 +684,13 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
     while (!done) {
         // 第一步：先提交请求
         if (rdma_post_recv(g_conn_id) != 0) {
-            fprintf(stderr, "[RDMA] post_recv failed\n");
+            LOG_ERROR("[RDMA] post_recv failed");
             goto out;
         }
 
         // 第二步：告诉主机可以发下一条消息
         if (rdma_send_control(RDMA_MSG_READY) != 0) {
-            fprintf(stderr, "[RDMA] send READY failed\n");
+            LOG_ERROR("[RDMA] send READY failed");
             goto out;
         }
 
@@ -702,9 +701,9 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
         rdma_msg_t *msg =(rdma_msg_t *)g_conn_cm->rbuffer;
         char *payload = g_conn_cm->rbuffer + sizeof(rdma_msg_t);
         uint32_t actual_len = wc.byte_len - sizeof(rdma_msg_t);
-        printf("[RDMA] recv type=%u, wc.byte_len=%u, payload=%u\n", msg->type, wc.byte_len, msg->length);
+        LOG_INFO("[RDMA] recv type=%u, wc.byte_len=%u, payload=%u", msg->type, wc.byte_len, msg->length);
         if (msg->length != actual_len) {
-            fprintf(stderr, "[RDMA] length mismatch: header=%u actual=%u\n", msg->length, actual_len);
+            LOG_ERROR("[RDMA] length mismatch: header=%u actual=%u", msg->length, actual_len);
             goto out;
         }
 
@@ -712,24 +711,24 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
             size_t written = fwrite(payload, 1, msg->length, fp);
 
             if (written != msg->length) {
-                fprintf(stderr, "[RDMA] fwrite failed\n");
+                LOG_ERROR("[RDMA] fwrite failed");
                 goto out;
             }
 
             total += (long)written;
 
-            printf("[RDMA] written=%zu total=%ld\n", written, total);
+            LOG_INFO("[RDMA] written=%zu total=%ld", written, total);
 
         } else if (msg->type == RDMA_MSG_MARKER) {
             if (msg->length != end_len || memcmp(payload, end_marker, end_len) != 0) {
-                fprintf(stderr, "[RDMA] marker mismatch\n");
+                LOG_ERROR("[RDMA] marker mismatch");
                 goto out;
             }
 
             done = 1;
 
         } else {
-            fprintf(stderr, "[RDMA] unknown msg type=%u\n", msg->type);
+            LOG_ERROR("[RDMA] unknown msg type=%u", msg->type);
             goto out;
         }
         /*
@@ -764,7 +763,7 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
      */
 
     if (rdma_send_control(RDMA_MSG_FINISHED) != 0) goto out;
-    printf("[RDMA] received %ld bytes -> %s\n", total, filepath);
+    LOG_INFO("[RDMA] received %ld bytes -> %s", total, filepath);
     rc = 0;
 
 out:
@@ -831,7 +830,7 @@ void rdma_shutdown(void) {
     }
 
     pthread_mutex_unlock(&g_rdma_mtx);
-    printf("[RDMA] shutdown done\n");
+    LOG_INFO("[RDMA] shutdown done");
 }
 
 
