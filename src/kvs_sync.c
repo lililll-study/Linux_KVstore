@@ -373,6 +373,18 @@ static int slave_connect_to_master(const char *ip, int port) {
     SYNC_LOG_S("connected to master");
     return fd;
 }
+
+// ===== 从机：通知主机全量加载完成（新建命令连接发 SYNC-FINISHED） =====
+static int slave_temp_sync_finished(const char *ip, int port) {
+
+    int fd = slave_connect_to_master(ip, port);      /* 复用已有连接函数 */
+    if (fd <= 0) return -1;
+
+    safe_send(fd, fin, strlen(fin));
+    close(fd);
+    return 0;
+}
+
 // ===== 从机：接收全量数据并加载 =====
 static void slave_recv_temp(int fd) {
 
@@ -400,13 +412,19 @@ static void slave_recv_temp(int fd) {
 #endif
 
 
-    /* 加载全量数据*/
-    if (load_snapshots_from(TEMP_FILE) != 0) {
-        SYNC_ERR("load full data from %s failed", TEMP_FILE);
+    /* 加载全量数据：.tmp 与快照格式相同，改名为本地快照后直接加载
+     * 副作用是从机留下一份 SNAP_FILE 本地快照，重启也能恢复 */
+    if (rename(TEMP_FILE, SNAP_FILE) != 0) {
+        SYNC_ERR("rename %s to %s failed", TEMP_FILE, SNAP_FILE);
         close(fd);
         return;
     }
-    SYNC_LOG_S("full data loaded from %s", TEMP_FILE);
+    if (load_snapshots() != 0) {
+        SYNC_ERR("load full data from %s failed", SNAP_FILE);
+        close(fd);
+        return;
+    }
+    SYNC_LOG_S("full data loaded from %s", SNAP_FILE);
 
     /* 给主机发送全量完成标志SYNC-FINISHED */
     if (slave_temp_sync_finished(g_config.master_ip, g_config.master_port) != 0) {
@@ -465,16 +483,7 @@ int sync_from_master(const char *master_ip, int port) {
     return 0;
 }
 
-// ===== 从机：通知主机全量加载完成（新建命令连接发 SYNC-FINISHED） =====
-static int slave_temp_sync_finished(const char *ip, int port) {
 
-    int fd = slave_connect_to_master(ip, port);      /* 复用已有连接函数 */
-    if (fd <= 0) return -1;
-
-    safe_send(fd, fin, strlen(fin));
-    close(fd);
-    return 0;
-}
 
 
 
