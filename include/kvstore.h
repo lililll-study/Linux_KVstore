@@ -170,7 +170,9 @@ int kvs_protocol(int fd, char *msg, int length, char *response);
 #if ENABLE_URING
 #define SNAP_FILE "data/data_snap.snap"
 #define AOF_FILE   "data/data_aof.aof"
+#define FULL_SYNC_FILE "data/.tmp"
 int save_snapshots();
+int save_snapshots_to(const char *filename);   /* 全量持久化到指定文件 */
 int load_snapshots();
 // AOF
 int append_aof(const char *cmd, const char *key, const char *value);
@@ -368,7 +370,7 @@ int resp_buf_has_data(kvs_conn_ctx_t *ctx);
 
 
 /*
-======================================= 5.  全量和增量同步 ======================================
+======================================= 5.  主从同步 ======================================
 ==========================================================================================
 */
 #if ENABLE_SYNC
@@ -416,6 +418,8 @@ void* slave_snap_recv_thread(void* arg);
 void slave_handle_aof_mode(int fd); 
 void slave_handle_snap_mode(int fd);
 int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
+
+int handle_sync_finished(int fd);
 
 #endif
 
@@ -531,6 +535,8 @@ void *master_rdma_thread(void *arg);
 int  rdma_send_file(const char *filepath, long total, const char *end_marker);
 int  rdma_recv_file(const char *filepath, const char *end_marker);
 void rdma_shutdown(void);
+
+
 #endif
 
 

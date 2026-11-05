@@ -834,5 +834,4 @@ void rdma_shutdown(void) {
 }
 
 
-
 #endif

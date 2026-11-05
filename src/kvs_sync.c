@@ -24,6 +24,21 @@
 #if ENABLE_AOF_SYNC
 #define AOF_FILE_COUNT 1
 
+/* 阶段1：主机收到 SYNC 后，把内存数据全量持久化进 .tmp 临时文件
+ * 之后 RDMA 推送、从机加载都用这个文件；master 收到 SYNC-FINISHED 后删除它 */
+int sync_save_full_tmp(void)
+{
+    unlink(FULL_SYNC_FILE);                        /* 清掉上次同步可能残留的 .tmp */
+    if (save_snapshots_to(FULL_SYNC_FILE) != 0) {
+        LOG_ERROR("save full data to %s failed", FULL_SYNC_FILE);
+        return -1;
+    }
+    LOG_INFO("full data saved to %s", FULL_SYNC_FILE);
+    return 0;
+}
+
+
+
 // AOF 增量同步上下文（长连接）
 typedef struct {
     int fd;                    // 同步连接fd
@@ -286,21 +301,12 @@ int is_sync_peer(int fd) {
 }
 
 
-// ===== 主机：处理 SYNC 请求 =====
+
+
+// ===== 主机：收到从机的SYNC命令 =====
 int handle_sync_request(int fd) {
 
- #if ENABLE_RDMA
-    if (g_config.rdma_enable) {
-        pthread_t rdma_tid;
-        if (pthread_create(&rdma_tid, NULL, master_rdma_thread, NULL) != 0) {
-            LOG_INFO("create rdma thread failed\n");
-        } else {
-            pthread_detach(rdma_tid);
-        }
-    }
- #endif
-
-    // 1. 发送模式
+    /* 1: 收到SYNC命令，先把持久化模式mode发送过去避免等待 */
     if (g_config.aof_enable) {
         safe_send(fd, "aof\n", 4);
     } else if (g_config.snap_enable) {
@@ -310,6 +316,36 @@ int handle_sync_request(int fd) {
         close(fd);
         return -1;
     }
+    
+    if (0 != sync_save_full_tmp()) {
+        LOG_INFO("save all mem data to tmp file failed");
+    }
+    LOG_INFO("save all mem data to tmp file success");
+
+    // 2. 如果当前是snap 模式：维持原逻辑，等从机发 SAVE
+    if (!g_config.aof_enable) {
+        SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
+        g_snap_ctx.fd = fd;
+        g_snap_ctx.is_active = 1;
+        safe_send(fd, "SNAP_SYNC_OK\n", 13);
+        return 0;
+    }
+    SYNC_LOG_M("handle SYNC request on fd=%d", fd);
+
+
+    /* 3:  */
+ #if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, master_rdma_thread, (void *)(long)fd) != 0) {
+            LOG_INFO("create rdma thread failed\n");
+        }
+        pthread_detach(tid);     /* .tmp 删除和增量恢复都在 handle_sync_finished 里做 */
+        return 0;
+    }
+ #endif
+
+
 
     // 2. 根据模式处理
     if (g_config.aof_enable) {
@@ -378,6 +414,8 @@ int handle_sync_request(int fd) {
 
     return 0;
 }
+
+
 
 
 #if ENABLE_SYNC_MODIFY
@@ -485,6 +523,7 @@ void* slave_snap_recv_thread(void* arg) {
     return NULL;
 }
 
+
 // ===== 从节点：处理主机发来的aof命令 =====
 void slave_handle_aof_mode(int fd) {
     // ===== 1. 接收 AOF 文件（全量） =====
@@ -563,9 +602,12 @@ void slave_handle_snap_mode(int fd) {
     SYNC_LOG_S("SNAP recv thread started");
 }
 
-// ===== 从节点：建立连接，并发起SYNC同步 ============
-int sync_from_master(const char *master_ip, int port) {
-    SYNC_LOG_S("connecting to master %s:%d", master_ip, port);
+
+
+static const char *SYNC_CMD = "*1\r\n$4\r\nSYNC\r\n";
+// ===== 从节点：连接主机 ============
+static int slave_connect_to_master(const char *ip, int port) {
+    SYNC_LOG_S("connecting to master %s:%d", ip, port);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -576,7 +618,7 @@ int sync_from_master(const char *master_ip, int port) {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, master_ip, &addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
         perror("inet_pton");
         close(fd);
         return -1;
@@ -589,16 +631,24 @@ int sync_from_master(const char *master_ip, int port) {
     }
 
     SYNC_LOG_S("connected to master");
+    return fd;
+}
 
-    // 发送SYNC命令到master，开始同步
-    const char *sync_cmd = "*1\r\n$4\r\nSYNC\r\n";
-    if (safe_send(fd, sync_cmd, strlen(sync_cmd)) < 0) {
-        perror("send SYNC");
+// ===== 从节点：建立连接，并发起SYNC同步 ============
+int sync_from_master(const char *master_ip, int port) {
+
+    /* 1：从机连接主机，并发SYNC同步标志*/
+    int fd = slave_connect_to_master(master_ip, port);
+    if (fd <= 0) {
+        LOG_ERROR("connect to master failed");
+    }
+    if (safe_send(fd, SYNC_CMD, strlen(SYNC_CMD)) < 0) {
+        LOG_ERROR("send SYNC error");
         close(fd);
         return -1;
     }
 
-    // 接收 mode（逐字节读，避免吞掉后续的 AOF 内容）
+    // 接收主机的持久化模式mode
     char mode[16] = {0};
     int mode_len = 0;
     while (mode_len < (int)sizeof(mode) - 1) {
@@ -613,19 +663,21 @@ int sync_from_master(const char *master_ip, int port) {
         }
         mode_len++;
     }
-    mode[strcspn(mode, "\r\n")] = '\0';
+    mode[strcspn(mode, "\r\n")] = '\0'; // 把末尾的换行清除
     SYNC_LOG_S("master mode: %s", mode);
 
+    /* 2：从机启动rdma-client*/
  #if ENABLE_RDMA
     if (g_config.rdma_enable) {
         if (slave_rdma_start() != 0) {
-            SYNC_ERR("rdma connect test failed");
+            LOG_ERROR("rdma connect test failed");
         } else {
-            SYNC_LOG_S("RDMA test connection ok");
+            LOG_INFO("RDMA test connection ok");
         }
     }
  #endif
 
+    /* 3：从机启动接收程序*/
     if (strcmp(mode, "aof") == 0) {
         slave_handle_aof_mode(fd);
     } else if (strcmp(mode, "snap") == 0) {

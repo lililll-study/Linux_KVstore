@@ -700,7 +700,27 @@ int save_snapshots() {
     return ret;
 }
 
+/* 把内存数据全量保存到指定文件（save_snapshots 的参数化版本）
+ * 复用引擎持久化表，格式与快照完全一致（含每条记录的内联 CRC） */
+int save_snapshots_to(const char *filename)
+{
+    // 先清空文件
+    FILE *fp = fopen(filename, "w");
+    if (!fp) return -1;
+    fclose(fp);
 
+    // 依次调用各引擎的保存函数（hash / skiptable 追加写同一文件）
+    int ret = 0, i = 0;
+    for (i = 0; engine_persist_table[i].name != NULL; i++) {
+        if (engine_persist_table[i].save_fn(filename) != 0) {
+            LOG_ERROR("failed to save %s snap to %s\n",
+                      engine_persist_table[i].name, filename);
+            ret = -1;
+        }
+    }
+
+    return ret;
+}
 
 #if ENABLE_MMAP
 
