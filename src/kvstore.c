@@ -49,7 +49,7 @@ void kvs_free(void *ptr) {
 const char *command[] = {
     "HSET", "HGET", "HDEL", "HMOD", "HEXIST",
     "SSET", "SGET", "SDEL", "SMOD", "SEXIST",
-    "SAVE", "SYNC"
+    "SAVE", "SYNC", "SYNC-FINISHED"
 
 };
 
@@ -70,6 +70,7 @@ enum {
 
     KVS_CMD_SAVE,
     KVS_CMD_SYNC,
+    KVS_CMD_SYNC_FINISHED,
 	KVS_CMD_COUNT,
 
 };
@@ -254,8 +255,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HSET", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                    master_aof_immediate("HSET", key, value);
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -277,8 +276,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HDEL", key, NULL);  // 追加AOF
-                // ===== immediate 同步 =====
-                    master_aof_immediate("HDEL", key, NULL);
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 不存在 → 0
@@ -290,8 +287,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HMOD", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                    master_aof_immediate("HMOD", key, value);
                 SAFE_APPEND("+OK\r\n");
             } else {
                 SAFE_APPEND("-ERR no such key\r\n");
@@ -313,8 +308,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SSET", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                    master_aof_immediate("SSET", key, value);
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -336,8 +329,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SDEL", key, NULL);  // 追加AOF
-                // ===== immediate 同步 =====
-                    master_aof_immediate("SDEL", key, NULL);
                 
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
@@ -351,9 +342,6 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SMOD", key, value);  // 追加AOF
-                // ===== immediate 同步 =====
-                
-                    master_aof_immediate("SMOD", key, value);
                 
                 SAFE_APPEND("+OK\r\n");
             } else {
@@ -422,6 +410,13 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 ret = handle_sync_request(fd);
                 break;
             // 并且会发送 AOF_SYNC_OK 确认
+            }
+            break;
+        case KVS_CMD_SYNC_FINISHED:
+            SYNC_LOG("SYNC-FINISHED cmd received on fd=%d, role=%s", fd, g_is_master ? "master" : "slave");
+            if (g_is_master) {
+                // 主节点：收尾（删.tmp、销毁rdma server、恢复eBPF增量转发）
+                ret = handle_sync_finished(fd);
             }
             break;
 #endif
@@ -793,7 +788,7 @@ int main(int argc, char *argv[]) {
 #endif
 #if ENABLE_RDMA
     if (g_config.rdma_enable) {
-        rdma_shutdown();       /* 必须在网络主循环退出之后、进程结束之前 */
+        rdma_server_destroy();       /* 必须在网络主循环退出之后、进程结束之前 */
     }
 #endif
 

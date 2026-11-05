@@ -347,6 +347,19 @@ int master_rdma_start() {
  #endif
 }
 
+/* 阶段2：master 等待从机 rdma client 连接建立（轮询全局连接句柄）
+ * 返回 0 = 已连接；-1 = 超时 */
+int rdma_wait_client(int timeout_ms)
+{
+    int waited = 0;
+    while (g_conn_id == NULL) {
+        if (waited >= timeout_ms) return -1;
+        usleep(10 * 1000);
+        waited += 10;
+    }
+    return 0;
+}
+
 // 从节点创建id的过程
 static struct rdma_cm_id *rdma_create_cm_id(struct rdma_event_channel *channel, const char *ip, unsigned short port) {
 
@@ -791,7 +804,7 @@ void *master_rdma_thread(void *arg) {
 
 
 /* 程序退出时调用：拆掉常驻连接，释放所有 RDMA 资源 */
-void rdma_shutdown(void) {
+void rdma_server_destroy(void) {
     pthread_mutex_lock(&g_rdma_mtx);
     if (g_conn_id == NULL) {
         pthread_mutex_unlock(&g_rdma_mtx);
@@ -833,5 +846,44 @@ void rdma_shutdown(void) {
     LOG_INFO("[RDMA] shutdown done");
 }
 
+/* 从机：全量接收并加载完成后调用，一次性同步，client 用完即毁
+ * 从机没有 g_listen_id（监听是 master 侧资源），只拆数据连接本身 */
+void rdma_client_destroy(void) {
+    pthread_mutex_lock(&g_rdma_mtx);
+    if (g_conn_id == NULL) {
+        pthread_mutex_unlock(&g_rdma_mtx);
+        return;
+    }
+
+    /* 1. 先断开：通知对端，同时会在本地触发一个 DISCONNECTED 事件 */
+    rdma_disconnect(g_conn_id);
+
+    /* 2. 把这个 DISCONNECTED 事件收掉，否则 rdma_destroy_id 可能一直等事件被 reap */
+    if (g_conn_channel) {
+        struct rdma_cm_event *ev = NULL;
+        if (0 == rdma_get_cm_event(g_conn_channel, &ev)) {
+            rdma_ack_cm_event(ev);
+        }
+    }
+
+    /* 3. 销毁顺序不能乱：dereg MR → destroy QP → destroy CQ → dealloc PD */
+    rdma_free_buffer(g_conn_id);
+    rdma_destroy_queuepair(g_conn_id, g_conn_pd, g_conn_cq);
+    rdma_destroy_id(g_conn_id);
+
+    g_conn_id = NULL;
+    g_conn_pd = NULL;
+    g_conn_cq = NULL;
+    g_conn_cm = NULL;
+
+    /* 4. 最后销毁事件通道 */
+    if (g_conn_channel) {
+        rdma_destroy_event_channel(g_conn_channel);
+        g_conn_channel = NULL;
+    }
+
+    pthread_mutex_unlock(&g_rdma_mtx);
+    LOG_INFO("[RDMA] client destroy done");
+}
 
 #endif

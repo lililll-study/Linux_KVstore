@@ -24,21 +24,6 @@
 #if ENABLE_AOF_SYNC
 #define AOF_FILE_COUNT 1
 
-/* 阶段1：主机收到 SYNC 后，把内存数据全量持久化进 .tmp 临时文件
- * 之后 RDMA 推送、从机加载都用这个文件；master 收到 SYNC-FINISHED 后删除它 */
-int sync_save_full_tmp(void)
-{
-    unlink(FULL_SYNC_FILE);                        /* 清掉上次同步可能残留的 .tmp */
-    if (save_snapshots_to(FULL_SYNC_FILE) != 0) {
-        LOG_ERROR("save full data to %s failed", FULL_SYNC_FILE);
-        return -1;
-    }
-    LOG_INFO("full data saved to %s", FULL_SYNC_FILE);
-    return 0;
-}
-
-
-
 // AOF 增量同步上下文（长连接）
 typedef struct {
     int fd;                    // 同步连接fd
@@ -88,7 +73,6 @@ int safe_send(int fd, const char* data, int len) {
     }
     return total;
 }
-
 
 // ===== 从节点接收aof--超时5s自动发心跳 =====
 static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
@@ -157,9 +141,6 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
     return 0;
 }
 
-
-
-
 // ===== 从节点：循环接收内容写入 filepath，遇到 end_marker 停止并截断 =====
 int recv_file_content(int fd, const char *filepath, const char *end_marker) {
     if (!filepath || !end_marker) return -1;
@@ -224,73 +205,12 @@ int recv_file_content(int fd, const char *filepath, const char *end_marker) {
     return 0;
 }
 
-
-/**
- * @func 主节点收到sync，根据同步模式分发数据
- * aof：立即同步，每条cmd执行aof_master_immediate
- * snap：
- */
-// ===== 主节点：立即同步 (immediate) =====
-int master_aof_immediate(const char *cmd, const char *key, const char *value) {
-    if (!g_is_master) return 0;
-#if ENABLE_EBPF
-    /* eBPF 已接管：命令由 append_aof 的 uprobe 捕获后异步转发，这里直接放手。
-       只有 eBPF 真的跑起来了才放手，否则（加载失败/非 root）走原来的同步直发，不影响功能 */
-    if (g_config.ebpf_enable && ebpf_capture_is_running()) return 0;
-#endif
-    return master_aof_sync_send(cmd, key, value);
-}
-
-// ===== 主节点：把一条命令拼成 RESP 到调用方给的缓冲区（只拼不发） =====
-// 给批量转发复用，避免 RESP 格式在两处各写一份
-// 返回拼好的字节数；参数非法或缓冲区不够返回 -1
-int master_aof_format_cmd(char *buf, int cap,
-                          const char *cmd, const char *key, const char *value) {
-    if (!buf || cap <= 0 || !cmd || !key) return -1;
-
-    int len = 0;
-    if (value) {
-        len = snprintf(buf, cap,
-                       "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                       strlen(cmd), cmd,
-                       strlen(key), key,
-                       strlen(value), value);
-    } else {
-        len = snprintf(buf, cap,
-                       "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                       strlen(cmd), cmd,
-                       strlen(key), key);
-    }
-    if (len < 0 || len >= cap) return -1;   /* 单条命令超过缓冲区 */
-    return len;
-}
-
-// ===== 主节点：把一块已经拼好的 RESP 一次性推给从机（批量刷出用） =====
-int master_aof_send_raw(const char *data, int len) {
-    if (!g_is_master) return 0;
-    if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
-    return safe_send(g_aof_ctx.fd, data, len);
-}
-
-// ===== 主节点：立即同步 (immediate) =====
-int master_aof_sync_send(const char *cmd, const char *key, const char *value) {
-    if (!g_is_master) return 0;      /* 仅主节点推送增量，避免从机重放时把命令回灌给主机 */
-    if (!g_aof_ctx.is_active || g_aof_ctx.fd <= 0) return 0;
-
-    char buf[4096];
-    int len = master_aof_format_cmd(buf, sizeof(buf), cmd, key, value);
-    if (len < 0) return -1;
-    return safe_send(g_aof_ctx.fd, buf, len);
-}
-
 // ===== 主节点：判断是不是从机的 SAVE 请求 =====
 int is_slave_save(int fd) {
     return (g_snap_ctx.is_active && g_snap_ctx.fd == fd);
 }
 
-// ===== 判断 fd 是否为同步（复制）连接 =====
-// 复制连接上必须保持静默：从机把收到的任何字节都当作 AOF 追加，
-// 若主机回 +PONG/错误响应，会被写进从机 AOF 并让增量重放卡死。
+// ===== 主节点： fd 是否为同步（复制）连接 =====
 int is_sync_peer(int fd) {
     if (fd < 0) return 0;
     #if ENABLE_AOF_SYNC
@@ -303,308 +223,128 @@ int is_sync_peer(int fd) {
 
 
 
+
+// ===== 1. 全量阶段，主节点handle调用：内存数据全量放入tmp中 ==== 
+int master_save_tmp(void)
+{
+    unlink(TEMP_FILE);                        /* 清掉上次同步可能残留的 .tmp */
+    if (save_snapshots_to(TEMP_FILE) != 0) {
+        LOG_ERROR("save full data to %s failed", TEMP_FILE);
+        return -1;
+    }
+    LOG_INFO("full data saved to %s", TEMP_FILE);
+    return 0;
+}
+
+// ===== 2. 全量阶段，主节点handle调用：tmp文件发送线程 ==== 
+static void *master_send_temp_thread(void *arg) {
+
+    (void)arg;
+
+    /* 从机要先发起 RDMA client 连接，这里最多等 10s */
+    if (rdma_wait_client(10000) != 0) {
+        LOG_ERROR("rdma client not connected in 10s, full sync abort");
+        return NULL;
+    }
+
+    if (rdma_send_file(TEMP_FILE, -1, "AOF_SYNC_OK\n") < 0) {
+        LOG_ERROR("rdma send %s failed", TEMP_FILE);
+        return NULL;
+    }
+    LOG_INFO("full sync: %s pushed via rdma", TEMP_FILE);
+    return NULL;
+}
+
 // ===== 主机：收到从机的SYNC命令 =====
 int handle_sync_request(int fd) {
-
-    /* 1: 收到SYNC命令，先把持久化模式mode发送过去避免等待 */
-    if (g_config.aof_enable) {
-        safe_send(fd, "aof\n", 4);
-    } else if (g_config.snap_enable) {
-        safe_send(fd, "snap\n", 5);
-    } else {
-        safe_send(fd, "none\n", 5);
+    
+    /* 1: 把内存全量数据保存进temp文件 */
+    if (0 != master_save_tmp()) {
+        LOG_INFO("save all mem data to tmp file failed");
         close(fd);
         return -1;
     }
-    
-    if (0 != sync_save_full_tmp()) {
-        LOG_INFO("save all mem data to tmp file failed");
-    }
     LOG_INFO("save all mem data to tmp file success");
+    safe_send(fd, "ok\n", 3);            /* 主机tmp保存完成，发送ok给从机 */
 
-    // 2. 如果当前是snap 模式：维持原逻辑，等从机发 SAVE
-    if (!g_config.aof_enable) {
-        SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
-        g_snap_ctx.fd = fd;
-        g_snap_ctx.is_active = 1;
-        safe_send(fd, "SNAP_SYNC_OK\n", 13);
-        return 0;
-    }
-    SYNC_LOG_M("handle SYNC request on fd=%d", fd);
-
-
-    /* 3:  */
+    /* 2: 启动RDMA server，后台线程推送.tmp到从机 */
  #if ENABLE_RDMA
     if (g_config.rdma_enable) {
+
+        /* 启动rdma server 线程*/
         pthread_t tid;
-        if (pthread_create(&tid, NULL, master_rdma_thread, (void *)(long)fd) != 0) {
+        if (pthread_create(&tid, NULL, master_rdma_thread, NULL) != 0) {
             LOG_INFO("create rdma thread failed\n");
+            close(fd);
+            return -1;
         }
-        pthread_detach(tid);     /* .tmp 删除和增量恢复都在 handle_sync_finished 里做 */
+        pthread_detach(tid);
+
+        /* 推送线程：先等待从机rdma连接，然后发.tmp文件 */
+        pthread_t send_tid;
+        if (pthread_create(&send_tid, NULL, master_send_temp_thread, (void *)(long)fd) != 0) {
+            SYNC_ERR("create full sync send thread failed");
+            close(fd);
+            return -1;
+        }
+        pthread_detach(send_tid);
         return 0;
     }
  #endif
 
+    SYNC_ERR("rdma disabled, sync unsupported");
+    close(fd);
+    return -1;
+}
 
+// ===== 主机：收到从机 SYNC-FINISHED，全量同步结束 =====
+int handle_sync_finished(int fd) {
+    (void)fd;
 
-    // 2. 根据模式处理
-    if (g_config.aof_enable) {
-        SYNC_LOG_M("handle SYNC request on fd=%d, mode=%s", fd,
-           g_config.aof_enable ? "aof" : (g_config.snap_enable ? "snap" : "none"));
+    unlink(TEMP_FILE);
+    LOG_INFO("SYNC-FINISHED received, %s removed", TEMP_FILE);
 
-#if ENABLE_EBPF
-        /* ★ 全量窗口开始：先关转发。
-           此刻 ringbuf 里残留的事件都属于"全量"范围，转发出去会和全量 AOF 重复 */
-        int ebpf_live = (g_config.ebpf_enable && ebpf_capture_is_running());
-        if (ebpf_live) {
-            ebpf_capture_set_forward(0);
-            /* ★ append_aof 是 io_uring 异步入队，不 flush 就 stat，
-               shot_size 会漏掉还在队列里的命令 → 全量缺数据 → 从机永久丢 */
-            persistence_flush();
-        }
-#endif
-
-        init_aof_sync_ctx();
-        g_aof_ctx.fd = fd;
-        g_aof_ctx.is_active = 1;
-
-        // ★ 记录发送开始时的文件大小，作为快照边界
-        struct stat st;
-        long shot_size = 0;
-        if (stat(AOF_FILE, &st) == 0) shot_size = st.st_size;
 #if ENABLE_RDMA
-        if (g_config.rdma_enable) {
-            if (rdma_send_file(AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
-                SYNC_ERR("rdma send AOF failed");
-                close(fd);
-                return -1;
-            }
-        } else if (send_file_content(fd, AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
-            SYNC_ERR("send AOF content failed");
-            close(fd);
-            return -1;
-        }
-#else
-        // 只发送 shot_size 字节，末尾加 marker
-        if (send_file_content(fd, AOF_FILE, shot_size, "AOF_SYNC_OK\n") < 0) {
-            SYNC_ERR("send AOF content failed");
-            close(fd);
-            return -1;
-        }
-
-#endif
-
-#if ENABLE_EBPF
-        /* ★ 全量发送完毕。reactor 是单线程，刚才阻塞在这里期间不会产生新命令，
-           所以现在重新打开增量转发，既不会漏也不会重 */
-        if (ebpf_live) {
-            ebpf_capture_set_forward(1);
-            SYNC_LOG_M("全量同步完成，eBPF 增量转发已开启 fd=%d", fd);
-        }
-#endif
-    } else if (g_config.snap_enable) {
-        SYNC_LOG_M("SNAP mode: waiting for slave SAVE");
-
-        // 记录从机 fd，等从机发 SAVE
-        g_snap_ctx.fd = fd;
-        g_snap_ctx.is_active = 1;
-
-        safe_send(fd, "SNAP_SYNC_OK\n", 13);
+    if (g_config.rdma_enable) {
+        rdma_server_destroy();                 /* 一次性同步：server 用完即毁 */
     }
-
+#endif
     return 0;
 }
 
 
+static const char *SYNC_CMD = "*1\r\n$4\r\nSYNC\r\n";
+static const char *fin = "*1\r\n$13\r\nSYNC-FINISHED\r\n";   /* $后是命令字符串长度：13 */
 
-
-#if ENABLE_SYNC_MODIFY
-
-/**
- * @func 从节点发起sync同步, 根据master的模式进行数据备份
- * aof：全量接收命令，replay_aof_from加载到内存
- * snap：全量接收数据，落盘，再load加载
- */
-// ===== 从节点：接收 AOF 增量数据（修复半包/粘包问题） =====
-void* slave_aof_recv_thread(void* arg) {
-    aof_sync_ctx_t* ctx = (aof_sync_ctx_t*)arg;
+// ===== 从机：接收主机 eBPF 转发的增量命令（RESP 流，直接执行，不落 AOF） =====
+static void *slave_sync_recv_thread(void *arg) {
+    aof_sync_ctx_t *ctx = (aof_sync_ctx_t *)arg;
     int fd = ctx->fd;
 
     char buf[4096];
-
-    LOG_INFO("[AOF Sync] Slave receive thread started on fd %d\n", fd);
+    SYNC_LOG_S("incremental recv thread started on fd %d", fd);
 
     while (ctx->is_active && fd > 0) {
-        /* 1 秒超时：有数据就 append，超时后统一 replay + 发心跳 */
         int n = recv_with_timeout(fd, buf, sizeof(buf), 1);
 
         if (n > 0) {
-            /* 只 append，不 replay */
-            FILE *fp = fopen(AOF_FILE, "a");
-            if (fp) {
-                fwrite(buf, 1, n, fp);
-                fclose(fp);
-            } else {
-                LOG_ERROR("[AOF Sync] open %s for append failed\n", AOF_FILE);
-            }
-
+            /* 直接走协议解析执行（与普通客户端同一入口） */
+            kvs_protocol(fd, buf, n, NULL);
         } else if (n == 0) {
-            /* 超时：把当前攒下的数据一次性 replay */
-            struct stat st;
-            if (stat(AOF_FILE, &st) == 0 && st.st_size > ctx->consumed_offset) {
-
-                /*  从 consumed_offset 起，只处理新增部分 */
-                long new_offset = replay_aof_from(AOF_FILE, ctx->consumed_offset);
-                if (new_offset > ctx->consumed_offset) {
-                    ctx->consumed_offset = new_offset;
-                }
-            }
-
-            /* 发心跳 */
-            if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) {
-                LOG_ERROR("[Heartbeat] Send failed\n");
-                break;
-            }
+            /* 超时发心跳 */
+            if (safe_send(fd, HEARTBEAT_CMD, HEARTBEAT_CMD_LEN) < 0) break;
         } else {
-            LOG_WARN("[AOF Sync] Master connection closed\n");
+            SYNC_LOG_S("master connection closed");
             break;
         }
     }
 
     ctx->is_active = 0;
-    if (fd > 0) {
-        close(fd);
-        ctx->fd = -1;
-    }
-    LOG_INFO("[AOF Sync] Slave receive thread exiting\n");
-    return NULL;
-}
-
-// ===== 从节点：SNAP 接收线程（每 10s 发 SAVE）=====
-void* slave_snap_recv_thread(void* arg) {
-    snap_sync_ctx_t* ctx = (snap_sync_ctx_t*)arg;
-    int fd = ctx->fd;
-
-    SYNC_LOG_S("SNAP recv thread started, fd=%d", fd);
-
-    while (ctx->is_active && fd > 0) {
-        sleep(10);
-
-        // 1. 发 SAVE 给主机（SAVE 本身即心跳）
-        const char *save_cmd = "*1\r\n$4\r\nSAVE\r\n";
-        if (safe_send(fd, save_cmd, strlen(save_cmd)) < 0) break;
-
-#if ENABLE_RDMA
-        if (g_config.rdma_enable) {
-            if (rdma_recv_file(SNAP_FILE, "SNAP_END\n") < 0) {
-                SYNC_ERR("rdma recv SNAP failed");
-                break;
-            }
-        } else if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
-            SYNC_ERR("SNAP recv content failed");
-            break;
-        }
-#else
-        /* 2. 接收 SNAP 内容并写入 SNAP_FILE */
-        if (recv_file_content(fd, SNAP_FILE, "SNAP_END\n") < 0) {
-            SYNC_ERR("SNAP recv content failed");
-            break;
-        }
-#endif
-        load_snapshots();
-        SYNC_LOG_S("SNAP loaded");
-    }
-    ctx->is_active = 0;
-    if (fd > 0) {
-        close(fd);
-        ctx->fd = -1;
-    }
-    SYNC_LOG_S("SNAP recv thread exiting");
+    if (fd > 0) { close(fd); ctx->fd = -1; }
     return NULL;
 }
 
 
-// ===== 从节点：处理主机发来的aof命令 =====
-void slave_handle_aof_mode(int fd) {
-    // ===== 1. 接收 AOF 文件（全量） =====
-    SYNC_LOG_S("receiving AOF full stream...");
-
-#if ENABLE_RDMA
-    if (g_config.rdma_enable) {
-        if (rdma_recv_file(AOF_FILE, "AOF_SYNC_OK\n") < 0) {
-            SYNC_ERR("rdma recv AOF failed");
-            close(fd);
-            return;
-        }
-    } else if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
-        SYNC_ERR("recv AOF content failed");
-        close(fd);
-        return;
-    }
-#else
-    /* 接收 AOF 内容并写入本地 AOF */
-    if (recv_file_content(fd, AOF_FILE, "AOF_SYNC_OK\n") < 0) {
-        SYNC_ERR("recv AOF content failed");
-        close(fd);
-        return;
-    }
-
-#endif
-    SYNC_LOG_S("AOF stream received, replaying...");
-
-    long consumed = replay_aof_from(AOF_FILE, 0);
-
-    if (consumed < 0) {
-        SYNC_ERR("replay_aof_from failed");
-        close(fd);
-        return;
-    }
-    SYNC_LOG_S("AOF replayed, consumed_offset=%ld", consumed);
-
-
-    // 启动 AOF 增量接收线程（后续主机每 5s 发的新增命令）
-    init_aof_sync_ctx();
-    g_aof_ctx.fd = fd;
-    g_aof_ctx.is_active = 1;
-    g_aof_ctx.consumed_offset = consumed;
-    pthread_create(&g_aof_ctx.recv_thread, NULL, slave_aof_recv_thread, &g_aof_ctx);
-    pthread_detach(g_aof_ctx.recv_thread);
-
-    SYNC_LOG_S("AOF incremental recv thread started");
-}
-
-// ===== 从节点：主机发来的snap数据 =====
-void slave_handle_snap_mode(int fd) {
-    char ack[32] = {0};
-    int ack_len = 0;
-    while (ack_len < (int)sizeof(ack) - 1) {
-        int n = recv(fd, ack + ack_len, 1, 0);
-        if (n <= 0) {
-            close(fd);
-            return;
-        }
-        if (ack[ack_len] == '\n') {
-            break;
-        }
-        ack_len++;
-    }
-    if (strcmp(ack, "SNAP_SYNC_OK\n") != 0) {
-        SYNC_ERR("SNAP sync rejected: %s", ack);
-        close(fd);
-        return;
-    }
-
-    g_snap_ctx.fd = fd;
-    g_snap_ctx.is_active = 1;
-    pthread_create(&g_snap_ctx.recv_thread, NULL, slave_snap_recv_thread, &g_snap_ctx);
-    pthread_detach(g_snap_ctx.recv_thread);
-
-    SYNC_LOG_S("SNAP recv thread started");
-}
-
-
-
-static const char *SYNC_CMD = "*1\r\n$4\r\nSYNC\r\n";
 // ===== 从节点：连接主机 ============
 static int slave_connect_to_master(const char *ip, int port) {
     SYNC_LOG_S("connecting to master %s:%d", ip, port);
@@ -633,7 +373,61 @@ static int slave_connect_to_master(const char *ip, int port) {
     SYNC_LOG_S("connected to master");
     return fd;
 }
+// ===== 从机：接收全量数据并加载 =====
+static void slave_recv_temp(int fd) {
 
+#if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+
+        if (slave_rdma_start() != 0) {
+            SYNC_ERR("rdma client connect failed");
+            close(fd);
+            return;
+        }
+        /* 本机是 rdma client（slave_rdma_start 已建连），收全量到 TEMP_FILE */
+        if (rdma_recv_file(TEMP_FILE, "AOF_SYNC_OK\n") < 0) {
+            SYNC_ERR("rdma recv full data failed");
+            close(fd);
+            return;
+        }
+        SYNC_LOG_S("full data received, saved to %s", TEMP_FILE);
+    } else {
+
+        SYNC_ERR("rdma disabled, sync unsupported");
+        close(fd);
+        return;
+    }
+#endif
+
+
+    /* 加载全量数据*/
+    if (load_snapshots_from(TEMP_FILE) != 0) {
+        SYNC_ERR("load full data from %s failed", TEMP_FILE);
+        close(fd);
+        return;
+    }
+    SYNC_LOG_S("full data loaded from %s", TEMP_FILE);
+
+    /* 给主机发送全量完成标志SYNC-FINISHED */
+    if (slave_temp_sync_finished(g_config.master_ip, g_config.master_port) != 0) {
+        SYNC_ERR("notify SYNC-FINISHED failed");
+        return;
+    }
+
+#if ENABLE_RDMA
+    if (g_config.rdma_enable) {
+        rdma_client_destroy();           /* 从机销毁 rdma client 资源 */
+    }
+#endif
+
+    /* 增量接收：复用这条连接，收 eBPF 转发的 RESP 命令流直接执行 */
+    init_aof_sync_ctx();
+    g_aof_ctx.fd = fd;
+    g_aof_ctx.is_active = 1;
+    pthread_create(&g_aof_ctx.recv_thread, NULL, slave_sync_recv_thread, &g_aof_ctx);
+    pthread_detach(g_aof_ctx.recv_thread);
+    SYNC_LOG_S("incremental recv thread started");
+}
 // ===== 从节点：建立连接，并发起SYNC同步 ============
 int sync_from_master(const char *master_ip, int port) {
 
@@ -648,251 +442,41 @@ int sync_from_master(const char *master_ip, int port) {
         return -1;
     }
 
-    // 接收主机的持久化模式mode
-    char mode[16] = {0};
-    int mode_len = 0;
-    while (mode_len < (int)sizeof(mode) - 1) {
-        int n = recv(fd, mode + mode_len, 1, 0);
+    /* 2：等主机回ok */
+    char ack[8] = {0};
+    int ack_len = 0;
+    while (ack_len < 3) {
+        int n = recv(fd, ack + ack_len, 3 - ack_len, 0);
         if (n <= 0) {
-            LOG_ERROR("Failed to receive mode\n");
+            SYNC_ERR("no ack from master");
             close(fd);
             return -1;
         }
-        if (mode[mode_len] == '\n') {
-            break;
-        }
-        mode_len++;
+        ack_len += n;
     }
-    mode[strcspn(mode, "\r\n")] = '\0'; // 把末尾的换行清除
-    SYNC_LOG_S("master mode: %s", mode);
-
-    /* 2：从机启动rdma-client*/
- #if ENABLE_RDMA
-    if (g_config.rdma_enable) {
-        if (slave_rdma_start() != 0) {
-            LOG_ERROR("rdma connect test failed");
-        } else {
-            LOG_INFO("RDMA test connection ok");
-        }
-    }
- #endif
-
-    /* 3：从机启动接收程序*/
-    if (strcmp(mode, "aof") == 0) {
-        slave_handle_aof_mode(fd);
-    } else if (strcmp(mode, "snap") == 0) {
-        slave_handle_snap_mode(fd);
-    } else {
-        SYNC_ERR("unknown mode: %s", mode);
+    if (strncmp(ack, "ok", 2) != 0) {
+        SYNC_ERR("sync rejected by master: %s", ack);
         close(fd);
         return -1;
     }
 
+    /* 3：启动rdma client，接收tmp文件*/
+    slave_recv_temp(fd);
     return 0;
 }
 
-#else
-// 主节点----启动同步服务
-int handle_sync_request(int fd) {
-    printf("Handling SYNC request on fd %d\n", fd);
+// ===== 从机：通知主机全量加载完成（新建命令连接发 SYNC-FINISHED） =====
+static int slave_temp_sync_finished(const char *ip, int port) {
 
-    // 1. 发送 OK
+    int fd = slave_connect_to_master(ip, port);      /* 复用已有连接函数 */
+    if (fd <= 0) return -1;
 
-    if (send(fd, "OK\n", 3, 0) < 0) {
-        perror("send OK");
-        return -1;
-    }
-
-    // 2. 保存快照
-    if (g_config.snap_enable) {
-        printf("Saving snapshots...\n");
-        save_snapshots();
-        // 3. 清空 AOF（先清空，再发送，避免发送期间新增数据）
-        int i = 0;
-        for (i = 0; i < 4; i++) {
-            FILE *fp = fopen(aof_files[i], "w");
-            if (fp) fclose(fp);
-        }
-        printf("AOF cleared\n");
-        // 3. 发送快照文件
-        send_all_files(fd);
-        printf("SYNC completed for fd %d\n", fd);
-    }
-    
-
- #if ENABLE_AOF_SYNC
-    if (g_config.aof_enable) {
-        printf("[AOF Sync] Switching to sync mode...\n");
-        // 初始化上下文
-        init_aof_sync_ctx();
-        g_aof_ctx.fd = fd;
-        g_aof_ctx.is_active = 1;
-        g_aof_ctx.last_heartbeat = time(NULL);
-        int i = 0;
-        // 记录当前 AOF 文件大小
-        for (i = 0; i < 4; i++) {
-            struct stat st;
-            if (stat(aof_files[i], &st) == 0) {
-                g_aof_ctx.last_size[i] = st.st_size;
-            } else {
-                g_aof_ctx.last_size[i] = 0;
-            }
-            // printf("[AOF Sync] %s: %ld bytes\n", aof_files[i], g_aof_ctx.last_size[i]);
-        }
-        // 发送确认
-    safe_send(fd, "AOF_SYNC_OK\n", 12);
-
-        // 启动主节点检测线程（只启动一次）
-        static int check_thread_started = 0;
-        if (!check_thread_started) {
-            pthread_create(&g_aof_ctx.check_thread, NULL, aof_master_check_thread, NULL);
-            pthread_detach(g_aof_ctx.check_thread);
-            check_thread_started = 1;
-            printf("[AOF Sync] Master check thread started\n");
-        }
-    }  else {
-        // 仅snap：发送结束标记，关闭连接
-        safe_send(fd, "SYNC_DONE\n", 10);
-        printf("Full sync only mode: connection closed\n");
-        close(fd);
-    }
-    return 0;    
- #endif
-}
-
-// ============ 从节点：发起 SYNC ============
-// 全量同步和增量同步，都从从节点发送sync开始
-int sync_from_master(const char *master_ip, int port) { 
-
-    printf("Connecting to master %s:%d\n", master_ip, port);
-
-    // 连接主节点（作为普通客户端）
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return -1;
-    }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, master_ip, &addr.sin_addr) <= 0) {
-        perror("inet_pton");
-        close(fd);
-        return -1;
-    }
-    
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        close(fd);
-        return -1;
-    }
-    
-    printf("Connected to master\n");
-    
-    // 发送 SYNC 命令
-    send(fd, "SYNC\n", 5, 0);
-    
-    // // 接收 OK
-    char resp[16];
-    int n = recv(fd, resp, sizeof(resp)-1, 0);
-    if (n <= 0) {
-        printf("Failed to receive response\n");
-        close(fd);
-        return -1;
-    }
-    resp[n] = '\0';
-    if (strcmp(resp, "OK\n") != 0) {
-        printf("Sync rejected: %s\n", resp);
-        close(fd);
-        return -1;
-    }
-
-    // 如果开启了snap
-    if (g_config.snap_enable) {
-        printf("Receiving files...\n");
-        // 接收所有文件
-        while (1) {
-            int ret = recv_file_from_master(fd, "data");
-            if (ret != 0) {
-                // 检查是否是 END 标记
-                char buf[16];
-                n = recv(fd, buf, sizeof(buf), 0);
-                if (n > 0 && strcmp(buf, "END\n") == 0) {
-                    printf("Received END marker\n");
-                    break;
-                }
-            }
-        }
-        // 加载快照
-        printf("Reloading snapshots from master...\n");
-        load_snapshots();
-        // ===== 清空从机 AOF =====
-        int i;
-        for (i = 0; i < 4; i++) {
-            FILE *fp = fopen(aof_files[i], "w");
-            if (fp) fclose(fp);
-        }
-        printf("Slave AOF cleared\n");
-    }
-    
- #if ENABLE_AOF_SYNC
-    // ===== 关键改动：不关闭连接，等待 AOF 增量同步 =====
-    // 接收 AOF_SYNC_OK
-    if(g_config.aof_enable) {
-        char ack[32];
-        n = recv(fd, ack, sizeof(ack)-1, 0);
-        if (n <= 0) {
-            printf("[AOF Sync] Failed to receive AOF sync ack\n");
-            close(fd);
-            return -1;
-        }
-        ack[n] = '\0';
-        
-        if (strcmp(ack, "AOF_SYNC_OK\n") != 0) {
-            printf("[AOF Sync] AOF sync rejected: %s\n", ack);
-            close(fd);
-            return -1;
-        }
-        
-        printf("[AOF Sync] AOF sync started!\n");
-        // 保存连接
-        init_aof_sync_ctx();
-        g_aof_ctx.fd = fd;
-        g_aof_ctx.is_active = 1;
-        g_aof_ctx.last_heartbeat = time(NULL);
-        
-        // 启动从节点接收线程
-        pthread_create(&g_aof_ctx.recv_thread, NULL, aof_slave_recv_thread, &g_aof_ctx);
-        pthread_detach(g_aof_ctx.recv_thread);
-        
-        printf("[AOF Sync] Receive thread started\n");
-    } else {
-        // 仅全量模式
-        char done[16];
-        n = recv(fd, done, sizeof(done)-1, 0);
-        if (n > 0 && strcmp(done, "SYNC_DONE\n") == 0) {
-            printf("Full sync completed, connection closed\n");
-        }
-        close(fd);
-    }
-
-    
-    return 0;
- #else
+    safe_send(fd, fin, strlen(fin));
     close(fd);
-    
-    // 重新加载数据
-    printf("Reloading snap_data from master...\n");
-    load_snapshots();
-    
-    printf("Sync completed\n");
     return 0;
-
- #endif
 }
 
 
-#endif
 
 
 

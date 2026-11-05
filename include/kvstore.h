@@ -53,7 +53,7 @@
 
 #define ENABLE_RDMA         1   // 打开RDMA功能
 
-#define ENABLE_EBPF         1   // 打开ebpf功能
+#define ENABLE_EBPF         0   // 关闭ebpf功能
 #define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
 /* ===== 主机工作标记 ===== */
@@ -170,7 +170,7 @@ int kvs_protocol(int fd, char *msg, int length, char *response);
 #if ENABLE_URING
 #define SNAP_FILE "data/data_snap.snap"
 #define AOF_FILE   "data/data_aof.aof"
-#define FULL_SYNC_FILE "data/.tmp"
+#define TEMP_FILE "data/.tmp"
 int save_snapshots();
 int save_snapshots_to(const char *filename);   /* 全量持久化到指定文件 */
 int load_snapshots();
@@ -384,7 +384,9 @@ int resp_buf_has_data(kvs_conn_ctx_t *ctx);
 extern int g_is_master;
 
 // ======== 主从同步接口 ===========
-int handle_sync_request(int fd);                        // 主机：处理 SYNC
+int handle_sync_request(int fd);        // 主机：处理 SYNC
+int handle_sync_finished(int fd);       // 主机：SYNC-FINISHED 收尾
+int master_save_tmp(void);              // 主机：全量内存数据落 .tmp 临时文件
 
 
 int safe_send(int fd, const char* data, int len);
@@ -393,33 +395,15 @@ int send_file_content(int fd, const char *filepath, long max_bytes, const char *
 int recv_file_content(int fd, const char *filepath, const char *end_marker);
 
 
-// 主从同步改造
-
-int is_slave_save(int fd);
+int is_slave_save(int fd);      // 主节点：fd 是否为从机的 SAVE 请求
 int is_sync_peer(int fd);       // fd 是否为同步（复制）连接
 
 void init_aof_sync_ctx(void);
 
-// 主节点同步模式及线程函数
-int master_aof_immediate(const char *cmd, const char *key, const char *value);    // immediate 同步（无线程）
-
-// 主节点：把一条命令拼成 RESP 并推给从机（同步链路唯一出口，eBPF 线程也走这里）
-int master_aof_sync_send(const char *cmd, const char *key, const char *value);
-// 只拼不发：批量转发时先攒进大缓冲，减少 send() 系统调用次数
-int master_aof_format_cmd(char *buf, int cap,
-                          const char *cmd, const char *key, const char *value);
-// 把一块已经拼好的 RESP 一次性推给从机（批量刷出用）
-int master_aof_send_raw(const char *data, int len);
-
 
 // 从节点处理同步数据线程，以及接口函数
-void* slave_aof_recv_thread(void* arg); 
-void* slave_snap_recv_thread(void* arg); 
-void slave_handle_aof_mode(int fd); 
-void slave_handle_snap_mode(int fd);
 int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 
-int handle_sync_finished(int fd);
 
 #endif
 
@@ -474,8 +458,6 @@ extern kvs_config_t g_config;
 
 int kvs_config_load(const char *filename);
 void kvs_config_print(void);
-
-
 
 /*
 ======================================= 8.  日志功能 ======================================
@@ -534,9 +516,9 @@ int  slave_rdma_start(void);
 void *master_rdma_thread(void *arg);
 int  rdma_send_file(const char *filepath, long total, const char *end_marker);
 int  rdma_recv_file(const char *filepath, const char *end_marker);
-void rdma_shutdown(void);
-
-
+void rdma_server_destroy(void);
+void rdma_client_destroy(void);
+int rdma_wait_client(int timeout_ms);
 #endif
 
 

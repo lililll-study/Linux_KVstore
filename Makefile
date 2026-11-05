@@ -57,7 +57,6 @@ SRCS = $(SRC_DIR)/kvstore.c \
 	   $(SRC_DIR)/log.c \
 	   $(SRC_DIR)/crc.c \
 	   $(SRC_DIR)/kvs_rdma.c \
-	   $(SRC_DIR)/kvs_ebpf.c \
 	   $(SRC_DIR)/kvs_mem_leak.c
 
 
@@ -157,6 +156,7 @@ clean:
 	@mkdir -p $(DATA_DIR)
 	@: > $(AOF_FILE)      # 清空 AOF
 	@: > $(SNAP_FILE)     # 清空 SNAP
+	@rm -f $(DATA_DIR)/.tmp   # 清掉全量同步残留的临时文件（-f：不存在也不报错）
 	@: > $(LOG)      	  # 清空 log
 	@echo "Data and log files cleared:"
 	@ls -l $(AOF_FILE) $(SNAP_FILE) $(LOG)
