@@ -193,7 +193,30 @@ int persistence_init(void);
 int persistence_flush(void);
 int persistence_reset_aof(void);
 void persistence_shutdown(void);
+
+/* ===== SNAP 异步保存：SAVE 命令触发 + io_uring 落盘 =====
+ * 主机/从机 init 阶段打开通道；从机等全量同步完成后再重建
+ */
+int  persist_snap_start(void);     /* 打开 SNAP 文件、初始化 uring、启动后台保存线程 */
+void persist_snap_stop(void);      /* 先 join 保存线程，再 flush 并关闭通道 */
+int  persist_snap_request(void);   /* SAVE 命令用：仅唤醒后台线程，立即返回（=已受理） */
+
+/* ===== 数据锁：写命令持写锁，读命令/快照遍历持读锁 =====
+ * 防止快照线程遍历内存表时，写命令（含从机增量接收线程）改动链表 */
+extern pthread_rwlock_t g_data_lock;
+#define DATA_RLOCK()    pthread_rwlock_rdlock(&g_data_lock)
+#define DATA_WLOCK()    pthread_rwlock_wrlock(&g_data_lock)
+#define DATA_UNLOCK()   pthread_rwlock_unlock(&g_data_lock)
 #else
+/* 非 io_uring 版本：异步 SNAP 通道不存在，接口降级为空操作；
+ * 命令侧的数据锁也降级为无锁（该版本内存表本来也不存在后台并发访问） */
+static inline int  persist_snap_start(void)   { return 0; }
+static inline void persist_snap_stop(void)    {}
+static inline int  persist_snap_request(void) { return -1; }
+#define DATA_RLOCK()    ((void)0)
+#define DATA_WLOCK()    ((void)0)
+#define DATA_UNLOCK()   ((void)0)
+
 // 快照文件路径（放在 data 目录下）
 #define SNAP_HASH_FILE      "data/hash.snap"
 #define SNAP_SKIPTABLE_FILE "data/skiptable.snap"
@@ -387,15 +410,11 @@ extern int g_is_master;
 int handle_sync_request(int fd);        // 主机：处理 SYNC
 int handle_sync_finished(int fd);       // 主机：SYNC-FINISHED 收尾
 int master_save_tmp(void);              // 主机：全量内存数据落 .tmp 临时文件
+void sync_net_forward_cmd(const char *cmd, const char *key, const char *value);
+                                        // 主机：网络转发模式（ebpf.enable=false 时自动生效）
 
 
 int safe_send(int fd, const char* data, int len);
-// 主节点传输和从节点接收
-int send_file_content(int fd, const char *filepath, long max_bytes, const char *end_marker);
-int recv_file_content(int fd, const char *filepath, const char *end_marker);
-
-
-int is_slave_save(int fd);      // 主节点：fd 是否为从机的 SAVE 请求
 int is_sync_peer(int fd);       // fd 是否为同步（复制）连接
 
 void init_aof_sync_ctx(void);
@@ -448,6 +467,7 @@ typedef struct {
     int rdma_enable;
 
     // eBPF 实时捕获转发--主节点
+    // false 时主机自动改用网络转发（命令线程直发从机），两种通道二选一
     int ebpf_enable;
 
     // 内存泄漏检测运行时开关（编译由 ENABLE_LEAK 控制）
