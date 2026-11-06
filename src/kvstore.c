@@ -117,6 +117,12 @@ int kvs_split_token(char *msg, char *tokens[]) {
 
 }
 
+/* ============================================
+ * 所有命令的唯一汇聚点，eBPF uprobe 挂在此函数入口
+ * ⚠ 此函数被 ebpf/aof_capture.bpf.c 的 on_net_cmd 依赖：
+ *   函数名、参数顺序 (fd, tokens, count)、x86_64 寄存器约定(rdi/rsi/rdx)
+ *   任一变更都必须同步修改 BPF 侧，否则 uprobe 静默失效
+ * ============================================ */
 int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 //     static int g_cmd_cnt = 0;
 //     if (++g_cmd_cnt % 1000000 == 0) {
@@ -250,11 +256,14 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     switch (cmd) {
 #if ENABLE_HASH
         case KVS_CMD_HSET:
+            DATA_WLOCK();
             ret = kvs_hash_set(&global_hash ,key, value);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HSET", key, value);  // 追加AOF
+                sync_net_forward_cmd("HSET", key, value);   // 网络转发模式：直发从机
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -262,38 +271,48 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             
             break;
         case KVS_CMD_HGET: {
+            DATA_RLOCK();
             char *result = kvs_hash_get(&global_hash, key);
             if (result == NULL) {
                 SAFE_APPEND("$-1\r\n");     // 空值
             } else {
                 SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
+            DATA_UNLOCK();
             break;
         }
         case KVS_CMD_HDEL:
+            DATA_WLOCK();
             ret = kvs_hash_del(&global_hash ,key);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HDEL", key, NULL);  // 追加AOF
+                sync_net_forward_cmd("HDEL", key, NULL);    // 网络转发模式：直发从机
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 不存在 → 0
             }
             break;
         case KVS_CMD_HMOD:
+            DATA_WLOCK();
             ret = kvs_hash_mod(&global_hash ,key, value);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("HMOD", key, value);  // 追加AOF
+                sync_net_forward_cmd("HMOD", key, value);   // 网络转发模式：直发从机
                 SAFE_APPEND("+OK\r\n");
             } else {
                 SAFE_APPEND("-ERR no such key\r\n");
             }
             break;
         case KVS_CMD_HEXIST:
+            DATA_RLOCK();
             ret = kvs_hash_exist(&global_hash ,key);
+            DATA_UNLOCK();
             if (ret == 0) {
                 SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {
@@ -303,11 +322,14 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #endif
 #if ENABLE_SKIPTABLE
         case KVS_CMD_SSET:
+            DATA_WLOCK();
             ret = kvs_skiptable_set(&global_skiptable, key, value);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SSET", key, value);  // 追加AOF
+                sync_net_forward_cmd("SSET", key, value);   // 网络转发模式：直发从机
                 SAFE_APPEND(":1\r\n");      // 新插入 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 已存在（不覆盖）→ 0
@@ -315,21 +337,26 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_SGET:{
+            DATA_RLOCK();
             char *result = kvs_skiptable_get(&global_skiptable, key);
             if (result == NULL) {
                 SAFE_APPEND("$-1\r\n");     // 空值
             } else {
                 SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
+            DATA_UNLOCK();
             break;
         }
         case KVS_CMD_SDEL:
+            DATA_WLOCK();
             ret = kvs_skiptable_del(&global_skiptable, key);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SDEL", key, NULL);  // 追加AOF
-                
+                sync_net_forward_cmd("SDEL", key, NULL);    // 网络转发模式：直发从机
+
                 SAFE_APPEND(":1\r\n");      // 删除成功 → 1
             } else {
                 SAFE_APPEND(":0\r\n");      // 不存在 → 0
@@ -337,19 +364,24 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_SMOD:
+            DATA_WLOCK();
             ret = kvs_skiptable_mod(&global_skiptable, key, value);
+            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
                 if (!is_aof_sync) append_aof("SMOD", key, value);  // 追加AOF
-                
+                sync_net_forward_cmd("SMOD", key, value);   // 网络转发模式：直发从机
+
                 SAFE_APPEND("+OK\r\n");
             } else {
                 SAFE_APPEND("-ERR no such key\r\n");
             }
             break;
         case KVS_CMD_SEXIST:
+            DATA_RLOCK();
             ret = kvs_skiptable_exist(&global_skiptable, key);
+            DATA_UNLOCK();
             if (ret == 0) {
                 SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {
@@ -366,24 +398,12 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
                 SAFE_APPEND("-ERR SAVE only in SNAP mode\r\n");
                 break;
             }
-            ret = save_snapshots();
-            // 如果是从机的 SAVE 请求，发送 SNAP
-            if (g_config.snap_enable && is_slave_save(fd)) {
-#if ENABLE_RDMA
-                if (g_config.rdma_enable) {
-                    rdma_send_file(SNAP_FILE, 0, "SNAP_END\n");
-                } else {
-                    send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
-                }
-#else
-                send_file_content(fd, SNAP_FILE, 0, "SNAP_END\n");
-#endif
-                // SAFE_APPEND("+OK\r\n");
-                break;
-            }
+            ret = persist_snap_request();   /* 异步触发一次 SNAP 保存（前面已判 snap 模式） */
             if (ret == 0) {
-                persistence_reset_aof();
+                /* 主机落盘后把 SAVE 同步给从机：主从落盘步骤保持一致 */
+                sync_net_forward_cmd("SAVE", NULL, NULL);
             }
+            /* SNAP 与 AOF 模式互斥，这里无需清理 AOF */
             SAFE_APPEND(ret == 0 ? "+OK\r\n" : "-ERR save failed\r\n");
             break;
 #else
@@ -562,6 +582,13 @@ LOG_INFO("------------ 2. kvs_engine created ----\n");
                 LOG_INFO("No snapshot found\n");
             }
             LOG_INFO("------------ 3. Snapshots loaded ---\n");
+
+            /* SNAP 异步保存：打开落盘通道，落盘由 SAVE 命令触发 */
+            if (persist_snap_start() != 0) {
+                LOG_INFO("------------ 3.1 SNAP async save FAILED ---\n");
+                return -1;
+            }
+            LOG_INFO("------------ 3.1 SNAP channel started ---\n");
         } else {
             LOG_INFO("------------ 3. Snapshots disabled ---\n");
         }
@@ -765,7 +792,8 @@ int main(int argc, char *argv[]) {
     }
 
 #if ENABLE_EBPF
-    /* ★ 主节点：把 eBPF 加载器搬进本进程，uprobe 挂在自身的 append_aof 上 */
+    /* ★ 主节点：把 eBPF 加载器搬进本进程，uprobe 挂在 kvs_filter_protocol 上
+     * ebpf.enable=false 时自动走网络转发（sync_net_forward_cmd），无需在此处理 */
     if (g_is_master && g_config.ebpf_enable) {
         char self[512] = {0};
         ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
