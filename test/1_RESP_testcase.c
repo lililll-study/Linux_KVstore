@@ -765,6 +765,52 @@ void delete_1m(int connfd) {
 }
 
 /* ============================================================
+ * Part 4：echo 写入测试（README §3：10w 条插入，单条收发）
+ * 与 redis-benchmark -c 1 -P 1 -n 100000 SET 对齐：
+ * 发一条命令、等一条响应，量出真实往返的 echo 性能
+ * ============================================================ */
+#define ECHO_COUNT  100000
+
+void echo_insert(int connfd, int engine_idx, int count) {
+    int i;
+    char cmd[256];
+    char resp[256];
+    char got[256];
+    int pass = 0, fail = 0;
+
+    struct timeval tv_begin, tv_cur;
+    gettimeofday(&tv_begin, NULL);
+
+    for (i = 0; i < count; i++) {
+        /* op 0 = SET：key/value 沿用 Hash_i / val_i 格式 */
+        int cmd_len = build_one_cmd(cmd, engine_idx, 0, i);
+        send(connfd, cmd, cmd_len, 0);
+
+        /* ★ 一条命令一个往返：循环收满一个完整 RESP 响应 */
+        if (recv_one_resp(connfd, resp, sizeof(resp), got, sizeof(got)) < 0) {
+            printf("[Echo insert] recv failed at i=%d\n", i);
+            goto done;
+        }
+        /* 新插入回 :1，覆盖旧数据回 +OK，两者都算成功 */
+        if (strcmp(got, "1") == 0 || strcmp(got, "OK") == 0) {
+            pass++;
+        } else {
+            fail++;
+            if (fail <= 5)
+                printf("[Echo insert] MISMATCH i=%d: got '%s'\n", i, got);
+        }
+    }
+
+done:
+    gettimeofday(&tv_cur, NULL);
+    int time_used = TIME_SUB_MS(tv_cur, tv_begin);
+
+    printf("[Echo insert] %-10s %d: %d ms, qps=%d, pass=%d fail=%d\n",
+           engine_name[engine_idx], count, time_used,
+           count * 1000 / (time_used > 0 ? time_used : 1), pass, fail);
+}
+
+/* ============================================================
  * main：测试入口
  * ============================================================ */
 int main(int argc, char *argv[]) {
@@ -778,6 +824,7 @@ int main(int argc, char *argv[]) {
         printf("    5  批量 SET/GET (每引擎 BATCH_COUNT 条)\n");
         printf("    6  插入 100w (2 引擎 x 50w)\n");
         printf("    7  删除 100w (2 引擎 x 50w)\n");
+        printf("    8  echo_insert    echo 写入测试 (10w 条单条收发)\n");
         printf("   10  错误格式测试 (SSET → SMOD缺参 → SDELX未知命令 → SGET校验)\n");
         printf("  engine: 0=Hash 1=Skiptable (-1=全部引擎)\n");
         return 0;
@@ -828,6 +875,13 @@ int main(int argc, char *argv[]) {
         break;
     case 7:
         delete_1m(connfd);
+        break;
+    case 8:
+        if (engine < 0)
+            for (e = 0; e < ENGINE_COUNT; e++)
+                echo_insert(connfd, e, ECHO_COUNT);
+        else
+            echo_insert(connfd, engine, ECHO_COUNT);
         break;
     case 10:
         error_test_phase1_correct_sset(connfd, 10000);
