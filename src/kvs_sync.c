@@ -53,6 +53,8 @@ typedef struct {
 } snap_sync_ctx_t;
 static snap_sync_ctx_t g_snap_ctx  = {0};
 
+static int g_slave_incr_fd = -1;   /* 主机侧：从机复用的增量连接 fd（SYNC 命令所在连接） */
+
 int safe_send(int fd, const char* data, int len) {
     int total = 0;
     while (total < len) {
@@ -216,6 +218,7 @@ int is_sync_peer(int fd) {
     #if ENABLE_AOF_SYNC
     if (g_aof_ctx.is_active && g_aof_ctx.fd == fd) return 1;
     #endif
+    if (g_is_master && g_slave_incr_fd == fd) return 1;   /* 主机侧：从机增量连接 */
     if (g_snap_ctx.is_active && g_snap_ctx.fd == fd) return 1;
     return 0;
 }
@@ -232,7 +235,7 @@ int master_save_tmp(void)
         LOG_ERROR("save full data to %s failed", TEMP_FILE);
         return -1;
     }
-    LOG_INFO("full data saved to %s", TEMP_FILE);
+    LOG_INFO("[TEMP] full data saved to %s", TEMP_FILE);
     return 0;
 }
 
@@ -251,20 +254,22 @@ static void *master_send_temp_thread(void *arg) {
         LOG_ERROR("rdma send %s failed", TEMP_FILE);
         return NULL;
     }
-    LOG_INFO("full sync: %s pushed via rdma", TEMP_FILE);
+    LOG_INFO("[RDMA] Full data sync: %s pushed by rdma success !", TEMP_FILE);
     return NULL;
 }
 
 // ===== 主机：收到从机的SYNC命令 =====
 int handle_sync_request(int fd) {
-    
+
+    g_slave_incr_fd = fd;            /* 记住这条连接：从机之后用它收增量/发心跳 */
+
     /* 1: 把内存全量数据保存进temp文件 */
     if (0 != master_save_tmp()) {
-        LOG_INFO("save all mem data to tmp file failed");
+        LOG_INFO("[TEMP] Save full data to tmp file failed");
         close(fd);
         return -1;
     }
-    LOG_INFO("save all mem data to tmp file success");
+    LOG_INFO("[TEMP] Save full data to tmp file success !");
     safe_send(fd, "ok\n", 3);            /* 主机tmp保存完成，发送ok给从机 */
 
     /* 2: 启动RDMA server，后台线程推送.tmp到从机 */
@@ -302,7 +307,7 @@ int handle_sync_finished(int fd) {
     (void)fd;
 
     unlink(TEMP_FILE);
-    LOG_INFO("SYNC-FINISHED received, %s removed", TEMP_FILE);
+    LOG_INFO("[SYNC] SYNC-FINISHED received, %s removed", TEMP_FILE);
 
 #if ENABLE_RDMA
     if (g_config.rdma_enable) {
@@ -426,7 +431,15 @@ static void slave_recv_temp(int fd) {
     }
     SYNC_LOG_S("full data loaded from %s", SNAP_FILE);
 
-    /* 给主机发送全量完成标志SYNC-FINISHED */
+    /* 先起增量接收线程：保证主机收到 FINISHED 后立刻补发的窗口缓存有人读
+     * （eBPF 在收到 SYNC-FINISHED 的瞬间就会 flush，若从机还没在 recv 会压 TCP 缓冲） */
+    init_aof_sync_ctx();
+    g_aof_ctx.fd = fd;
+    g_aof_ctx.is_active = 1;
+    pthread_create(&g_aof_ctx.recv_thread, NULL, slave_sync_recv_thread, &g_aof_ctx);
+    pthread_detach(g_aof_ctx.recv_thread);
+
+    /* 再通知主机全量完成（触发主机 eBPF 补发缓存 + 开启正常转发） */
     if (slave_temp_sync_finished(g_config.master_ip, g_config.master_port) != 0) {
         SYNC_ERR("notify SYNC-FINISHED failed");
         return;
@@ -438,12 +451,6 @@ static void slave_recv_temp(int fd) {
     }
 #endif
 
-    /* 增量接收：复用这条连接，收 eBPF 转发的 RESP 命令流直接执行 */
-    init_aof_sync_ctx();
-    g_aof_ctx.fd = fd;
-    g_aof_ctx.is_active = 1;
-    pthread_create(&g_aof_ctx.recv_thread, NULL, slave_sync_recv_thread, &g_aof_ctx);
-    pthread_detach(g_aof_ctx.recv_thread);
     SYNC_LOG_S("incremental recv thread started");
 }
 // ===== 从节点：建立连接，并发起SYNC同步 ============

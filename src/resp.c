@@ -167,7 +167,6 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
 
     while (processed_data < remain) {   // 只要已经处理的字数小于缓冲区数量，就循环处理
 
-#if 1
         char *p = data + processed_data;    // 当前未处理的数据位置
         int left = remain - processed_data; // 当前剩余没处理的数据
 
@@ -368,54 +367,7 @@ int kvs_ctx_process(int fd, kvs_conn_ctx_t *ctx, char *response, int resp_cap) {
     }
 
     return processed_data;
-// printf("[DEBUG] kvs_ctx_process: processed_data=%d\n", processed_data);
-        // 8. 此处引入状态机，如果检测完开头，就把状态机置位，如果数据不够等下一次数据来了，直接检测不同状态，例如head，cmd，token
-        //      这样即使token因为分包问题没收完退出循环后，下一次接着token解析的循环进行处理，不影响头和cmd个数的解析。
-        
-#else
-        // 1. 查找换行符 
-        // 从行开始到缓冲区末尾剩余的字节数，查找\n
-        char *line_end = memchr(line_start, '\n', ctx->cmd_buffer_len - processed_bytes);
-        // 边界条件
-        if (!line_end) break;// 没找到说明无完整命令，直接跳出
-        // 找到了，命令长度
-        int cmd_len = line_end - line_start + 1;
 
-        // 2. 分配本次命令空间，并把cmd复制到cmd_buf缓存
-        char *cmd_temp_buf = (char *)malloc(cmd_len + 1);    // 分配本次命令的空间
-        if (!cmd_temp_buf) break;
-        memcpy(cmd_temp_buf, line_start, cmd_len);
-        // printf("debug: cmd_temp_buf = '%s'\n", cmd_temp_buf);
-
-        // 3. 去掉末尾的 \n 和 \r
-        char *p = cmd_temp_buf + cmd_len - 1;
-        while (p >= cmd_temp_buf && (*p == '\n' || *p == '\r')) {
-            *p = '\0';
-            p--;
-        }
-
-
-        // 5. 如果有完整命令，处理命令
-        char *tokens[KVS_MAX_TOKENS] = {0};
-        int count = kvs_split_token(cmd_temp_buf, tokens);
-        // printf("debug 0。5:\n");
-
-        if (count > 0) {
-            // printf("debug 0。3:\n");
-            // 传入 NULL，不使用 response
-            kvs_filter_protocol(fd, tokens, count, NULL);
-            // printf("debug 0。4:\n");
-        }
-        free(cmd_temp_buf);
-        line_start += cmd_len;
-        processed_bytes += cmd_len;
-    }
-    if (processed_bytes > 0) {
-        kvs_ctx_consume(ctx, processed_bytes);
-    }
-    
-    return processed_bytes;
-#endif
 }
 
 void cleanup_connection(int fd) {

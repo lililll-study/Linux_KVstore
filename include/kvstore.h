@@ -53,7 +53,7 @@
 
 #define ENABLE_RDMA         1   // 打开RDMA功能
 
-#define ENABLE_EBPF         0   // 关闭ebpf功能
+#define ENABLE_EBPF         1   // 打开ebpf功能
 #define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
 /* ===== 主机工作标记 ===== */
@@ -529,12 +529,11 @@ int rdma_wait_client(int timeout_ms);
 ==========================================================================================
 */
 #if ENABLE_EBPF
-/* 启动：加载 BPF 对象 + 挂 uprobe 到本进程的 append_aof + 起 ringbuf 消费线程 */
+/* 启动：加载 BPF 对象 + 挂 uprobe 到本进程的 kvs_filter_protocol + 起 ringbuf 消费线程 */
 int  master_ebpf_start(const char *bin_path, int target_pid);
-/* 是否真的跑起来了：加载/attach 失败时主节点要降级回同步直发 */
+/* 是否真的跑起来了：加载/attach 失败时主节点要降级 */
 int  ebpf_capture_is_running(void);
-/* 0：只消费不转发（全量同步窗口内）；1：正常增量转发 */
-void ebpf_capture_set_forward(int on);
+/* 转发窗口由 eBPF 自行探测 SYNC / SYNC-FINISHED 管理，模块不再暴露 set_forward */
 void ebpf_capture_stop(void);
 
 #endif

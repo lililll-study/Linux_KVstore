@@ -118,12 +118,12 @@ int kvs_split_token(char *msg, char *tokens[]) {
 }
 
 int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
-    static int g_cmd_cnt = 0;
-    if (++g_cmd_cnt % 1000000 == 0) {
-#if ENABLE_MEMPOOL
-        kvs_mempool_stats_all();   // 每 100w 条命令打一次快照
-#endif
-    }
+//     static int g_cmd_cnt = 0;
+//     if (++g_cmd_cnt % 1000000 == 0) {
+// #if ENABLE_MEMPOOL
+//         kvs_mempool_stats_all();   // 每 100w 条命令打一次快照
+// #endif
+//     }
 // SET KEY VALUE
 // tokens[0]: SET ; tokens[1]: KEY; tokens[0]: VALUE
 // 进行协议数据过滤
@@ -144,8 +144,10 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #endif
         return 0;  // 直接返回，不处理
     }
-    // 来自 AOF 同步的命令，不需要响应
-    int is_aof_sync = (fd < 0);
+    // 来自同步链路的命令，不需要响应：
+    //   fd<0        eBPF 捕获直灌（历史路径）
+    //   is_sync_peer 从机收增量流 / 主机收从机心跳（fd>0 的长连接）
+    int is_aof_sync = (fd < 0) || is_sync_peer(fd);
 
     kvs_conn_ctx_t *ctx = NULL;
     char *single_resp = NULL;

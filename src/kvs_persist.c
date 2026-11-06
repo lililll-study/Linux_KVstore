@@ -296,7 +296,7 @@ int save_snapshot_hash(const char *filename) {
     }
 
     fclose(fp);
-    LOG_INFO("Snapshot hash saved to %s\n", filename);
+    LOG_INFO("[PERSIST] Snapshot hash saved to %s\n", filename);
     return 0;
 }
 
@@ -316,7 +316,7 @@ int save_snapshot_skiptable(const char *filename) {
     }
     
     fclose(fp);
-    LOG_INFO("Snapshot skiptable saved to %s\n", filename);
+    LOG_INFO("[PERSIST] Snapshot skiptable saved to %s\n", filename);
     return 0;
 }
 
