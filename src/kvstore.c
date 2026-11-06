@@ -79,8 +79,6 @@ enum {
 // ===== 从机自动连接线程 =====
 static void* slave_sync_thread(void* arg) {
     sleep(1);
-    SYNC_LOG_S("auto connecting to master %s:%d",
-           g_config.master_ip, g_config.master_port);
 
     while (1) {
         int ret = sync_from_master(g_config.master_ip, g_config.master_port);

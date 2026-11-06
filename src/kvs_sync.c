@@ -370,7 +370,7 @@ static int slave_connect_to_master(const char *ip, int port) {
         return -1;
     }
 
-    SYNC_LOG_S("connected to master");
+    SYNC_LOG_S("TCP Connection established !");
     return fd;
 }
 

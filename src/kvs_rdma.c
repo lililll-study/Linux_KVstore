@@ -47,6 +47,18 @@ typedef enum {
     RDMA_MSG_ERROR = 5
 } rdma_msg_type_t;
 
+// 将协议数字翻译成字符串，方便打日志
+static const char *rdma_msg_type_str(uint32_t type) {
+    switch (type) {
+        case RDMA_MSG_DATA:     return "DATA";
+        case RDMA_MSG_MARKER:   return "MARKER";
+        case RDMA_MSG_READY:    return "READY";
+        case RDMA_MSG_FINISHED: return "FINISHED";
+        case RDMA_MSG_ERROR:    return "ERROR";
+        default:                return "UNKNOWN";
+    }
+}
+
 typedef struct {
     uint32_t type;
     uint32_t length;      // 本块 payload 有效字节数
@@ -409,18 +421,29 @@ int slave_rdma_start() {
     // 创建channel和id
     struct rdma_event_channel *channel = rdma_create_event_channel();
     if (!channel) {
-        perror("rdma_create_event_channel\n");
+        LOG_ERROR("slave_rdma_start: rdma_create_event_channel failed\n");
         return 0;
     }
 
     struct rdma_cm_id *cm_id = rdma_create_cm_id(channel, RDMA_SERVER_IP, RDMA_SERVER_PORT);
+    if (!cm_id) {
+        LOG_ERROR("slave_rdma_start: rdma_create_cm_id failed\n");
+        rdma_destroy_event_channel(channel);
+        return -1;
+    }
 
     // 构建队列
     struct ibv_pd *pd;
     struct ibv_cq *cq;
-    rdma_create_queuepair(cm_id, &pd, &cq);
+    if (rdma_create_queuepair(cm_id, &pd, &cq) != 0) {
+        LOG_ERROR("slave_rdma_start: create queuepair failed\n");
+        return -1;
+    }
 
-    rdma_alloc_buffer(cm_id, pd);
+    if (0 != rdma_alloc_buffer(cm_id, pd) ) {
+        LOG_ERROR("slave_rdma_start: rdma_alloc_buffer failed\n");
+        return -1;
+    }
 
     // 分配buffer
     struct rdma_conn_param param;
@@ -430,15 +453,13 @@ int slave_rdma_start() {
     param.retry_count = 3;
 
     if (0 != rdma_connect(cm_id, &param)) {
-        perror("rdma_connect\n");
+        LOG_ERROR("rdma_connect failed\n");
         return -1;
     }
     if (rdma_wait_cm_event(channel, RDMA_CM_EVENT_ESTABLISHED, NULL) != 0) {
-        printf("Connect failed!\n");
+        LOG_ERROR("Connect failed!\n");
         return -1;
     }
-
-    LOG_INFO("rdma connect success\n");
 
     // struct ibv_wc wc;
     // conn_manager_t *cm = cm_id->context;
@@ -485,6 +506,7 @@ int slave_rdma_start() {
 
 // 发一个块，阻塞到发送完成
 static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t type, const char *payload, uint32_t len) {
+    
     conn_manager_t *cm = (conn_manager_t *)id->context;
     if (len > RDMA_BUFFER_SIZE - sizeof(rdma_msg_t)) return -1;
 
@@ -495,26 +517,26 @@ static int rdma_send_block(struct rdma_cm_id *id, struct ibv_cq *cq, uint32_t ty
     if (len > 0 && payload != dst) {
         memcpy(dst, payload, len);
     }
-    LOG_INFO("[RDMA] posting SEND type=%u len=%u", type, len);
-    int ret = rdma_post_send(id, sizeof(rdma_msg_t) + len);
 
+    // 【优化日志】打印谁发了什么
+    const char *role = (g_listen_id != NULL) ? "Master -> Slave" : "Slave -> Master";
+    LOG_INFO("[RDMA TX] %s | type: %s, payload_len: %u", role, rdma_msg_type_str(type), len);
+
+    int ret = rdma_post_send(id, sizeof(rdma_msg_t) + len);
     if (ret != 0) {
-        LOG_ERROR("[RDMA] ibv_post_send failed: %d (%s)",
-            ret, strerror(ret));
+        LOG_ERROR("[RDMA TX] post_send failed: %d (%s)", ret, strerror(ret));
         return -1;
     }
+
     struct ibv_wc wc;
+    if (rdma_poll_wc(cq, &wc) != 0) return -1;
 
-    if (rdma_poll_wc(cq, &wc) != 0)
+
+    if (wc.opcode != IBV_WC_SEND) {
+        LOG_ERROR("[RDMA TX] invalid opcode: %d", wc.opcode);
         return -1;
+    }
 
-    LOG_INFO("[RDMA] SEND completion opcode=%d status=%d",
-        wc.opcode, wc.status);
-
-    if (wc.opcode != IBV_WC_SEND)
-        return -1;
-
-    LOG_INFO("[RDMA] SEND type=%u, length=%u", type, len);
     return 0;
 }
 
@@ -558,6 +580,7 @@ static int rdma_wait_control(uint32_t expected) {
 
 
 int rdma_send_file(const char *filepath, long total, const char *end_marker) {
+
     if (!filepath || !end_marker) return -1;
 
     /* 等连接就绪（主机监听线程是异步起的，最多等 5s） */
@@ -594,11 +617,11 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
 
     /* 直接读进 sbuffer 的 payload 区，避免二次拷贝 */
     char *payload = g_conn_cm->sbuffer + sizeof(rdma_msg_t);
-
     size_t cap = RDMA_BUFFER_SIZE - sizeof(rdma_msg_t);
-
     long sent = 0;
     
+    // 如果是大文件，每发一个 chunk 打印一次会非常乱，这里只打印起始和结束
+    LOG_INFO("[RDMA TX] Start sending file %s (total: %ld bytes)", filepath, to_send);
 
     while (sent < to_send) {
 
@@ -619,7 +642,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         size_t chunk = remaining < cap ? remaining : cap;
 
         if (fread(payload, 1, chunk, fp) != chunk) {
-            LOG_ERROR("[RDMA] fread failed");
+            LOG_ERROR("[RDMA TX] fread failed");
             goto out;
         }
 
@@ -628,7 +651,8 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         }
         sent += (long)chunk;
 
-        LOG_INFO("[RDMA] sent chunk=%zu total=%ld/%ld", chunk, sent, to_send);
+        // 【优化】可选：打印进度百分比
+        // LOG_INFO("[RDMA TX] Progress: %ld / %ld bytes (%.1f%%)", sent, to_send, (double)sent/to_send * 100);
     }
 
     /*
@@ -645,7 +669,6 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
         goto out;
 
 
-    LOG_INFO("FINISHED");
     if (rdma_send_block(g_conn_id, g_conn_cq, RDMA_MSG_MARKER, end_marker, (uint32_t)strlen(end_marker)) != 0) {
         goto out;
     }
@@ -658,7 +681,7 @@ int rdma_send_file(const char *filepath, long total, const char *end_marker) {
     if (rdma_post_recv(g_conn_id) != 0)
         goto out;
 
-    LOG_INFO("[RDMA] file sync finished: %ld bytes", sent);
+    LOG_INFO("[RDMA TX] File sync completely finished: %ld bytes", sent);
 
     rc = 0;
 
@@ -697,13 +720,13 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
     while (!done) {
         // 第一步：先提交请求
         if (rdma_post_recv(g_conn_id) != 0) {
-            LOG_ERROR("[RDMA] post_recv failed");
+            LOG_ERROR("[RDMA RX] post_recv failed");
             goto out;
         }
 
         // 第二步：告诉主机可以发下一条消息
         if (rdma_send_control(RDMA_MSG_READY) != 0) {
-            LOG_ERROR("[RDMA] send READY failed");
+            LOG_ERROR("[RDMA RX] send READY failed");
             goto out;
         }
 
@@ -714,43 +737,38 @@ int rdma_recv_file(const char *filepath, const char *end_marker) {
         rdma_msg_t *msg =(rdma_msg_t *)g_conn_cm->rbuffer;
         char *payload = g_conn_cm->rbuffer + sizeof(rdma_msg_t);
         uint32_t actual_len = wc.byte_len - sizeof(rdma_msg_t);
-        LOG_INFO("[RDMA] recv type=%u, wc.byte_len=%u, payload=%u", msg->type, wc.byte_len, msg->length);
+
+        // 【优化日志】打印从机收到了什么
+        LOG_INFO("[RDMA RX] Master -> Slave | type: %s, payload_len: %u",  rdma_msg_type_str(msg->type), msg->length);
         if (msg->length != actual_len) {
-            LOG_ERROR("[RDMA] length mismatch: header=%u actual=%u", msg->length, actual_len);
+            LOG_ERROR("[RDMA RX] length mismatch: header=%u actual=%u", msg->length, actual_len);
             goto out;
         }
 
         if (msg->type == RDMA_MSG_DATA) {
             size_t written = fwrite(payload, 1, msg->length, fp);
-
             if (written != msg->length) {
-                LOG_ERROR("[RDMA] fwrite failed");
+                LOG_ERROR("[RDMA RX] fwrite failed");
                 goto out;
             }
-
             total += (long)written;
-
-            LOG_INFO("[RDMA] written=%zu total=%ld", written, total);
+            // 这一行太频繁了，如果是几十MB的文件会刷屏，可以注释掉或者改成 DEBUG
+            // LOG_INFO("[RDMA RX] written=%zu total=%ld", written, total); 
 
         } else if (msg->type == RDMA_MSG_MARKER) {
             if (msg->length != end_len || memcmp(payload, end_marker, end_len) != 0) {
-                LOG_ERROR("[RDMA] marker mismatch");
+                LOG_ERROR("[RDMA RX] marker mismatch");
                 goto out;
             }
-
+            LOG_INFO("[RDMA RX] End marker received. File transfer complete.");
             done = 1;
-
         } else {
-            LOG_ERROR("[RDMA] unknown msg type=%u", msg->type);
+            LOG_ERROR("[RDMA RX] unknown msg type=%u", msg->type);
             goto out;
         }
-        /*
-         * 当前消息已经完全处理。
-         * 下一轮循环才重新 post_recv，
-         * 不会提前覆盖 rbuffer。
-         */
-
     }
+
+
 
     if (fflush(fp) != 0) {
         perror("fflush");
