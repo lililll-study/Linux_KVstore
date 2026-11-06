@@ -3,16 +3,15 @@
 #define __RDMA_TRANSMIT_H__
 
 #define RDMA_SERVER_PORT    9000
-#define RDMA_SERVER_IP      "192.168.137.134"
+#define RDMA_SERVER_IP      "192.168.137.139"   /* 默认值，可被命令行参数覆盖 */
 #define RDMA_CLIENT_PORT    9001
-#define RDMA_CLIENT_IP      "192.168.137.137"
 
 
 #define RDMA_TIMEOUT_MS     2000
 #define RDMA_CQ_DEPTH       32
-#define RDMA_BUFFER_SIZE    1024 * 1024 * 64 //4096
+#define RDMA_BUFFER_SIZE    1024 * 1024         /* 每块 1MB：块太大测不出传输梯度 */
 
-#define RDMA_FILENAME       "m.mp4"
+#define RDMA_FILENAME       "bench_100m.bin"    /* 默认文件，可被命令行参数覆盖 */
 
 typedef struct conn_manager_s {
 

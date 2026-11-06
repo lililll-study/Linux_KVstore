@@ -6,6 +6,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include <unistd.h>
 #include "rdma.h"
@@ -16,8 +18,10 @@
 #include <sys/types.h>
 
 
+int main(int argc, char *argv[]) {
+    /* 用法: ./rdma_server [outfile]，输出耗时与吞吐 */
+    const char *outfile = (argc > 1) ? argv[1] : RDMA_FILENAME;
 
-int main() {
     // 分配事件通道
     struct rdma_event_channel *channel = rdma_create_event_channel();
     if (!channel) {
@@ -30,7 +34,7 @@ int main() {
         perror("rdma_create_id\n");
         return 0;
     }
-    
+
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -44,6 +48,7 @@ int main() {
         perror("rdma_listen\n");
         return 0;
     }
+    printf("[RDMA server] listening on port %d...\n", RDMA_SERVER_PORT);
 
     struct rdma_cm_event *event = NULL;
     rdma_wait_cm_event(channel, RDMA_CM_EVENT_CONNECT_REQUEST, &event);
@@ -81,30 +86,20 @@ int main() {
         return 0;
     }
     conn_manager_t *cm = id->context;
-    // printf("recv: %s\n", cm->rbuffer);
 
-#if 0
-    int i=0;
-    for (i=0; i<RDMA_BUFFER_SIZE; i++) {
-        if (cm->rbuffer[i] == 0x0) break;
-        cm->sbuffer[i] = cm->rbuffer[i] - 0x20;
-    }
-#else
-
+    // 收 header：magic + 文件总大小
     file_type_t *type = (file_type_t*)cm->rbuffer;
     uint32_t magic = type->magic;
     size_t total = type->total;
-    printf("total: %ld, magic: %x\n", type->total, type->magic);
+    printf("[RDMA server] header: total=%ld, magic=%x\n", type->total, type->magic);
 
-    printf("open\n");
-    int fd = open(RDMA_FILENAME, O_RDWR | O_CREAT, 0666);
+    int fd = open(outfile, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
         perror("open\n");
         return 0;
     }
     ftruncate(fd, total); // 创建文件指定大小
 
-    printf("mmap\n");
     // 把内容映射进文件
     char *p = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
@@ -112,25 +107,22 @@ int main() {
         return 0;
     }
 
-    int idx = 0;    // 当前读到文件的位置
+    /* ===== 计时开始：收到 header 之后（不含建连开销）===== */
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    size_t idx = 0;    // 当前写到文件的位置
     while (idx < total) {   // 没有读到末尾就循环
 
-        printf("Before post_recv, idx=%d\n", idx);
-
-        int ret = rdma_post_recv(id);
-        if (ret != 0) {
-            fprintf(stderr, "rdma_post_recv failed: %d\n", ret);
+        if (rdma_post_recv(id) != 0) {
+            fprintf(stderr, "rdma_post_recv failed\n");
             return -1;
         }
-
-        // printf("post_recv success, idx=%d\n", idx);
 
         if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
             perror("rdma_poll_wc || wc.opcode\n");
             return -1;
         }
-
-        printf("recv complete: idx=%d, byte_len=%u\n", idx, wc.byte_len);
 
         size_t remaining = total - idx;
 
@@ -141,14 +133,13 @@ int main() {
 
         memcpy(p + idx, cm->rbuffer, wc.byte_len);
         idx += wc.byte_len;
-
-        printf("write complete: idx=%d\n", idx);
     }
+
     msync(p, total, MS_SYNC);
     munmap(p, total);
     close(fd);
 
-#endif
+    // 回 ACK
     const char *msg = "sync finished";
     strcpy(cm->sbuffer, msg);
     rdma_post_send(id, strlen(msg) + 1);
@@ -157,6 +148,14 @@ int main() {
         return 0;
     }
 
-    getchar();
+    /* ===== 计时结束：ACK 发出 ===== */
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double sec = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9;
 
+    printf("[RDMA server] recv %zu bytes in %.3f s -> %.2f MB/s, saved to %s\n",
+           total, sec, total / (1024.0 * 1024.0) / sec, outfile);
+
+    rdma_free_buffer(id);
+    rdma_destroy_queuepair(id, pd, cq);
+    return 0;
 }

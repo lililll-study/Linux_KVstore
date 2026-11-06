@@ -150,6 +150,30 @@ $(BUILD_DIR)/kvs_ebpf.o: $(SRC_DIR)/kvs_ebpf.c $(BPF_SKEL) $(BPF_HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 	@echo "Build complete (ebpf module): $@"
 
+# ===== 传输对比 benchmark：RDMA vs TCP sendfile（rdma/ 目录的独立小程序）=====
+# 用法: make bench
+RDMA_DIR   = rdma
+BENCH_BINS = $(RDMA_DIR)/rdma_server $(RDMA_DIR)/rdma_client \
+             $(RDMA_DIR)/tcp_server $(RDMA_DIR)/tcp_client
+
+bench: $(BENCH_BINS)
+
+$(RDMA_DIR)/rdma_server: $(RDMA_DIR)/rdma_server.c $(RDMA_DIR)/rdma.h
+	$(CC) -O2 -Wall -o $@ $< -lrdmacm -libverbs
+	@echo "Build complete: $@"
+
+$(RDMA_DIR)/rdma_client: $(RDMA_DIR)/rdma_client.c $(RDMA_DIR)/rdma.h
+	$(CC) -O2 -Wall -o $@ $< -lrdmacm -libverbs
+	@echo "Build complete: $@"
+
+$(RDMA_DIR)/tcp_server: $(RDMA_DIR)/tcp_server.c
+	$(CC) -O2 -Wall -o $@ $<
+	@echo "Build complete: $@"
+
+$(RDMA_DIR)/tcp_client: $(RDMA_DIR)/tcp_client.c
+	$(CC) -O2 -Wall -o $@ $<
+	@echo "Build complete: $@"
+
 
 
 clean:

@@ -693,7 +693,7 @@ out:
     return rc;
 }
 
-/* 从机调用：接收文件写入 filepath，直到收到 end_marker。语义与 recv_file_content 一致 */
+/* 从机调用：接收文件写入 filepath，直到收到 end_marker（全量同步 .tmp 用） */
 int rdma_recv_file(const char *filepath, const char *end_marker) {
     if (!filepath || !end_marker) return -1;
     if (g_conn_id == NULL) return -1;
