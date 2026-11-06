@@ -8,9 +8,9 @@
 #                                             # 三模式连续测：模式2/3 需要从机配合
 #
 # 原理：
-#   模式1 关闭同步  : ebpf=false, net.forward=false，从机不连，纯本地写
-#   模式2 eBPF 转发 : ebpf=true,  net.forward=false，从机连上后 eBPF 旁路转发
-#   模式3 网络转发  : ebpf=false, net.forward=true， 从机连上后命令线程直发
+#   模式1 关闭同步  : ebpf=false，从机不连，纯本地写（无从机连接则转发通道空转）
+#   模式2 eBPF 转发 : ebpf=true，  从机连上后 eBPF 旁路转发
+#   模式3 网络转发  : ebpf=false， 从机连上后命令线程直发（ebpf 关闭即自动走网络转发）
 #   每轮压测用 1_RESP_testcase 8 0（echo 写入：10w 条 HSET 单条收发，
 #   连接 127.0.0.1:2000，故本脚本须在主机 VM 上运行），抓 qps= 均值
 # =====================================================================
@@ -54,16 +54,12 @@ run_bench() {
     echo ""
 }
 
-# 生成临时配置：基于 master.conf，替换/追加 ebpf 与 net.forward 两个开关
+# 生成临时配置：基于 master.conf，只需切换 ebpf.enable 一个开关
+# （ebpf=false 且从机连上时自动走网络转发，无需额外开关）
 make_conf() {
-    local ebpf=$1 netf=$2
+    local ebpf=$1
     sed -e "s/^ebpf.enable=.*/ebpf.enable=$ebpf/" \
         "$CONF_DIR/master.conf" > "$CONF_DIR/bench_master.conf"
-    if grep -q '^net.forward=' "$CONF_DIR/bench_master.conf"; then
-        sed -i "s/^net.forward=.*/net.forward=$netf/" "$CONF_DIR/bench_master.conf"
-    else
-        echo "net.forward=$netf" >> "$CONF_DIR/bench_master.conf"
-    fi
     echo "$CONF_DIR/bench_master.conf"
 }
 
@@ -98,21 +94,21 @@ fi
 MODE=${1:-full}
 
 echo "================= [1/3] 关闭主从同步（基线） ================="
-start_master "$(make_conf false false)"
+start_master "$(make_conf false)"
 run_bench "sync-off"
 stop_master
 
 if [ "$MODE" = "full" ]; then
     echo "================= [2/3] eBPF 转发 ================="
-    start_master "$(make_conf true false)"
+    start_master "$(make_conf true)"
     echo ">>> 主机已用 ebpf=true 配置启动，等从机连接"
     wait_slave
     run_bench "ebpf-fwd"
     stop_master
 
     echo "================= [3/3] 网络转发 ================="
-    start_master "$(make_conf false true)"
-    echo ">>> 主机已用 net.forward=true 配置启动，等从机重连"
+    start_master "$(make_conf false)"
+    echo ">>> 主机已用 ebpf=false 配置启动（自动走网络转发），等从机重连"
     wait_slave
     run_bench "net-fwd"
     stop_master

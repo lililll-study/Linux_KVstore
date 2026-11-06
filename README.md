@@ -398,13 +398,15 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 ## 3、增量持久化--开启和关闭下的QPS测试
 
+测试内容：向服务端插入 10w 条数据（HSET/SET），每条命令等服务端返回 OK 后再发下一条（单条收发，无管道），量出真实往返的 echo 性能。
+
     --kvstore测试
-    #  服务启动
+    #  aof 开关：修改 config/master.conf 中 aof.enable=true/false，重启服务生效
     sudo ./build/kvstore --config master.conf
-    #  测试端执行
-    redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 1 -n 100000 PING
+    #  测试端执行（mode 8 = echo 写入 10w 条，engine 0 = Hash 引擎）
+    ./build/1_RESP_testcase 8 0
     
-    --redis测试
+    --redis测试（对齐：10w 条 SET，单连接无管道，value 10 字节）
     # redis关闭aof
     redis-cli -p 6379 config set appendonly no
     # redis开启aof
@@ -412,12 +414,14 @@ sudo bash ./test/5_mem_test.sh jemalloc
     #查看当前aof状态
     redis-cli -p 6379 config get appendonly
     #  测试端执行
-    redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 PING
+    redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 -t SET -d 10
 
 | 测试项目           | 关闭aof的QPS | 开启aof的QPS |
 | -------------- | --------- | --------- |
-| kvstore的echo测试 | 8233.16   | 7795.45   |
-| redis测试        | 10410.16  | 8277.46   |
+| kvstore的echo测试 | 待实测      | 待实测     |
+| redis测试        | 待实测      | 待实测     |
+
+> 注：此前数据为旧 PING 空往返方案所测（kvstore 8233.16/7795.45，redis 10410.16/8277.46），已废弃，改用上述 10w 条插入方案后重测更新。
 
 
 
@@ -426,6 +430,14 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 
 ## 4、全量持久化--不同save间隔下的QPS测试
+
+测试前提：服务端以 SNAP 模式启动（SAVE 只在 snap 模式有效）。SNAP 落盘没有定时线程，
+保存频率完全由测试脚本发的 SAVE 命令控制，不存在背景保存干扰。
+
+SAVE 的异步语义：SAVE 命令只唤醒后台保存线程，立即返回 OK（=已受理，非已落盘）。
+数据拷贝（锁内遍历）、快照拼接、磁盘写入（io_uring）全部在后台线程执行，
+命令线程完全不被保存工作占用。写命令只会被"锁内拷贝"的 1~2ms 读锁短暂互斥——
+这是 QPS 残余损耗的唯一来源，四个 SAVE 档位预期基本拉平。
 
     # 共100w条数据,单条插入
     
@@ -440,8 +452,10 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 | Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE  | 1K/SAVE   |
 | ------ | --------- | -------- | -------- | --------- |
-| QPS    | 2.25w     | 2.17w    | 1.23w    | 0.436w    |
-| 总耗时    | 44.422 s  | 46.068 s | 81.463 s | 229.316 s |
+| QPS    | 待实测     | 待实测    | 待实测    | 待实测     |
+| 总耗时    | 待实测    | 待实测    | 待实测    | 待实测     |
+
+> 注：此前数据（2.25w/2.17w/1.23w/0.436w）为旧同步落盘方案所测，已废弃，待用异步方案重测更新。
 
 -------------------
 
