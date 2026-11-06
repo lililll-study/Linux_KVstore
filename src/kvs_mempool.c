@@ -437,22 +437,32 @@ void kvs_mempool_stats_all(void) {
 
 /* ==================== 内存回收：整段空闲的 chunk 释放回系统 ==================== */
 
-// 单池 trim：释放所有整段空闲的 chunk，返回释放的字节数
+// 单池 trim：释放整段空闲的 chunk，但保留最早的首批段（启动预热，常驻不还）
 static size_t _pool_trim(mempool_t *pool) {
     if (!pool || pool->sub_pools) return 0;
 
     size_t released_bytes = 0;          // 统计的是"退还物理页"的量
+    /* 定位链尾：chunks 是头插链，链尾即最早分配的启动首批段 */
+    mempool_chunk_t **last = &pool->chunks;
+    while (*last) last = &(*last)->next;
+
     mempool_chunk_t **pp = &pool->chunks;
     while (*pp) {
         mempool_chunk_t *c = *pp;
+        if (pp == last) {               // 首批段常驻，跳过不还
+            pp = &c->next;
+            continue;
+        }
         if (c->free_cnt == c->blocks) { // 整段空闲
             *pp = c->next;
             // 退物理页：RSS 下降；虚拟地址保留（VmSize 不变），spare 链囤着复用
-            size_t len = _page_align(sizeof(mempool_chunk_t) + c->blocks * pool->block_size);
+            size_t blocks = c->blocks;  /* madvise 会把段头清零，先存下来 */
+            size_t len = _page_align(sizeof(mempool_chunk_t) + blocks * pool->block_size);
             madvise(c, len, MADV_DONTNEED);
             c->next = pool->spare;      // 摘出活跃链，挂备用链（不 munmap！）
+            c->blocks = blocks;         /* 重写段头：否则 spare 复用时读到 0 */
             pool->spare = c;
-            released_bytes += c->blocks * pool->block_size;
+            released_bytes += blocks * pool->block_size;
         } else {
             pp = &c->next;
         }
