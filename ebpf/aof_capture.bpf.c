@@ -85,10 +85,12 @@ int on_net_cmd(struct pt_regs *ctx)
         type = EVT_SYNC_END;
     } else if (__builtin_memcmp(cmd, "SYNC", 5) == 0) {
         type = EVT_SYNC_BEGIN;
+    } else if (__builtin_memcmp(cmd, "SAVE", 5) == 0) {
+        type = EVT_SAVE;         /* 落盘命令也要转发：主从落盘步骤保持一致 */
     } else if (is_write_cmd(cmd)) {
         type = EVT_WRITE;
     } else {
-        return 0;    /* 读命令 / PING / SAVE / 未知命令一律不管 */
+        return 0;    /* 读命令 / PING / 未知命令一律不管 */
     }
 
     struct aof_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);

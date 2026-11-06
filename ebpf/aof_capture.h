@@ -13,6 +13,7 @@
 #define EVT_WRITE       0   /* 普通写命令 */
 #define EVT_SYNC_BEGIN  1   /* 主机收到从机 SYNC：全量同步开始 */
 #define EVT_SYNC_END    2   /* 主机收到从机 SYNC-FINISHED：全量同步结束 */
+#define EVT_SAVE        3   /* SAVE 命令：无 key/value，从机收到后也落盘一次 */
 
 struct aof_event {
     char cmd[AOF_CMD_MAX];
