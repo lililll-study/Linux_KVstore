@@ -72,11 +72,11 @@ int safe_send(int fd, const char* data, int len) {
 }
 
 /* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
- * 与 eBPF 转发互斥（net.forward=true 时主机不挂载 eBPF）。
+ * 与 eBPF 转发自动二选一：ebpf.enable=false 时走本路径（增量同步总得有通道）。
  * 全量同步窗口期间从机接收线程尚未就绪，数据会先堆在 socket 缓冲，
  * 就绪后被自动消费——语义上等价于 eBPF 模式的"窗口缓存补发"。 */
 void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
-    if (!g_config.net_forward || !g_is_master || g_slave_incr_fd <= 0) return;
+    if (g_config.ebpf_enable || !g_is_master || g_slave_incr_fd <= 0) return;
 
     static char fwd_buf[512];   // 单条命令缓冲（本工程 key/value 均为短串）
     int n;
