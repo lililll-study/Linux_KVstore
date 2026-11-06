@@ -487,6 +487,64 @@ int kvs_uring_append_cmd(kvs_uring_t *ctx, const void *data, size_t len,
     return 0;
 }
 
+/* ===== 对外接口：整文件重写（截断到 0 后整块写入） =====
+ * SNAP 快照每次都是全量覆盖，语义：FTRUNCATE(0) -> WRITE(data@0)
+ * 两个请求按队列顺序执行，worker 串行处理，不会出现"写一半被下一次截断"的错位
+ */
+int kvs_uring_rewrite(kvs_uring_t *ctx, const void *data, size_t len)
+{
+    if (!ctx || !data || len == 0) return -EINVAL;
+    if (len > UINT_MAX) return -E2BIG;
+
+    pthread_mutex_lock(&ctx->mutex);
+    if (!ctx->running || ctx->fatal_error != 0) {
+        int err = ctx->fatal_error ? ctx->fatal_error : ESHUTDOWN;
+        pthread_mutex_unlock(&ctx->mutex);
+        return -err;
+    }
+
+    /* 1. 截断到文件头 */
+    kvs_uring_req_t *r_trunc = calloc(1, sizeof(*r_trunc));
+    if (!r_trunc) {
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    r_trunc->opcode = 1;                 // FTRUNCATE
+    r_trunc->offset = 0;
+
+    /* 2. 全量数据 */
+    kvs_uring_req_t *r_data = calloc(1, sizeof(*r_data));
+    if (!r_data) {
+        free(r_trunc);
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    r_data->data = malloc(len);
+    if (!r_data->data) {
+        free(r_data); free(r_trunc);
+        pthread_mutex_unlock(&ctx->mutex);
+        return -ENOMEM;
+    }
+    memcpy(r_data->data, data, len);
+    r_data->len = len;
+    r_data->offset = 0;
+
+    /* 按序入队 */
+    if (ctx->tail) ctx->tail->next = r_trunc;
+    else ctx->head = r_trunc;
+    r_trunc->next = r_data;
+    r_data->next = NULL;
+    ctx->tail = r_data;
+    ctx->queued += 2;
+    ctx->submitted += 2;
+
+    ctx->next_offset = (off_t)len;
+
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
+    return 0;
+}
+
 /* ===== 对外接口：flush（等所有写完成） ===== */
 int kvs_uring_flush(kvs_uring_t *ctx)
 {

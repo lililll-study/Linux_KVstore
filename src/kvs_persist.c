@@ -251,13 +251,78 @@ format_err:
 
 
 
-// ===== 写入一个 token =====
-static int write_token(FILE *fp, const char *data) {
-    if (!data) return -1;
-    int len = strlen(data);
-    fprintf(fp, "$%d\r\n%s\r\n", len, data);
+/* ===== 快照格式化的内存缓冲 =====
+ * 异步保存时先把整份快照拼进内存，再一次性交给 io_uring 写盘，
+ * 这样遍历内存表和磁盘 IO 不会交错进行 */
+typedef struct {
+    char   *data;
+    size_t  len;
+    size_t  cap;
+} snap_buf_t;
+
+/* 确保缓冲剩余空间够 need 字节，不够就按 2 倍扩容 */
+static int snap_buf_reserve(snap_buf_t *b, size_t need)
+{
+    if (b->len + need <= b->cap) return 0;
+
+    size_t cap = b->cap ? b->cap : 4096;
+    while (cap < b->len + need) cap <<= 1;
+
+    char *p = (char *)realloc(b->data, cap);
+    if (!p) return -1;
+
+    b->data = p;
+    b->cap = cap;
     return 0;
 }
+
+/* 追加一行原始文本（段落标记用，如 "# hash\n"） */
+static int snap_buf_line(snap_buf_t *b, const char *line)
+{
+    size_t len = strlen(line);
+    if (snap_buf_reserve(b, len) < 0) return -1;
+
+    memcpy(b->data + b->len, line, len);
+    b->len += len;
+    return 0;
+}
+
+/* 追加一个 token：$len\r\ndata\r\n（带显式长度，供锁外格式化打包副本用） */
+static int snap_buf_token_n(snap_buf_t *b, const char *data, size_t len)
+{
+    if (!data) return -1;
+
+    /* 预留够：$ + 长度数字 + \r\n + 内容 + \r\n */
+    if (snap_buf_reserve(b, len + 32) < 0) return -1;
+
+    int n = snprintf(b->data + b->len, b->cap - b->len, "$%zu\r\n", len);
+    if (n < 0) return -1;
+    b->len += (size_t)n;
+
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    b->data[b->len++] = '\r';
+    b->data[b->len++] = '\n';
+    return 0;
+}
+
+/* ===== 锁内打包：临界区里只做 memcpy，格式化/CRC 全部推迟到锁外 =====
+ * 打包格式：条目的 key/value 以"原文 + 结尾 NUL"紧凑排列，
+ * 锁外靠 NUL 顺序解析，天然自描述，无需长度头 */
+
+/* 锁内拷贝一个字符串（含结尾 NUL），无任何格式化 */
+static int snap_pack_str(snap_buf_t *b, const char *s)
+{
+    if (!s) return -1;
+
+    size_t len = strlen(s) + 1;             /* 连结尾 NUL 一起拷 */
+    if (snap_buf_reserve(b, len) < 0) return -1;
+
+    memcpy(b->data + b->len, s, len);
+    b->len += len;
+    return 0;
+}
+
 
 /* CRC32 值格式化为 8 位十六进制字符串（方便存入SNAP/AOF文件中） */
 static const char *crc32_to_hex(uint32_t crc) {
@@ -266,20 +331,17 @@ static const char *crc32_to_hex(uint32_t crc) {
     return hexbuf;
 }
 
-/* 底层函数 */
-int save_snapshot_hash(const char *filename) {
-    FILE *fp = fopen(filename, "a");
-    if (!fp) return -1;
-    
-    fprintf(fp, "# hash\n");
+/* 锁内遍历 hash 表，把条目原文拷进打包缓冲（不格式化、不算 CRC）
+ * 调用方需持 g_data_lock 读锁 */
+static int snap_pack_hash(snap_buf_t *b) {
     int i = 0;
     for (i = 0; i < global_hash.max_slots; i++) {
         hashnode_t *node = global_hash.nodes[i];
         while (node != NULL) {
-            write_token(fp, node->key);
-            write_token(fp, node->value);
-            /* 每条 KV 末尾内联 CRC 校验值：$8\r\n<8位hex>\r\n */
-            write_token(fp, crc32_to_hex(crc32_calc_snap(node->key, node->value)));
+            if (snap_pack_str(b, node->key) < 0 ||
+                snap_pack_str(b, node->value) < 0) {
+                return -1;
+            }
             node = node->next;
         }
     }
@@ -288,34 +350,117 @@ int save_snapshot_hash(const char *filename) {
     for (i = 0; global_hash.rehash_nodes && i < global_hash.rehash_slots; i++) {
         hashnode_t *node = global_hash.rehash_nodes[i];
         while (node != NULL) {
-            write_token(fp, node->key);
-            write_token(fp, node->value);
-            write_token(fp, crc32_to_hex(crc32_calc_snap(node->key, node->value)));
+            if (snap_pack_str(b, node->key) < 0 ||
+                snap_pack_str(b, node->value) < 0) {
+                return -1;
+            }
             node = node->next;
         }
     }
+    return 0;
+}
 
+/* 锁外：把打包缓冲（NUL 分隔的条目原文流）解析并格式化成 token 文本
+ * [p, end) 为一个引擎段的打包数据；CRC 在这里算（读的是锁内拷出的副本） */
+static int snap_fmt_packed(snap_buf_t *b, const char *p, const char *end)
+{
+    while (p < end) {
+        const char *key = p;
+        p += strlen(p) + 1;                     /* 跳过 key 原文 */
+        if (p >= end) return -1;                /* 缺 value，数据损坏 */
+        const char *val = p;
+        p += strlen(p) + 1;                     /* 跳过 value 原文 */
+        if (p > end) return -1;
+
+        if (snap_buf_token_n(b, key, strlen(key)) < 0 ||
+            snap_buf_token_n(b, val, strlen(val)) < 0 ||
+            snap_buf_token_n(b, crc32_to_hex(crc32_calc_snap(key, val)), 8) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* 把 hash 全量格式化进内存缓冲（save_snapshot_* 单线程路径用）
+ * 内部同样走"先打包再格式化"，遍历逻辑只保留一份 */
+static int snap_format_hash(snap_buf_t *b) {
+    snap_buf_t packed = {0};
+    if (snap_pack_hash(&packed) != 0) {
+        free(packed.data);
+        return -1;
+    }
+
+    int ret = (snap_buf_line(b, "# hash\n") != 0) ? -1 :
+              snap_fmt_packed(b, packed.data, packed.data + packed.len);
+    free(packed.data);
+    return ret;
+}
+
+/* 底层函数 */
+int save_snapshot_hash(const char *filename) {
+    snap_buf_t b = {0};
+    if (snap_format_hash(&b) != 0) {
+        free(b.data);
+        return -1;
+    }
+
+    FILE *fp = fopen(filename, "a");
+    if (!fp) {
+        free(b.data);
+        return -1;
+    }
+    if (b.len > 0) fwrite(b.data, 1, b.len, fp);
     fclose(fp);
+    free(b.data);
+
     LOG_INFO("[PERSIST] Snapshot hash saved to %s\n", filename);
     return 0;
 }
 
-int save_snapshot_skiptable(const char *filename) {
-    FILE *fp = fopen(filename, "a");
-    if (!fp) return -1;
-    
-    fprintf(fp, "# skiptable\n");
-    
+/* 锁内遍历 skiptable，条目原文拷进打包缓冲
+ * 调用方需持 g_data_lock 读锁 */
+static int snap_pack_skiptable(snap_buf_t *b) {
     kvs_node_t *curr = global_skiptable.header->forward[0];
     while (curr != NULL) {
-        write_token(fp, curr->key);
-        write_token(fp, curr->value);
-        /* 每条 KV 末尾内联 CRC 校验值 */
-        write_token(fp, crc32_to_hex(crc32_calc_snap(curr->key, curr->value)));
+        if (snap_pack_str(b, curr->key) < 0 ||
+            snap_pack_str(b, curr->value) < 0) {
+            return -1;
+        }
         curr = curr->forward[0];
     }
-    
+    return 0;
+}
+
+/* 把 skiptable 全量格式化进内存缓冲（save_snapshot_* 单线程路径用） */
+static int snap_format_skiptable(snap_buf_t *b) {
+    snap_buf_t packed = {0};
+    if (snap_pack_skiptable(&packed) != 0) {
+        free(packed.data);
+        return -1;
+    }
+
+    int ret = (snap_buf_line(b, "# skiptable\n") != 0) ? -1 :
+              snap_fmt_packed(b, packed.data, packed.data + packed.len);
+    free(packed.data);
+    return ret;
+}
+
+int save_snapshot_skiptable(const char *filename) {
+    snap_buf_t b = {0};
+    if (snap_format_skiptable(&b) != 0) {
+        free(b.data);
+        return -1;
+    }
+
+    FILE *fp = fopen(filename, "a");
+    if (!fp) {
+        free(b.data);
+        return -1;
+    }
+    if (b.len > 0) fwrite(b.data, 1, b.len, fp);
     fclose(fp);
+    free(b.data);
+
     LOG_INFO("[PERSIST] Snapshot skiptable saved to %s\n", filename);
     return 0;
 }
@@ -545,6 +690,8 @@ int persistence_reset_aof(void)
 // 退出清理：进程退出时清理 AOF 子系统。
 void persistence_shutdown(void)
 {   
+    persist_snap_stop();          /* 先关 SNAP 落盘通道并写完最后一批 */
+
     // 先关闭uring
     if (g_aof_uring) {
         kvs_uring_shutdown(g_aof_uring);
@@ -555,6 +702,187 @@ void persistence_shutdown(void)
         close(g_aof_fd);
         g_aof_fd = -1;
     }
+}
+
+
+/* =============================================================
+ * SNAP 异步保存通道：由 SAVE 命令触发，走独立 io_uring 落盘
+ * ============================================================= */
+
+static int            g_snap_fd = -1;           /* SNAP 文件 fd，进程内常开 */
+static kvs_uring_t   *g_snap_uring = NULL;      /* 快照专用 uring 实例 */
+static pthread_t      g_snap_tid;               /* 保存线程：拷贝/拼接/落盘全在这 */
+static volatile int   g_snap_run = 0;           /* 保存线程运行标志 */
+static volatile int   g_snap_saving = 0;        /* 1=有一轮保存未完成（防重入） */
+static pthread_mutex_t g_snap_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_snap_cond = PTHREAD_COND_INITIALIZER;
+
+/* 全局数据锁：写命令持写锁，读命令/快照遍历持读锁 */
+pthread_rwlock_t g_data_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* 构建整份快照 → 交给 io_uring 异步写盘 → 等本轮写完
+ * 只在保存线程里被串行调用，天然无并发重入问题
+ * 锁内只做原文拷贝（pack），格式化/CRC 全在锁外（fmt）：
+ * 写命令被读写锁挡住的时间被压缩到最短 */
+static int snap_do_save(void)
+{
+    snap_buf_t packed = {0};    /* 锁内打包缓冲：条目原文紧凑排列 */
+    snap_buf_t b = {0};         /* 锁外格式化缓冲：最终快照文本 */
+    size_t hash_end = 0;
+    int ret = 0;
+
+    /* ① 锁内：只遍历 + memcpy。持读锁与写命令的写锁互斥，
+     *    保证快照看到完整一致的表，临界区时间最小化 */
+    DATA_RLOCK();
+    if (snap_pack_hash(&packed) != 0) {
+        ret = -1;
+    } else {
+        hash_end = packed.len;                  /* hash 段结束偏移 */
+        if (snap_pack_skiptable(&packed) != 0) ret = -1;
+    }
+    DATA_UNLOCK();
+
+    /* ② 锁外：写命令已放行，慢慢解析 + CRC + 格式化 */
+    if (ret == 0) {
+        if (snap_buf_line(&b, "# hash\n") != 0 ||
+            snap_fmt_packed(&b, packed.data, packed.data + hash_end) != 0 ||
+            snap_buf_line(&b, "# skiptable\n") != 0 ||
+            snap_fmt_packed(&b, packed.data + hash_end, packed.data + packed.len) != 0) {
+            ret = -1;
+        }
+    }
+    free(packed.data);
+
+    size_t total = b.len;
+
+    if (ret == 0 && total > 0) {
+        ret = kvs_uring_rewrite(g_snap_uring, b.data, total);
+        if (ret == 0) {
+            /* 等本轮写完，避免两轮 rewrite 交错截断文件 */
+            ret = kvs_uring_flush(g_snap_uring);
+        }
+    }
+
+    free(b.data);
+
+    if (ret == 0) {
+        LOG_DEBUG("[SNAP] 异步保存完成：%zu 字节\n", total);
+    } else {
+        LOG_ERROR("[SNAP] 异步保存失败\n");
+    }
+    return ret;
+}
+
+/* 保存线程：SAVE 命令只负责唤醒，拷贝/拼接/落盘全部在这里执行
+ * 命令线程因此完全不被保存工作占用 */
+static void *snap_save_worker(void *arg)
+{
+    (void)arg;
+
+    while (g_snap_run) {
+        /* 等 SAVE 命令唤醒（g_snap_saving 已由命令线程置位）
+         * while 循环防虚假唤醒，同时兼顾退出标志 */
+        pthread_mutex_lock(&g_snap_mutex);
+        while (g_snap_run && !g_snap_saving) {
+            pthread_cond_wait(&g_snap_cond, &g_snap_mutex);
+        }
+        pthread_mutex_unlock(&g_snap_mutex);
+        if (!g_snap_run) break;
+
+        snap_do_save();     /* 完整一轮：锁内 pack → 锁外 fmt → uring 落盘 */
+
+        pthread_mutex_lock(&g_snap_mutex);
+        g_snap_saving = 0;  /* 本轮结束，放行下一次 SAVE 请求 */
+        pthread_mutex_unlock(&g_snap_mutex);
+    }
+    return NULL;
+}
+
+/**
+ * @name 初始化 SNAP 落盘通道（常开 fd + io_uring 实例 + 保存线程）
+ * 主机/从机：snap 模式下 init 阶段调用；
+ * 从机全量同步（.tmp 加载）后需 stop→start 重建，让 fd 指向新快照文件。
+ * 拷贝/拼接/落盘全部在保存线程执行，SAVE 命令只发信号唤醒。
+ */
+int persist_snap_start(void)
+{
+    if (!g_config.snap_enable) return 0;   /* 非 SNAP 模式不启用 */
+    if (g_snap_uring) return 0;            /* 已经启动过 */
+
+    /* SNAP 文件常开：io_uring 需要固定的 fd 做写入 */
+    g_snap_fd = open(SNAP_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (g_snap_fd < 0) {
+        LOG_ERROR("[SNAP] open %s failed: %s\n", SNAP_FILE, strerror(errno));
+        return -errno;
+    }
+
+    int ret = kvs_uring_init(&g_snap_uring, g_snap_fd, 0);
+    if (ret < 0) {
+        LOG_ERROR("[SNAP] io_uring init failed: %s\n", strerror(-ret));
+        close(g_snap_fd);
+        g_snap_fd = -1;
+        return ret;
+    }
+
+    /* 保存线程：pack/fmt/落盘全在后台 */
+    g_snap_run = 1;
+    if (pthread_create(&g_snap_tid, NULL, snap_save_worker, NULL) != 0) {
+        LOG_ERROR("[SNAP] create save thread failed\n");
+        g_snap_run = 0;
+        kvs_uring_shutdown(g_snap_uring);
+        g_snap_uring = NULL;
+        close(g_snap_fd);
+        g_snap_fd = -1;
+        return -1;
+    }
+
+    LOG_INFO("[SNAP] 落盘通道已就绪（后台线程执行保存，SAVE 仅唤醒）\n");
+    return 0;
+}
+
+/* 关闭 SNAP 落盘通道：先停保存线程（等它做完手头这轮），再 flush + 关 fd
+ * 从机全量同步 rename 前必须调用：否则线程还攥着旧 fd 在写 */
+void persist_snap_stop(void)
+{
+    if (g_snap_run) {
+        g_snap_run = 0;
+        pthread_mutex_lock(&g_snap_mutex);
+        pthread_cond_signal(&g_snap_cond);  /* 唤醒线程使其看到退出标志 */
+        pthread_mutex_unlock(&g_snap_mutex);
+        /* join：若此刻线程正在保存，会等这轮完整做完，fd 保证无人再用 */
+        pthread_join(g_snap_tid, NULL);
+    }
+
+    if (g_snap_uring) {
+        kvs_uring_flush(g_snap_uring);      /* 把最后一批写完 */
+        kvs_uring_shutdown(g_snap_uring);
+        g_snap_uring = NULL;
+    }
+
+    if (g_snap_fd >= 0) {
+        close(g_snap_fd);
+        g_snap_fd = -1;
+    }
+}
+
+/* SAVE 命令入口：只占任务槽 + 唤醒保存线程，立即返回
+ * 返回 0 = 已受理（后台保存中），不保证此刻已落盘
+ * 后台忙（上一轮未完）则跳过本轮——后一轮快照天然更新，无损失 */
+int persist_snap_request(void)
+{
+    if (!g_config.snap_enable) return 0;
+    if (!g_snap_uring) return -1;
+
+    pthread_mutex_lock(&g_snap_mutex);
+    if (g_snap_saving) {
+        pthread_mutex_unlock(&g_snap_mutex);
+        LOG_DEBUG("[SNAP] 上一次保存尚未结束，跳过本次请求\n");
+        return 0;
+    }
+    g_snap_saving = 1;                      /* 占住任务槽 */
+    pthread_cond_signal(&g_snap_cond);      /* 唤醒保存线程 */
+    pthread_mutex_unlock(&g_snap_mutex);
+    return 0;
 }
 
 
