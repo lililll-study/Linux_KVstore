@@ -58,6 +58,7 @@ static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ar
 
 static char g_batch[EBPF_BATCH_SIZE];
 static int  g_batch_len;
+static u64  g_batch_cnt;      /* 当前 batch 缓冲内的条数，发送成功后才并入 g_forwarded */
 static u64  g_lost_seen;      /* 上次看到的 ringbuf 丢弃计数，用于只报新增 */
 
 
@@ -138,10 +139,22 @@ static int batch_flush(void)
     if (g_batch_len <= 0) return 0;
 
     int len = g_batch_len;
+    u64 cnt = g_batch_cnt;      /* 本批条数：发送成功才计入"已转发" */
     g_batch_len = 0;
+    g_batch_cnt = 0;
 
-    /* 从机通道未登记：无处可发（全量同步尚未开始/从机已断开） */
-    if (g_slave_fd <= 0) return 0;
+    /* 从机通道未登记：无处可发（全量同步尚未开始/从机已断开），整批丢弃
+     * 提示做累计打印：poll 循环每轮都 flush，单机写入时逐条打会刷爆日志
+     * （首次丢批打一条，之后每累计 1MB 提醒一次） */
+    if (g_slave_fd <= 0) {
+        static u64 drop_total = 0;
+        u64 prev = drop_total;
+        drop_total += len;
+        if (prev == 0 || (drop_total >> 20) != (prev >> 20))
+            LOG_DEBUG("[EBPF] 从机未连接，累计丢弃 %llu 字节",
+                      (unsigned long long)drop_total);
+        return 0;
+    }
 
     int sent = 0;
     while (sent < len) {
@@ -152,6 +165,8 @@ static int batch_flush(void)
         }
         sent += n;
     }
+
+    g_forwarded += cnt;         /* 整批真正发出，才更新转发计数 */
     return 0;
 }
 
@@ -233,12 +248,14 @@ static int poll_event(void *ctx, void *data, size_t len)
 
     memcpy(g_batch + g_batch_len, one, n);
     g_batch_len += n;
+    g_batch_cnt++;
 
-    g_forwarded++;
-    if ((g_forwarded % 1000) == 0)
-        LOG_DEBUG("[EBPF] 已转发 %llu 条（累计捕获 %llu 条）",
-                  (unsigned long long)g_forwarded,
-                  (unsigned long long)g_captured);
+    /* 进度打印挂在逐条递增的捕获计数上；g_forwarded 只统计真正 send 出去的条数
+     * （从机未连接时保持 0，日志能如实反映"捕获了但没转发"） */
+    if ((g_captured % 10000) == 0)
+        LOG_DEBUG("[EBPF] 累计捕获 %llu 条，已真正转发 %llu 条",
+                  (unsigned long long)g_captured,
+                  (unsigned long long)g_forwarded);
     return 0;
 }
 
