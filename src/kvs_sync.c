@@ -45,15 +45,10 @@ void init_aof_sync_ctx(void) {
 }
 #endif
 
-// ===== 统一的同步上下文（含心跳） =====
-typedef struct {
-    int fd;
-    int is_active;
-    pthread_t recv_thread;
-} snap_sync_ctx_t;
-static snap_sync_ctx_t g_snap_ctx  = {0};
-
-static int g_slave_incr_fd = -1;   /* 主机侧：从机复用的增量连接 fd（SYNC 命令所在连接） */
+static int g_slave_incr_fd = -1;   /* 主机侧：从机复用的增量连接 fd（SYNC 命令所在连接）
+                                    * ⚠ 与 kvs_ebpf.c 的 g_slave_fd 指向同一条连接：
+                                    *   两处各自独立登记（都在收到 SYNC 命令时），
+                                    *   改动任意一处的登记逻辑需同步评估另一处 */
 
 int safe_send(int fd, const char* data, int len) {
     int total = 0;
@@ -74,6 +69,34 @@ int safe_send(int fd, const char* data, int len) {
         total += n;
     }
     return total;
+}
+
+/* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
+ * 与 eBPF 转发互斥（net.forward=true 时主机不挂载 eBPF）。
+ * 全量同步窗口期间从机接收线程尚未就绪，数据会先堆在 socket 缓冲，
+ * 就绪后被自动消费——语义上等价于 eBPF 模式的"窗口缓存补发"。 */
+void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
+    if (!g_config.net_forward || !g_is_master || g_slave_incr_fd <= 0) return;
+
+    static char fwd_buf[512];   // 单条命令缓冲（本工程 key/value 均为短串）
+    int n;
+    if (value) {
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd, strlen(key), key, strlen(value), value);
+    } else if (key) {
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd, strlen(key), key);
+    } else {
+        /* 无参命令（SAVE）：*1 单元素数组 */
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*1\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd);
+    }
+    if (n > 0 && n < (int)sizeof(fwd_buf)) {
+        safe_send(g_slave_incr_fd, fwd_buf, n);
+    }
 }
 
 // ===== 从节点接收aof--超时5s自动发心跳 =====
@@ -103,115 +126,6 @@ static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {
     return recv(fd, buf, len, 0);
 }
 
-// ===== 主节点：把本地文件内容循环发送给 fd，末尾追加 end_marker =====
-int send_file_content(int fd, const char *filepath, long max_bytes, const char *end_marker) {
-    if (!filepath || !end_marker) return -1;
-
-    struct stat st;
-    if (stat(filepath, &st) != 0) {
-        SYNC_ERR("stat %s failed", filepath);
-        return -1;
-    }
-
-    long to_send = st.st_size;
-    if (max_bytes > 0 && max_bytes < to_send) to_send = max_bytes;
-    if (to_send > 0) {
-        FILE *fp = fopen(filepath, "rb");
-        if (!fp) { SYNC_ERR("open %s failed", filepath); return -1; }
-
-        char buf[1024];
-        long sent_total = 0;
-        size_t n;
-        while (sent_total < to_send &&
-               (n = fread(buf, 1, (to_send - sent_total) < (long)sizeof(buf)
-                                 ? (size_t)(to_send - sent_total) : sizeof(buf), fp)) > 0) {
-            if (safe_send(fd, buf, n) < 0) {
-                SYNC_ERR("send content failed");
-                fclose(fp);
-                return -1;
-            }
-            sent_total += n;
-        }
-        fclose(fp);
-        SYNC_LOG_M("Sent %ld bytes from %s (limit=%ld)", sent_total, filepath, to_send);
-    }
-
-    if (safe_send(fd, end_marker, strlen(end_marker)) < 0) {
-        SYNC_ERR("send marker failed");
-        return -1;
-    }
-    return 0;
-}
-
-// ===== 从节点：循环接收内容写入 filepath，遇到 end_marker 停止并截断 =====
-int recv_file_content(int fd, const char *filepath, const char *end_marker) {
-    if (!filepath || !end_marker) return -1;
-
-    FILE *fp = fopen(filepath, "wb");
-    if (!fp) {
-        SYNC_ERR("open %s failed", filepath);
-        return -1;
-    }
-
-    char buf[1024];
-    int total = 0;
-    int end_received = 0;
-    char tail[64] = {0};
-    int tail_len = 0;
-    int end_len = strlen(end_marker);
-
-    if (end_len >= (int)sizeof(tail)) {
-        SYNC_ERR("end_marker too long");
-        fclose(fp);
-        return -1;
-    }
-
-    while (!end_received) {
-        int n = recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            SYNC_ERR("recv failed or peer closed");
-            fclose(fp);
-            return -1;
-        }
-
-        fwrite(buf, 1, n, fp);
-        total += n;
-
-        int i;
-        for (i = 0; i < n; i++) {
-            if (tail_len < (int)sizeof(tail) - 1) {
-                tail[tail_len++] = buf[i];
-                tail[tail_len] = '\0';
-            } else {
-                memmove(tail, tail + 1, sizeof(tail) - 2);
-                tail[sizeof(tail) - 2] = buf[i];
-                tail[sizeof(tail) - 1] = '\0';
-            }
-            if (tail_len >= end_len &&
-                strcmp(tail + tail_len - end_len, end_marker) == 0) {
-                end_received = 1;
-                break;
-            }
-        }
-    }
-
-    fclose(fp);
-
-    /* 截掉末尾的 end_marker */
-    struct stat st;
-    if (stat(filepath, &st) == 0 && st.st_size >= end_len) {
-        truncate(filepath, st.st_size - end_len);
-    }
-
-    SYNC_LOG_S("Received %d bytes, saved to %s", total - end_len, filepath);
-    return 0;
-}
-
-// ===== 主节点：判断是不是从机的 SAVE 请求 =====
-int is_slave_save(int fd) {
-    return (g_snap_ctx.is_active && g_snap_ctx.fd == fd);
-}
-
 // ===== 主节点： fd 是否为同步（复制）连接 =====
 int is_sync_peer(int fd) {
     if (fd < 0) return 0;
@@ -219,7 +133,6 @@ int is_sync_peer(int fd) {
     if (g_aof_ctx.is_active && g_aof_ctx.fd == fd) return 1;
     #endif
     if (g_is_master && g_slave_incr_fd == fd) return 1;   /* 主机侧：从机增量连接 */
-    if (g_snap_ctx.is_active && g_snap_ctx.fd == fd) return 1;
     return 0;
 }
 
@@ -419,6 +332,10 @@ static void slave_recv_temp(int fd) {
 
     /* 加载全量数据：.tmp 与快照格式相同，改名为本地快照后直接加载
      * 副作用是从机留下一份 SNAP_FILE 本地快照，重启也能恢复 */
+    /* 重新同步会用新文件替换 SNAP：先停掉旧的保存通道，
+     * 否则 io_uring 的 fd 还指向被 rename 掉的旧文件，后续保存全写丢 */
+    persist_snap_stop();
+
     if (rename(TEMP_FILE, SNAP_FILE) != 0) {
         SYNC_ERR("rename %s to %s failed", TEMP_FILE, SNAP_FILE);
         close(fd);
@@ -430,6 +347,13 @@ static void slave_recv_temp(int fd) {
         return;
     }
     SYNC_LOG_S("full data loaded from %s", SNAP_FILE);
+
+    /* 全量数据已就绪：重建 SNAP 落盘通道（fd 指向新快照文件，
+     * 之后主机转发来的 SAVE 命令由此通道落盘）
+     * 放在 load 之后、增量线程之前：避免把空表/半截数据存成快照 */
+    if (persist_snap_start() != 0) {
+        SYNC_ERR("[SNAP] async save start failed");
+    }
 
     /* 先起增量接收线程：保证主机收到 FINISHED 后立刻补发的窗口缓存有人读
      * （eBPF 在收到 SYNC-FINISHED 的瞬间就会 flush，若从机还没在 recv 会压 TCP 缓冲） */
