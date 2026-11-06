@@ -33,7 +33,9 @@ static u64                     g_forwarded;
 
 /* ===== 三态机状态：正常转发 / 全量同步窗口缓存 / 冲刷补发 ===== */
 static volatile int g_in_sync = 0;      /* 1: 处于 SYNC~SYNC-FINISHED 窗口 */
-static volatile int g_slave_fd = -1;    /* 从机增量连接 fd，由 SYNC 事件赋值 */
+static volatile int g_slave_fd = -1;    /* 从机增量连接 fd，由 SYNC 事件赋值
+                                         * ⚠ 与 kvs_sync.c 的 g_slave_incr_fd 指向同一条连接：
+                                         *   两处各自独立登记，改动需同步评估 */
 
 /* 同步窗口缓存：窗口内主机新收到的写命令先存这里，FINISHED 后一次性补发 */
 #define EBPF_CACHE_MAX (64u << 20)      /* 64MB 上限（malloc 懒加载，实际只占用到量） */
@@ -66,7 +68,7 @@ static u64  g_lost_seen;      /* 上次看到的 ringbuf 丢弃计数，用于�
 static int ebpf_resp_format(char *buf, int cap,
                             const char *cmd, const char *key, const char *value)
 {
-    if (!buf || cap <= 0 || !cmd || !key) return -1;
+    if (!buf || cap <= 0 || !cmd) return -1;
 
     if (value) {
         return snprintf(buf, cap,
@@ -75,10 +77,16 @@ static int ebpf_resp_format(char *buf, int cap,
                         strlen(key), key,
                         strlen(value), value);
     }
+    if (key) {
+        return snprintf(buf, cap,
+                        "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                        strlen(cmd), cmd,
+                        strlen(key), key);
+    }
+    /* 无参命令（SAVE）：*1 单元素数组 */
     return snprintf(buf, cap,
-                    "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                    strlen(cmd), cmd,
-                    strlen(key), key);
+                    "*1\r\n$%zu\r\n%s\r\n",
+                    strlen(cmd), cmd);
 }
 
 /**
@@ -150,10 +158,11 @@ static int batch_flush(void)
 
 /**
  * @name ringbuf 的事件回调函数
- * 三态分发：
+ * 四态分发：
  *   EVT_SYNC_BEGIN → 登记从机通道 fd，进入缓存模式
  *   EVT_SYNC_END   → 退出缓存模式，把窗口内命令一次性补发给从机
  *   EVT_WRITE      → 缓存模式存入 g_cache；正常模式攒批发送
+ *   EVT_SAVE       → 同写命令路径转发（无 key，拼 *1 格式），从机收到后自行落盘
  */
 static int poll_event(void *ctx, void *data, size_t len)
 {
@@ -189,13 +198,13 @@ static int poll_event(void *ctx, void *data, size_t len)
         return 0;
     }
 
-    /* ===== 3. 写命令 ===== */
+    /* ===== 3. 写命令 / SAVE：只拼 RESP 不发送 ===== */
     if (e->truncated)
         LOG_WARN("[EBPF] 事件被截断，cmd=%s key=%s", e->cmd, e->key);
 
-    /* 只拼 RESP 不发送 */
     char one[4096];
-    int n = ebpf_resp_format(one, sizeof(one), e->cmd, e->key,
+    int n = ebpf_resp_format(one, sizeof(one), e->cmd,
+                             e->key_len > 0 ? e->key : NULL,
                              e->has_value ? e->value : NULL);
     if (n < 0) {
         LOG_ERROR("[EBPF] 命令过长无法拼包，丢弃 cmd=%s key=%s", e->cmd, e->key);
