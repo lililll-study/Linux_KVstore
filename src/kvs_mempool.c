@@ -442,17 +442,11 @@ static size_t _pool_trim(mempool_t *pool) {
     if (!pool || pool->sub_pools) return 0;
 
     size_t released_bytes = 0;          // 统计的是"退还物理页"的量
-    /* 定位链尾：chunks 是头插链，链尾即最早分配的启动首批段 */
-    mempool_chunk_t **last = &pool->chunks;
-    while (*last) last = &(*last)->next;
-
+    /* chunks 是头插链：链尾就是最早分配的启动首批段 */
     mempool_chunk_t **pp = &pool->chunks;
     while (*pp) {
         mempool_chunk_t *c = *pp;
-        if (pp == last) {               // 首批段常驻，跳过不还
-            pp = &c->next;
-            continue;
-        }
+        if (c->next == NULL) break;     // 到链尾（首批段）了：常驻不还，直接结束
         if (c->free_cnt == c->blocks) { // 整段空闲
             *pp = c->next;
             // 退物理页：RSS 下降；虚拟地址保留（VmSize 不变），spare 链囤着复用

@@ -13,10 +13,15 @@ ROOT="$(pwd)"
 
 MODE=${1:-pool}
 PORT=2000
-CONF=config/master.conf
 BIN=./build/kvstore
 TEST=./build/1_RESP_testcase
 LOG=/tmp/kvstore_$MODE.log
+
+# 测试专用配置：基于 master.conf 生成，强制关闭 eBPF
+# ringbuf 会固定吃掉 ~64MB RSS + ~128MB VSZ（内核分配时清零全部页），
+# 抬高所有状态的基线；内存池测试只关心池自身的增长/归还，须排除这个底噪
+CONF=config/mem_test.conf
+sed -e "s/^ebpf.enable=.*/ebpf.enable=false/" config/master.conf > "$CONF"
 
 # jemalloc 路径
 JEMALLOC=$(find /usr/lib /usr/local/lib -name "libjemalloc.so*" 2>/dev/null | head -1)
@@ -52,8 +57,10 @@ if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
 fi
 
 # ===== 1. 清数据，启动服务端 =====
+# 三种持久化产物全清（snap/aof/dat）+ 全量同步临时文件，
+# 否则启动时 load_snapshots 会把上次测试残留的数据加载进内存，污染 start 基线
 mkdir -p data logs
-rm -f data/*.aof data/*.dat
+rm -f data/*.aof data/*.dat data/*.snap data/.tmp
 
 if [ -n "$PRELOAD" ]; then
     LD_PRELOAD="$PRELOAD" $BIN --config $CONF > "$LOG" 2>&1 &
@@ -146,3 +153,6 @@ printf "%-14s %12s %12s\n" "after_trim"   "$AFTER_TRIM_VSZ"   "$AFTER_TRIM_RSS"
 # 追加到汇总文件
 echo "$MODE $START_VSZ $START_RSS $PEAK_VSZ $PEAK_RSS $AFTER_INSERT_VSZ $AFTER_INSERT_RSS $AFTER_DELETE_VSZ $AFTER_DELETE_RSS" \
     >> /tmp/mem_results.txt
+
+# 清理测试专用配置
+rm -f "$CONF"
