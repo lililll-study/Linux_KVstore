@@ -414,9 +414,14 @@ int kvs_uring_append(kvs_uring_t *ctx, const void *data, size_t len)
     return 0;
 }
 
-/* ===== 对外接口：截断 base 后追加命令+尾部（重写 AOF 文件尾 CRC） =====
- * 按队列顺序依次执行：FTRUNCATE(base) -> WRITE(data@base) -> WRITE(tail@base+len)
+/* ===== 对外接口：追加命令+尾部（重写 AOF 文件尾 CRC） =====
+ * 按队列顺序依次执行：WRITE(data@base) -> WRITE(tail@base+len)
  * base 为命令区末尾偏移（即旧 CRC 尾部起始），由调用方维护。
+ *
+ * 不做 FTRUNCATE：新记录 + 新尾部是连续写入 [base, base+len+tail_len)，
+ * 长度远大于旧尾部 20 字节，旧尾部被直接覆盖；FTRUNCATE 改文件大小会触发
+ * ext4 元数据日志事务（io_uring 也没有截断操作码，只能在 worker 里同步调用），
+ * 每条写命令一次会严重拖慢落盘速率、造成队列积压。
  */
 int kvs_uring_append_cmd(kvs_uring_t *ctx, const void *data, size_t len,
                          const void *tail, size_t tail_len, off_t base)
@@ -431,38 +436,28 @@ int kvs_uring_append_cmd(kvs_uring_t *ctx, const void *data, size_t len,
         return -err;
     }
 
-    /* 1. 截断到 base（去掉旧 CRC 尾部） */
-    kvs_uring_req_t *r_trunc = calloc(1, sizeof(*r_trunc));
-    if (!r_trunc) {
-        pthread_mutex_unlock(&ctx->mutex);
-        return -ENOMEM;
-    }
-    r_trunc->opcode = 1;                 // FTRUNCATE
-    r_trunc->offset = base;
-
-    /* 2. 命令数据 */
+    /* 1. 命令数据 */
     kvs_uring_req_t *r_data = calloc(1, sizeof(*r_data));
     if (!r_data) {
-        free(r_trunc);
         pthread_mutex_unlock(&ctx->mutex);
         return -ENOMEM;
     }
     r_data->data = malloc(len);
-    if (!r_data->data) { free(r_data); free(r_trunc); pthread_mutex_unlock(&ctx->mutex); return -ENOMEM; }
+    if (!r_data->data) { free(r_data); pthread_mutex_unlock(&ctx->mutex); return -ENOMEM; }
     memcpy(r_data->data, data, len);
     r_data->len = len;
     r_data->offset = base;
 
-    /* 3. CRC 尾部 */
+    /* 2. CRC 尾部 */
     kvs_uring_req_t *r_tail = calloc(1, sizeof(*r_tail));
     if (!r_tail) {
-        free(r_data->data); free(r_data); free(r_trunc);
+        free(r_data->data); free(r_data);
         pthread_mutex_unlock(&ctx->mutex);
         return -ENOMEM;
     }
     r_tail->data = malloc(tail_len);
     if (!r_tail->data) {
-        free(r_tail); free(r_data->data); free(r_data); free(r_trunc);
+        free(r_tail); free(r_data->data); free(r_data);
         pthread_mutex_unlock(&ctx->mutex);
         return -ENOMEM;
     }
@@ -471,14 +466,13 @@ int kvs_uring_append_cmd(kvs_uring_t *ctx, const void *data, size_t len,
     r_tail->offset = base + (off_t)len;
 
     /* 按序入队 */
-    if (ctx->tail) ctx->tail->next = r_trunc;
-    else ctx->head = r_trunc;
-    r_trunc->next = r_data;
+    if (ctx->tail) ctx->tail->next = r_data;
+    else ctx->head = r_data;
     r_data->next = r_tail;
     r_tail->next = NULL;
     ctx->tail = r_tail;
-    ctx->queued += 3;
-    ctx->submitted += 3;
+    ctx->queued += 2;
+    ctx->submitted += 2;
 
     ctx->next_offset = base + (off_t)len + (off_t)tail_len;
 

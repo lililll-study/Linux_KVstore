@@ -194,6 +194,25 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
         }
     }
 
+    /* redis-benchmark 兼容：SET/GET/DEL 未命中命令表时，映射到 hash 引擎命令。
+     * 注意不能直接改写 tokens[0]（它指向 malloc 的缓冲，resp_free_tokens 会
+     * free 每个 token，替换成字符串字面量会导致 free 非法指针而崩溃），
+     * 所以只改写本次匹配用的 cmd 下标。 */
+    if (cmd >= KVS_CMD_COUNT) {
+        const char *alias = NULL;
+        if      (strcmp(tokens[0], "SET") == 0) alias = "HSET";
+        else if (strcmp(tokens[0], "GET") == 0) alias = "HGET";
+        else if (strcmp(tokens[0], "DEL") == 0) alias = "HDEL";
+
+        if (alias != NULL) {
+            for (cmd = KVS_CMD_START; cmd < KVS_CMD_COUNT; cmd++) {
+                if (strcmp(alias, command[cmd]) == 0) {
+                    break;
+                }
+            }
+        }
+    }
+
     // 解析到错误token后，应该打印错误的token信息，然后跳过这条cmd命令，继续执行后续的。
     if (cmd >= KVS_CMD_COUNT) {
         // printf("[ERROR] unknown command token: '%s'\n", tokens[0]);
