@@ -293,7 +293,7 @@ sudo ./build/kvstore --config master.conf
 ./build/2_presist_testcase 127.0.0.1 2000 4
 ```
 
-## 三、主从同步
+## 三、主从同步测试及性能
 
 ```bash
 make clean
@@ -315,6 +315,26 @@ sudo ./build/kvstore --config slave.conf
 # 测试端：连从机，验证 10w
 ./build/3_sync_testcase 192.168.137.140 2000 3
 ```
+
+
+
+实时数据同步性能测试
+
+关闭SYNC，开启SYNC的ebpf，开启SYNC的网络转发
+
+QPS
+
+
+
+已有数据同步性能测试
+
+sendfile rdma iperf3-tcp
+
+吞吐量
+
+
+
+
 
 ## 四、数据校验
 
@@ -342,7 +362,9 @@ make reactor
 ./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
 ```
 
-## 五、内存池
+
+
+## 五、内存池测试及性能
 
 ```bash
 # ===== 步骤 1：无内存池 =====
@@ -366,62 +388,67 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 
 
+| VM/RSS (MB) | 无内存池          | 有内存池          | jemalloc     |
+| ----------- | ------------- | ------------- | ------------ |
+| **开始状态**    | 22.8 / 4.2    | 29.5 / 10.9   | 37.6 / 7.0   |
+| **峰值状态**    | 139.7 / 121.1 | 162.4 / 143.9 | 130.7 / 94.6 |
+| **结束状态**    | 137.7 / 119.1 | 160.3 / 15.4  | 130.7 / 13.8 |
+
+---
+
+
+
+
+
 
 
 # 性能数据
 
-## 1. 加入功能后的性能对比
-
-| 添加功能       | 添加前 QPS | 添加后 QPS | 提升倍数      | 备注             |
-| ---------- | ------- | ------- | --------- | -------------- |
-| 基础实现（单条写入） | -       | 1.68w   | -         | 阻塞 I/O         |
-| 管道化写入（批量）  | 1.68w   | 11.9w   | **7.1x**  | 减少网络 RTT       |
-| AOF 异步写入   | 11.9w   | 13.2w   | **1.11x** | 异步AOF降低损耗      |
-| 主从同步(aof)  | 13.2w   | 6.64w   | **0.51x** | AOF落盘+主从同步+crc |
-| 主从同步(snap) | 11.9w   | 11.4w   | **0.96x** | 几乎不影响          |
-
--------------------
-
-## 2. 内存池性能测试
 
 
-
-| **VM/RSS (MB)** | **无内存池**      | **有内存池**      | **jemalloc** |
-| --------------- | ------------- | ------------- | ------------ |
-| **开始状态**        | 6.2 / 4.1     | 12.7 / 10.6   | 20.6 / 6.8   |
-| **峰值状态**        | 120.3 / 118.3 | 142.5 / 140.5 | 111.6 / 92.3 |
-| **结束状态**        | 118.3 / 116.3 | 140.5 / 8.6   | 111.6 / 13.4 |
-
--------------------
-
-
-
-## 3、增量持久化--开启和关闭下的QPS测试
+## 1、增量持久化--QPS测试
 
 测试内容：向服务端插入 10w 条数据（HSET/SET），每条命令等服务端返回 OK 后再发下一条（单条收发，无管道），量出真实往返的 echo 性能。
 
-    --kvstore测试
-    #  aof 开关：修改 config/master.conf 中 aof.enable=true/false，重启服务生效
-    sudo ./build/kvstore --config master.conf
-    #  测试端执行（mode 8 = echo 写入 10w 条，engine 0 = Hash 引擎）
-    ./build/1_RESP_testcase 8 0
-    
-    --redis测试（对齐：10w 条 SET，单连接无管道，value 10 字节）
-    # redis关闭aof
-    redis-cli -p 6379 config set appendonly no
-    # redis开启aof
-    redis-cli -p 6379 config set appendonly yes
-    #查看当前aof状态
-    redis-cli -p 6379 config get appendonly
-    #  测试端执行
-    redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 -t SET -d 10
+```bash
+--kvstore测试
+# aof 开关：修改 config/master.conf 中 aof.enable=true/false，重启服务生效
+sudo ./build/kvstore --config master.conf
+
+# 测试端执行（mode 8 = echo 写入 10w 条，engine 0 = Hash 引擎）
+./build/1_RESP_testcase 8 0
+
+
+--redis测试（对齐：10w 条 SET，单连接无管道，value 10 字节）
+# redis关闭aof
+redis-cli -p 6379 config set appendonly no
+# redis开启aof 
+redis-cli -p 6379 config set appendonly yes
+#查看当前aof状态 
+redis-cli -p 6379 config get appendonly
+# 测试端执行 
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 -t SET -d 10
+```
+
+
+
+性能数据--优化前
 
 | 测试项目           | 关闭aof的QPS | 开启aof的QPS |
 | -------------- | --------- | --------- |
-| kvstore的echo测试 | 待实测      | 待实测     |
-| redis测试        | 待实测      | 待实测     |
+| kvstore的echo测试 | 8233.16   | 7795.45   |
+| redis测试        | 10410.16  | 8277.46   |
 
-> 注：此前数据为旧 PING 空往返方案所测（kvstore 8233.16/7795.45，redis 10410.16/8277.46），已废弃，改用上述 10w 条插入方案后重测更新。
+
+
+性能数据
+
+优化了开启aof的uring异步写入，从每条异步落盘改为攒16条再落盘。
+
+| 测试项目           | 关闭aof的QPS | 开启aof的QPS |
+| -------------- | --------- | --------- |
+| kvstore的echo测试 | 13841.0   | 13377.4   |
+| redis测试        | 8709.28   | 7074.14   |
 
 
 
@@ -429,64 +456,82 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 
 
-## 4、全量持久化--不同save间隔下的QPS测试
+## 2、全量持久化--QPS测试
 
-测试前提：服务端以 SNAP 模式启动（SAVE 只在 snap 模式有效）。SNAP 落盘没有定时线程，
-保存频率完全由测试脚本发的 SAVE 命令控制，不存在背景保存干扰。
+测试前提：服务端以 SNAP 模式启动（SAVE 只在 snap 模式有效）。
 
 SAVE 的异步语义：SAVE 命令只唤醒后台保存线程，立即返回 OK（=已受理，非已落盘）。
 数据拷贝（锁内遍历）、快照拼接、磁盘写入（io_uring）全部在后台线程执行，
-命令线程完全不被保存工作占用。写命令只会被"锁内拷贝"的 1~2ms 读锁短暂互斥——
-这是 QPS 残余损耗的唯一来源，四个 SAVE 档位预期基本拉平。
+命令线程完全不被保存工作占用。
 
-    # 共100w条数据,单条插入
-    
-    # 100W/SAVE
-    ./build/2_presist_testcase 127.0.0.1 2000 13 h
-    # 10W/SAVE
-    ./build/2_presist_testcase 127.0.0.1 2000 12 h
-    # 1W/SAVE
-    ./build/2_presist_testcase 127.0.0.1 2000 11 h
-    # 1k/SAVE
-    ./build/2_presist_testcase 127.0.0.1 2000 10 h
 
-| Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE  | 1K/SAVE   |
-| ------ | --------- | -------- | -------- | --------- |
-| QPS    | 待实测     | 待实测    | 待实测    | 待实测     |
-| 总耗时    | 待实测    | 待实测    | 待实测    | 待实测     |
 
-> 注：此前数据（2.25w/2.17w/1.23w/0.436w）为旧同步落盘方案所测，已废弃，待用异步方案重测更新。
+```bash
+# 共100w条数据,单条插入
+# 100W/SAVE
+./build/2_presist_testcase 127.0.0.1 2000 13 h
+# 10W/SAVE
+./build/2_presist_testcase 127.0.0.1 2000 12 h
+# 1W/SAVE
+./build/2_presist_testcase 127.0.0.1 2000 11 h
+# 1k/SAVE
+./build/2_presist_testcase 127.0.0.1 2000 10 h
+```
+
+优化前
+
+| Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE | 1K/SAVE |
+| ------ | --------- | -------- | ------- | ------- |
+| QPS    | 2.25w     | 2.17w    | 1.23w   | 0.436w  |
+| 总耗时s   | 44.2      | 46.1     | 81.5    | 229.3   |
+
+
+
+优化后：SAVE指令，全量落盘异步执行
+
+| Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE | 1K/SAVE |
+| ------ | --------- | -------- | ------- | ------- |
+| QPS    | 2.43w     | 2.37w    | 1.94w   | 1.89    |
+| 总耗时s   | 41.118    | 42.070   | 51.458  | 53.110  |
+
+
 
 -------------------
 
-## 5、批处理--QPS测试
+## 3、批处理--QPS测试
 
 共插10w条数据。
 
 批量10条，20条，40条，80条，160条的qps
 
 ```
-# 测试批量10条数据
-redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 10 -n 100000 -t ping -q
+KVSTORE
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 10 -n 100000 -t set -d 10 -r 100000
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 20 -n 100000 -t set -d 10 -r 100000
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 40 -n 100000 -t set -d 10 -r 100000
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 80 -n 100000 -t set -d 10 -r 100000
+redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 160 -n 100000 -t set -d 10 -r 100000
 
-# 测试批量20条数据
-redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 20 -n 100000 -t ping -q
 
-# 测试批量40条数据
-redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 40 -n 100000 -t ping -q
-
-# 测试批量80条数据
-redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 80 -n 100000 -t ping -q
-
-# 测试批量160条数据
-redis-benchmark -h 127.0.0.1 -p 2000 -c 1 -P 160 -n 100000 -t ping -q
+redis测试
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 10 -n 100000 -t SET -d 10
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 20 -n 100000 -t SET -d 10
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 40 -n 100000 -t SET -d 10
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 80 -n 100000 -t SET -d 10
+redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 160 -n 100000 -t SET -d 10
 ```
 
 
 
-|        | 批量10条 | 批量20条  | 批量40条  | 批量80条  | 批量160条  |
-| ------ | ----- | ------ | ------ | ------ | ------- |
-| SNAP模式 | 7.84w | 16.81w | 32.79w | 53.48w | 105.26w |
-| AOF模式  | 7.07w | 13.94w | 27.55w | 53.76w | 104.17w |
+优化前，是用PING测的数据，不具备对比价值
+
+
+
+优化后
+
+|         | 批量10条 | 批量20条  | 批量40条  | 批量80条  | 批量160条 |
+| ------- | ----- | ------ | ------ | ------ | ------ |
+| kvstore | 6.73w | 12.57w | 23.09w | 42.02w | 67.11w |
+| redis   | 6.38w | 12.97w | 22.88w | 40.32w | 62.11w |
 
 
