@@ -771,6 +771,34 @@ void delete_1m(int connfd) {
  * ============================================================ */
 #define ECHO_COUNT  100000
 
+/* 测速跑完后的清理：把本轮插入的 key 批量删掉再退出，
+ * 避免残留数据被下次测试的 load_snapshots 加载、污染内存基线。
+ * 这里不测性能，所以用管道化批量删（而非单条收发），越快越好 */
+static void echo_cleanup(int connfd, int engine_idx, int count) {
+    int cap = count * 80;            /* 每条 DEL 约 40 字节，留一倍余量 */
+    char *batch = malloc(cap);
+    char *resp  = malloc(cap);
+    if (!batch || !resp) {
+        free(batch);
+        free(resp);
+        return;
+    }
+
+    int blen = 0, i;
+    for (i = 0; i < count; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "%s_%06d", engine_name[engine_idx], i);
+        blen = append_resp_cmd(batch, blen, engine_del_cmd[engine_idx], key, NULL);
+    }
+
+    send_and_recv(connfd, batch, blen, resp, cap, count);
+    printf("[Echo cleanup] %-10s %d: 已删除本轮插入的 key\n",
+           engine_name[engine_idx], count);
+
+    free(batch);
+    free(resp);
+}
+
 void echo_insert(int connfd, int engine_idx, int count) {
     int i;
     char cmd[256];
@@ -808,6 +836,9 @@ done:
     printf("[Echo insert] %-10s %d: %d ms, qps=%d, pass=%d fail=%d\n",
            engine_name[engine_idx], count, time_used,
            count * 1000 / (time_used > 0 ? time_used : 1), pass, fail);
+
+    /* 性能数据已得出，删掉本轮插入的数据再退出 */
+    echo_cleanup(connfd, engine_idx, count);
 }
 
 /* ============================================================
