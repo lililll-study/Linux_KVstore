@@ -209,15 +209,15 @@ int recv_cb(int fd) {
     if (data_len == 0) { // 断开连接了
         // close(clientfd);
         printf("client disconnect: %d\n", fd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);   /* 必须先于 close：close 后按 fd 查表失败，DEL 会静默失效 */
         close(fd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);   // unfinished 
         conn_release(fd);
         cleanup_connection(fd);
         return 0;
     } else if (data_len < 0) {
         printf("count: %d, errno: %d, %s\n", data_len, errno, strerror(errno));
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);   /* 同上：先摘 epoll 注册再关闭 */
         close(fd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
         conn_release(fd);
         cleanup_connection(fd);
         return 0;

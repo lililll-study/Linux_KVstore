@@ -3,8 +3,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern kvs_hash_t   global_hash;
@@ -706,71 +708,176 @@ void persistence_shutdown(void)
 
 
 /* =============================================================
- * SNAP 异步保存通道：由 SAVE 命令触发，走独立 io_uring 落盘
+ * SNAP 异步保存通道：由 SAVE 命令触发，fork 子进程落盘（COW 快照）
  * ============================================================= */
 
-static int            g_snap_fd = -1;           /* SNAP 文件 fd，进程内常开 */
-static kvs_uring_t   *g_snap_uring = NULL;      /* 快照专用 uring 实例 */
-static pthread_t      g_snap_tid;               /* 保存线程：拷贝/拼接/落盘全在这 */
+static pthread_t      g_snap_tid;               /* 保存线程：fork/等子进程全在这 */
 static volatile int   g_snap_run = 0;           /* 保存线程运行标志 */
 static volatile int   g_snap_saving = 0;        /* 1=有一轮保存未完成（防重入） */
 static pthread_mutex_t g_snap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_snap_cond = PTHREAD_COND_INITIALIZER;
 
-/* 全局数据锁：写命令持写锁，读命令/快照遍历持读锁 */
+/* 全局数据锁：写命令持写锁，读命令持读锁 */
 pthread_rwlock_t g_data_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-/* 构建整份快照 → 交给 io_uring 异步写盘 → 等本轮写完
- * 只在保存线程里被串行调用，天然无并发重入问题
- * 锁内只做原文拷贝（pack），格式化/CRC 全在锁外（fmt）：
- * 写命令被读写锁挡住的时间被压缩到最短 */
+/* ===== 子进程侧：流式写盘（静态缓冲，全程禁 malloc/LOG/io_uring） =====
+ * fork 出的子进程持有 fork 瞬间的 COW 冻结镜像：
+ *   - 读 global_hash/global_skiptable 不用加锁（子进程单线程，内存不再变化）
+ *   - 禁 malloc/realloc：fork 时父进程其他线程可能正持 malloc 内部锁 → 子进程死锁
+ *   - 禁 LOG/stdio：同理，glibc 内部锁
+ *   - 禁 io_uring：ring 与父进程共享，子进程提交会互相踩
+ *   - 落盘用裸 write()，出错不 LOG，只置错误标志，由父进程统一报告 */
+
+#define SNAP_CHILD_BUF_SIZE (256 * 1024)
+
+static char   g_snap_cbuf[SNAP_CHILD_BUF_SIZE]; /* 子进程写盘缓冲（静态内存） */
+static size_t g_snap_clen = 0;                  /* 已占字节数 */
+static int    g_snap_cfd = -1;
+static int    g_snap_cerr = 0;                  /* 出错标志 */
+
+/* 把缓冲内数据全部写入文件（循环写，处理部分写入） */
+static void snap_child_flush(void)
+{
+    size_t off = 0;
+    while (off < g_snap_clen) {
+        ssize_t n = write(g_snap_cfd, g_snap_cbuf + off, g_snap_clen - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            g_snap_cerr = 1;
+            return;
+        }
+        off += (size_t)n;
+    }
+    g_snap_clen = 0;
+}
+
+/* 追加字节流，缓冲满先落盘 */
+static void snap_child_write(const char *data, size_t len)
+{
+    if (g_snap_cerr) return;
+    if (len > sizeof(g_snap_cbuf)) {            /* 单条超过整缓冲：防御 */
+        g_snap_cerr = 1;
+        return;
+    }
+    if (g_snap_clen + len > sizeof(g_snap_cbuf)) {
+        snap_child_flush();
+        if (g_snap_cerr) return;
+    }
+    memcpy(g_snap_cbuf + g_snap_clen, data, len);
+    g_snap_clen += len;
+}
+
+/* 输出一个 token：$len\r\ndata\r\n（格式与 snap_buf_token_n 完全一致） */
+static void snap_child_token(const char *s)
+{
+    if (g_snap_cerr) return;
+    char head[32];
+    int n = snprintf(head, sizeof(head), "$%zu\r\n", strlen(s));
+    if (n < 0) {
+        g_snap_cerr = 1;
+        return;
+    }
+    snap_child_write(head, (size_t)n);
+    snap_child_write(s, strlen(s));
+    snap_child_write("\r\n", 2);
+}
+
+/* 子进程遍历 hash 表并直接格式化输出（含渐进 rehash 表） */
+static void snap_child_save_hash(void)
+{
+    int i = 0;
+    for (i = 0; i < global_hash.max_slots; i++) {
+        hashnode_t *node = global_hash.nodes[i];
+        while (node != NULL) {
+            snap_child_token(node->key);
+            snap_child_token(node->value);
+            snap_child_token(crc32_to_hex(crc32_calc_snap(node->key, node->value)));
+            node = node->next;
+        }
+    }
+
+    for (i = 0; global_hash.rehash_nodes && i < global_hash.rehash_slots; i++) {
+        hashnode_t *node = global_hash.rehash_nodes[i];
+        while (node != NULL) {
+            snap_child_token(node->key);
+            snap_child_token(node->value);
+            snap_child_token(crc32_to_hex(crc32_calc_snap(node->key, node->value)));
+            node = node->next;
+        }
+    }
+}
+
+/* 子进程遍历 skiptable 并直接格式化输出 */
+static void snap_child_save_skiptable(void)
+{
+    kvs_node_t *curr = global_skiptable.header->forward[0];
+    while (curr != NULL) {
+        snap_child_token(curr->key);
+        snap_child_token(curr->value);
+        snap_child_token(crc32_to_hex(crc32_calc_snap(curr->key, curr->value)));
+        curr = curr->forward[0];
+    }
+}
+
+/* 子进程入口：冻结镜像 → 流式写 SNAP 文件 → _exit 带回退出码 */
+static void snap_child_save(void)
+{
+    int i;
+
+    /* 关闭从父进程继承的所有 fd（socket/epoll 等子进程用不到）：
+     * 不关的话，子进程会拖着这些 socket 的引用计数，
+     * 父进程关闭连接后 epoll 注册无法自动摘除，会残留出 recv EBADF 之类的怪问题。
+     * 0/1/2 保留，3 以上全部关闭；子进程随后自己 open 快照文件 */
+    for (i = 3; i < 1024; i++) {
+        close(i);
+    }
+
+    /* 子进程不响应退出信号：父进程收 Ctrl+C 时不能把写一半的保存一起带走 */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+
+    g_snap_cfd = open(SNAP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (g_snap_cfd < 0) _exit(1);
+
+    snap_child_write("# hash\n", strlen("# hash\n"));
+    snap_child_save_hash();
+    snap_child_write("# skiptable\n", strlen("# skiptable\n"));
+    snap_child_save_skiptable();
+
+    if (!g_snap_cerr) snap_child_flush();
+    if (!g_snap_cerr && fsync(g_snap_cfd) < 0) g_snap_cerr = 1;
+
+    close(g_snap_cfd);
+    _exit(g_snap_cerr ? 1 : 0);
+}
+
+/* 完整一轮保存：fork 子进程在 COW 冻结镜像上打包落盘
+ * 命令线程全程不受读写锁影响（只有 fork 瞬间毫秒级页表复制），
+ * 期间新 SAVE 请求按防重入语义跳过（后一轮快照天然更新） */
 static int snap_do_save(void)
 {
-    snap_buf_t packed = {0};    /* 锁内打包缓冲：条目原文紧凑排列 */
-    snap_buf_t b = {0};         /* 锁外格式化缓冲：最终快照文本 */
-    size_t hash_end = 0;
-    int ret = 0;
-
-    /* ① 锁内：只遍历 + memcpy。持读锁与写命令的写锁互斥，
-     *    保证快照看到完整一致的表，临界区时间最小化 */
-    DATA_RLOCK();
-    if (snap_pack_hash(&packed) != 0) {
-        ret = -1;
-    } else {
-        hash_end = packed.len;                  /* hash 段结束偏移 */
-        if (snap_pack_skiptable(&packed) != 0) ret = -1;
-    }
-    DATA_UNLOCK();
-
-    /* ② 锁外：写命令已放行，慢慢解析 + CRC + 格式化 */
-    if (ret == 0) {
-        if (snap_buf_line(&b, "# hash\n") != 0 ||
-            snap_fmt_packed(&b, packed.data, packed.data + hash_end) != 0 ||
-            snap_buf_line(&b, "# skiptable\n") != 0 ||
-            snap_fmt_packed(&b, packed.data + hash_end, packed.data + packed.len) != 0) {
-            ret = -1;
-        }
-    }
-    free(packed.data);
-
-    size_t total = b.len;
-
-    if (ret == 0 && total > 0) {
-        ret = kvs_uring_rewrite(g_snap_uring, b.data, total);
-        if (ret == 0) {
-            /* 等本轮写完，避免两轮 rewrite 交错截断文件 */
-            ret = kvs_uring_flush(g_snap_uring);
-        }
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("[SNAP] fork failed: %s\n", strerror(errno));
+        return -1;
     }
 
-    free(b.data);
-
-    if (ret == 0) {
-        LOG_DEBUG("[SNAP] 异步保存完成：%zu 字节\n", total);
-    } else {
-        LOG_ERROR("[SNAP] 异步保存失败\n");
+    if (pid == 0) {
+        snap_child_save();      /* 子进程：内部 _exit，不会返回 */
     }
-    return ret;
+
+    /* 保存线程阻塞等子进程结束（后台线程，不阻塞命令线程） */
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        LOG_ERROR("[SNAP] waitpid failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        LOG_DEBUG("[SNAP] fork 保存完成\n");
+        return 0;
+    }
+    LOG_ERROR("[SNAP] 子进程保存失败 status=%d\n", status);
+    return -1;
 }
 
 /* 保存线程：SAVE 命令只负责唤醒，拷贝/拼接/落盘全部在这里执行
@@ -799,49 +906,30 @@ static void *snap_save_worker(void *arg)
 }
 
 /**
- * @name 初始化 SNAP 落盘通道（常开 fd + io_uring 实例 + 保存线程）
+ * @name 初始化 SNAP 落盘通道（启动保存线程）
  * 主机/从机：snap 模式下 init 阶段调用；
- * 从机全量同步（.tmp 加载）后需 stop→start 重建，让 fd 指向新快照文件。
- * 拷贝/拼接/落盘全部在保存线程执行，SAVE 命令只发信号唤醒。
+ * 从机全量同步（.tmp 加载）后需 stop→start 重建。
+ * 每轮保存 fork 子进程执行（子进程自己 open 快照文件），SAVE 命令只发信号唤醒。
  */
 int persist_snap_start(void)
 {
     if (!g_config.snap_enable) return 0;   /* 非 SNAP 模式不启用 */
-    if (g_snap_uring) return 0;            /* 已经启动过 */
+    if (g_snap_run) return 0;              /* 已经启动过 */
 
-    /* SNAP 文件常开：io_uring 需要固定的 fd 做写入 */
-    g_snap_fd = open(SNAP_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (g_snap_fd < 0) {
-        LOG_ERROR("[SNAP] open %s failed: %s\n", SNAP_FILE, strerror(errno));
-        return -errno;
-    }
-
-    int ret = kvs_uring_init(&g_snap_uring, g_snap_fd, 0);
-    if (ret < 0) {
-        LOG_ERROR("[SNAP] io_uring init failed: %s\n", strerror(-ret));
-        close(g_snap_fd);
-        g_snap_fd = -1;
-        return ret;
-    }
-
-    /* 保存线程：pack/fmt/落盘全在后台 */
+    /* 保存线程：fork/等待子进程全在后台 */
     g_snap_run = 1;
     if (pthread_create(&g_snap_tid, NULL, snap_save_worker, NULL) != 0) {
         LOG_ERROR("[SNAP] create save thread failed\n");
         g_snap_run = 0;
-        kvs_uring_shutdown(g_snap_uring);
-        g_snap_uring = NULL;
-        close(g_snap_fd);
-        g_snap_fd = -1;
         return -1;
     }
 
-    LOG_INFO("[SNAP] 落盘通道已就绪（后台线程执行保存，SAVE 仅唤醒）\n");
+    LOG_INFO("[SNAP] 落盘通道已就绪（fork 子进程执行保存，SAVE 仅唤醒）\n");
     return 0;
 }
 
-/* 关闭 SNAP 落盘通道：先停保存线程（等它做完手头这轮），再 flush + 关 fd
- * 从机全量同步 rename 前必须调用：否则线程还攥着旧 fd 在写 */
+/* 关闭 SNAP 落盘通道：停保存线程（等它做完手头这轮，含子进程落盘）
+ * 从机全量同步 rename 前必须调用：否则可能有子进程还在写 SNAP 文件 */
 void persist_snap_stop(void)
 {
     if (g_snap_run) {
@@ -849,19 +937,8 @@ void persist_snap_stop(void)
         pthread_mutex_lock(&g_snap_mutex);
         pthread_cond_signal(&g_snap_cond);  /* 唤醒线程使其看到退出标志 */
         pthread_mutex_unlock(&g_snap_mutex);
-        /* join：若此刻线程正在保存，会等这轮完整做完，fd 保证无人再用 */
+        /* join：若此刻线程正在保存，会等 fork 子进程完整写完 */
         pthread_join(g_snap_tid, NULL);
-    }
-
-    if (g_snap_uring) {
-        kvs_uring_flush(g_snap_uring);      /* 把最后一批写完 */
-        kvs_uring_shutdown(g_snap_uring);
-        g_snap_uring = NULL;
-    }
-
-    if (g_snap_fd >= 0) {
-        close(g_snap_fd);
-        g_snap_fd = -1;
     }
 }
 
@@ -871,7 +948,7 @@ void persist_snap_stop(void)
 int persist_snap_request(void)
 {
     if (!g_config.snap_enable) return 0;
-    if (!g_snap_uring) return -1;
+    if (!g_snap_run) return -1;
 
     pthread_mutex_lock(&g_snap_mutex);
     if (g_snap_saving) {

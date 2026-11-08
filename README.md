@@ -314,6 +314,18 @@ sudo ./build/kvstore --config slave.conf
 
 # 测试端：连从机，验证 10w
 ./build/3_sync_testcase 192.168.137.140 2000 3
+
+
+./test/8_transfer_bench.sh server
+
+
+chmod +x test/8_transfer_bench.sh
+./test/8_transfer_bench.sh client 192.168.137.139
+
+
+sudo pkill -9 tcp_server
+sudo pkill -9 rdma_server
+sudo pkill -9 iperf3
 ```
 
 
@@ -491,8 +503,8 @@ SAVE 的异步语义：SAVE 命令只唤醒后台保存线程，立即返回 OK�
 
 | Hash引擎 | 100W/SAVE | 10W/SAVE | 1W/SAVE | 1K/SAVE |
 | ------ | --------- | -------- | ------- | ------- |
-| QPS    | 2.43w     | 2.37w    | 1.94w   | 1.89    |
-| 总耗时s   | 41.118    | 42.070   | 51.458  | 53.110  |
+| QPS    | 2.42w     | 2.41w    | 2.34w   | 2.34w   |
+| 总耗时s   | 41.459    | 41.474   | 42.74   | 42.697  |
 
 
 
@@ -524,8 +536,6 @@ redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 160 -n 100000 -t SET -d 10
 
 
 优化前，是用PING测的数据，不具备对比价值
-
-
 
 优化后
 
