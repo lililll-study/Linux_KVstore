@@ -93,6 +93,14 @@ int main(int argc, char *argv[]) {
     size_t total = type->total;
     printf("[RDMA server] header: total=%ld, magic=%x\n", type->total, type->magic);
 
+    /* header 已消费，立刻贴上第一块 chunk 的 RECV：
+     * open/ftruncate/mmap 耗时较长，若等它们做完才贴 RECV，
+     * 客户端第一块 SEND 会撞上“对端无接收缓冲”空窗，触发 RNR 报错 */
+    if (rdma_post_recv(id) != 0) {
+        fprintf(stderr, "rdma_post_recv failed\n");
+        return -1;
+    }
+
     int fd = open(outfile, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
         perror("open\n");
@@ -114,11 +122,6 @@ int main(int argc, char *argv[]) {
     size_t idx = 0;    // 当前写到文件的位置
     while (idx < total) {   // 没有读到末尾就循环
 
-        if (rdma_post_recv(id) != 0) {
-            fprintf(stderr, "rdma_post_recv failed\n");
-            return -1;
-        }
-
         if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
             perror("rdma_poll_wc || wc.opcode\n");
             return -1;
@@ -129,6 +132,16 @@ int main(int argc, char *argv[]) {
         if (wc.byte_len == 0 || wc.byte_len > remaining) {
             fprintf(stderr, "Invalid received length: %u\n", wc.byte_len);
             return -1;
+        }
+
+        /* 收完一块后先贴下一块 RECV 再 memcpy：
+         * memcpy 期间对端可能正在发下一块，提前补上接收缓冲避免 RNR 空窗；
+         * 最后一块不再贴（保持一发一收配对：初始1 + 预贴1 + 循环补99 = 101） */
+        if (idx + wc.byte_len < total) {
+            if (rdma_post_recv(id) != 0) {
+                fprintf(stderr, "rdma_post_recv failed\n");
+                return -1;
+            }
         }
 
         memcpy(p + idx, cm->rbuffer, wc.byte_len);

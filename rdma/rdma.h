@@ -188,7 +188,9 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
         }
 
         if (wc.status != IBV_WC_SUCCESS) {
-            perror("ibv_poll_cq\n");
+            /* 错误原因在 wc.status 里；errno 是历史遗留的过期值，perror 会误导排查 */
+            fprintf(stderr, "rdma_poll_wc: wc.status=%d (%s), opcode=%d\n",
+                    wc.status, ibv_wc_status_str(wc.status), wc.opcode);
             return -1;
         }
         
