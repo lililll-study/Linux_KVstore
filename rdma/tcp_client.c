@@ -101,6 +101,10 @@ int main(int argc, char *argv[]) {
     }
     printf("[tcp sendfile] connected to %s:%d\n", server_ip, TCP_SERVER_PORT);
 
+    /* 发送缓冲加大到 4MB：与接收端 SO_RCVBUF 对称，窗口偏小会限制单连接吞吐 */
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
     /* 发 header：与 RDMA 端相同格式 */
     file_header_t hdr = {0};
     hdr.magic = 0x12345678;

@@ -41,6 +41,21 @@ static int recv_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
+static int send_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("send");
+            return -1;
+        }
+        sent += n;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     const char *outfile = (argc > 1) ? argv[1] : "tcp_recv.bin";
 
@@ -74,6 +89,10 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     printf("[tcp server] client connected\n");
+
+    /* 接收缓冲加大到 4MB：单连接吞吐受 TCP 窗口限制，窗口太小会误判成链路慢 */
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(conn, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     /* 收 header */
     file_header_t hdr = {0};
@@ -116,11 +135,22 @@ int main(int argc, char *argv[]) {
     }
 
     free(buf);
+
+    /* 强制落盘后再回 ACK：对齐 RDMA server 的 msync(MS_SYNC) 口径。
+     * write() 只把数据写进页缓存，不 fsync 就回 ACK，测出的是"内存到内存"，
+     * 与 RDMA 的"内存到磁盘"不是同一件事，会被当成虚高数据 */
+    if (0 != fsync(fd)) {
+        perror("fsync");
+        return -1;
+    }
     close(fd);
 
-    /* 回 ACK（与 RDMA server 相同内容） */
-    if (0 != send(conn, "sync finished", sizeof("sync finished"), 0)) {
-        perror("send");
+    /* 回 ACK（与 RDMA server 相同内容）
+     * 注意：send() 返回实际发送的字节数，成功时不是 0；
+     * 用 "0 != send()" 判断会把成功误判成失败（perror 打的还是过期 errno，
+     * 于是出现 "send: Success" 这种自相矛盾的输出） */
+    if (0 != send_all(conn, "sync finished", sizeof("sync finished"))) {
+        perror("send_all");
         return -1;
     }
 

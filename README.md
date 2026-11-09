@@ -319,7 +319,7 @@ sudo ./build/kvstore --config slave.conf
 ./test/8_transfer_bench.sh server
 
 
-chmod +x test/8_transfer_bench.sh
+chmod +x rdma/rdma_client rdma/rdma_server rdma/tcp_client rdma/tcp_server
 ./test/8_transfer_bench.sh client 192.168.137.139
 
 
@@ -338,11 +338,16 @@ QPS
 
 
 
-已有数据同步性能测试
+优化前
 
-sendfile rdma iperf3-tcp
+| 传输方式                 | 吞吐量                                    | 说明                                  |
+| -------------------- | -------------------------------------- | ----------------------------------- |
+| RDMA（iwarp）          | 43.80 MB/s                             | 单块连发 + READY 握手 + 最终确认              |
+| TCP sendfile         | 367.49 MB/s                            | 零拷贝 sendfile + "sync finished" 落盘确认 |
+| iperf3 TCP 裸链路（上限参照） | 444 MB/s (3.73 Gbit/s)                 | 纯链路流量，不含应用层处理与落盘                    |
+| RDMA（soft-roce）      | 70.86 MB/s |                                     |
 
-吞吐量
+
 
 
 
@@ -541,7 +546,5 @@ redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 160 -n 100000 -t SET -d 10
 
 |         | 批量10条 | 批量20条  | 批量40条  | 批量80条  | 批量160条 |
 | ------- | ----- | ------ | ------ | ------ | ------ |
-| kvstore | 6.73w | 12.57w | 23.09w | 42.02w | 67.11w |
-| redis   | 6.38w | 12.97w | 22.88w | 40.32w | 62.11w |
-
-
+| kvstore | 6.73w | 12.57w | 23.09w | 42.32w | 70.11w |
+| redis   | 6.5w  | 13.4w  | 22.88w | 48.31w | 81.23w |

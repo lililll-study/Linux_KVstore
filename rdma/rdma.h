@@ -9,9 +9,13 @@
 
 #define RDMA_TIMEOUT_MS     2000
 #define RDMA_CQ_DEPTH       32
-#define RDMA_BUFFER_SIZE    1024 * 1024         /* 每块 1MB：块太大测不出传输梯度 */
+#define RDMA_BUFFER_SIZE    1024 * 1024 * 200       /* 每块 1MB：块太大测不出传输梯度 */
 
 #define RDMA_FILENAME       "bench_100m.bin"    /* 默认文件，可被命令行参数覆盖 */
+
+/* 同步开关：1 = 停等协议（每块等对端 ACK，可靠但每块一个往返）
+ *          0 = 连发模式（不等对端确认，测极限吞吐；对端没收缓冲时靠 RNR 重试兜底）*/
+#define ENABLE_RDMA_ACK     0
 
 typedef struct conn_manager_s {
 
@@ -116,7 +120,8 @@ static int rdma_alloc_buffer(struct rdma_cm_id *cm_id, struct ibv_pd *pd) {
     if (!cm->send_mr || !cm->recv_mr) return -1;
 
     cm_id->context = cm;
-
+    cm_id->context = cm;
+    return 0;
 }
 
 static int rdma_free_buffer(struct rdma_cm_id *cm_id) {
@@ -175,8 +180,10 @@ static int rdma_post_send(struct rdma_cm_id *cm_id, size_t length) {
     return ibv_post_send(cm_id->qp, &wr, &bad);
 }
 
-// push 一次等待结果返回
-static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
+// 轮询 CQ，直到取到指定类型（opcode）的完成事件
+// 停等协议下，本端 SEND 的完成和对端回包（READY/ACK）的 RECV 完成
+// 落在同一个 CQ 里；遇到类型不匹配的完成事件（自己 SEND 的通知）跳过继续等
+static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out, enum ibv_wc_opcode expect) {
 
     while (1) {
         struct ibv_wc wc;
@@ -188,12 +195,21 @@ static int rdma_poll_wc(struct ibv_cq *cq, struct ibv_wc *out) {
         }
 
         if (wc.status != IBV_WC_SUCCESS) {
-            /* 错误原因在 wc.status 里；errno 是历史遗留的过期值，perror 会误导排查 */
-            fprintf(stderr, "rdma_poll_wc: wc.status=%d (%s), opcode=%d\n",
-                    wc.status, ibv_wc_status_str(wc.status), wc.opcode);
+            fprintf(stderr,
+                "[RDMA] WC ERROR: status=%d (%s), "
+                "opcode=%d, vendor_err=%u, wr_id=%llu\n",
+                wc.status,
+                ibv_wc_status_str(wc.status),
+                wc.opcode,
+                wc.vendor_err,
+                (unsigned long long)wc.wr_id);
             return -1;
         }
-        
+
+        if (wc.opcode != expect) {
+            continue;
+        }
+
         if(out) *out = wc;
         return 0;
     }

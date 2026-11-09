@@ -100,7 +100,7 @@ int main(int argc, char *argv[]) {
     printf("rdma connect success\n");
 
     conn_manager_t *cm = cm_id->context;
-    // 提前提交接收请求，等待服务端最终确认
+    // 提前提交接收请求：停等模式用来收 READY，连发模式留给最终确认
     if (rdma_post_recv(cm_id) != 0) {
         fprintf(stderr, "rdma_post_recv failed\n");
         return -1;
@@ -145,10 +145,38 @@ int main(int argc, char *argv[]) {
 
     rdma_post_send(cm_id, sizeof(file_type_t));
 
-    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_SEND) {
+    if (0 != rdma_poll_wc(cq, &wc, IBV_WC_SEND)) {
         perror("rdma_poll_wc\n");
         return 0;
     }
+
+#if ENABLE_RDMA_ACK
+    // 停等协议：收到 READY（服务端已贴好第一块数据的 RECV）才进入发送循环
+    if (0 != rdma_poll_wc(cq, &wc, IBV_WC_RECV)) {
+        perror("rdma_poll_wc\n");
+        return 0;
+    }
+#else
+    /* 只等待第一次 READY，后续数据块不等 ACK */
+    if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0)
+        return -1;
+
+    if (wc.byte_len != 6 ||
+        memcmp(cm->rbuffer, "READY", 6) != 0) {
+        fprintf(stderr, "Invalid READY\n");
+        return -1;
+    }
+
+    printf("[RDMA client] READY received\n");
+    /* READY 已经消耗了之前提交的 RECV，
+    * 现在重新提交 RECV，用于接收最终确认 */
+    if (rdma_post_recv(cm_id) != 0) {
+        fprintf(stderr, "post final ACK recv failed\n");
+        return -1;
+    }
+
+    printf("[RDMA client] final ACK recv posted\n");
+#endif
 
     while (idx < total) {
 
@@ -160,29 +188,57 @@ int main(int argc, char *argv[]) {
 
         memcpy(cm->sbuffer, p + idx, length);
 
+        printf("[RDMA client] SEND idx=%zu, len=%zu\n",
+            idx, length);
+        fflush(stdout);
+
         if (rdma_post_send(cm_id, length) != 0) {
             fprintf(stderr, "rdma_post_send failed\n");
             return -1;
         }
 
-        if (rdma_poll_wc(cq, &wc) != 0 || wc.opcode != IBV_WC_SEND) {
+        // 等 SEND 完成：数据已从 sbuffer 交出，才能安全复用 sbuffer（两种模式都必须）
+        if (rdma_poll_wc(cq, &wc, IBV_WC_SEND) != 0) {
             fprintf(stderr, "send completion failed\n");
             return -1;
         }
 
+#if ENABLE_RDMA_ACK
+        // 停等协议：贴一条 RECV 收 ACK，收到对端确认才允许发下一块
+        if (rdma_post_recv(cm_id) != 0) {
+            fprintf(stderr, "rdma_post_recv failed\n");
+            return -1;
+        }
+
+        if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0) {
+            fprintf(stderr, "recv ACK failed\n");
+            return -1;
+        }
+#else
+        /* 连发模式：不等对端确认，直接发下一块（SEND 完成是本地事件，开销极小）*/
+#endif
+
         idx += length;
+#if !ENABLE_RDMA_ACK
+    // usleep(10000);  /* 仅用于排查：10ms */
+#endif
     }
+
+#if ENABLE_RDMA_ACK
+    /* 停等协议：最后一块的 ACK 已在循环内收到 */
+#else
+    /* 连发模式：数据全部发出后，收服务端落盘完成的最终确认
+     * （开头贴的那条 RECV 在此使用；expect 过滤跳过 CQ 里可能残留的 SEND 完成事件）*/
+    if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0) {
+        fprintf(stderr, "recv final ACK failed\n");
+        return -1;
+    }
+#endif
 
     munmap(p, total);
     close(fd);
 
-    // 前面已经提交过 RECV，这里不能重复提交
-    if (0 != rdma_poll_wc(cq, &wc) || wc.opcode != IBV_WC_RECV) {
-        perror("rdma_poll_wc\n");
-        return 0;
-    }
-
-    /* ===== 计时结束：收到 server ACK ===== */
+    /* ===== 计时结束：停等为最后一块 ACK / 连发为最终确认 ===== */
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double sec = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9;
 
