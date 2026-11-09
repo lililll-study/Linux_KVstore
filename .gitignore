@@ -19,3 +19,9 @@
 # 备份文件
 *.bak
 *.backup
+
+# 测试与运行产物
+*.bin
+data/
+build/
+logs/

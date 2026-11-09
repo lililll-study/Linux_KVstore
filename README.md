@@ -316,13 +316,16 @@ sudo ./build/kvstore --config slave.conf
 ./build/3_sync_testcase 192.168.137.140 2000 3
 
 
+#RDMA性能分析
+主机和从机各添加一个网卡ens37，用于绑定RDMA，sroce或iwarp方法都行
+主机执行
 ./test/8_transfer_bench.sh server
 
-
+从机执行
 chmod +x rdma/rdma_client rdma/rdma_server rdma/tcp_client rdma/tcp_server
-./test/8_transfer_bench.sh client 192.168.137.139
+./test/8_transfer_bench.sh client 192.168.200.12
 
-
+杀死测试进程
 sudo pkill -9 tcp_server
 sudo pkill -9 rdma_server
 sudo pkill -9 iperf3
@@ -340,12 +343,12 @@ QPS
 
 优化前
 
-| 传输方式                 | 吞吐量                                    | 说明                                  |
-| -------------------- | -------------------------------------- | ----------------------------------- |
-| RDMA（iwarp）          | 43.80 MB/s                             | 单块连发 + READY 握手 + 最终确认              |
-| TCP sendfile         | 367.49 MB/s                            | 零拷贝 sendfile + "sync finished" 落盘确认 |
-| iperf3 TCP 裸链路（上限参照） | 444 MB/s (3.73 Gbit/s)                 | 纯链路流量，不含应用层处理与落盘                    |
-| RDMA（soft-roce）      | 70.86 MB/s |                                     |
+| 传输方式                 | 吞吐量                    | 说明                                  |
+| -------------------- | ---------------------- | ----------------------------------- |
+| RDMA（iwarp）          | 43.80 MB/s             | 单块连发 + READY 握手 + 最终确认              |
+| TCP sendfile         | 367.49 MB/s            | 零拷贝 sendfile + "sync finished" 落盘确认 |
+| iperf3 TCP 裸链路（上限参照） | 444 MB/s (3.73 Gbit/s) | 纯链路流量，不含应用层处理与落盘                    |
+| RDMA（soft-roce）      | 70.86 MB/s             |                                     |
 
 
 
