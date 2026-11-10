@@ -302,7 +302,7 @@ make
 sudo ./build/kvstore --config master.conf
 
 # 测试端：连接主机并插入5w条数据
-./build/3_sync_testcase 192.168.137.139 2000 1
+./build/3_sync_testcase 192.168.200.12 2000 1
 
 # 2. 启动从机
 sudo ./build/kvstore --config slave.conf
@@ -318,6 +318,19 @@ sudo ./build/kvstore --config slave.conf
 
 #RDMA性能分析
 主机和从机各添加一个网卡ens37，用于绑定RDMA，sroce或iwarp方法都行
+启动ens37网卡
+sudo ip link set ens37 up
+给他添加ip地址
+sudo ip addr add 192.168.200.12/24 dev ens37    主机12
+sudo ip addr add 192.168.200.12/24 dev ens37    从机11
+绑定rdma到网卡
+sudo rdma link add siw1 type siw netdev ens33    iwarp
+sudo rdma link add rxe0 type rxe netdev ens33    roce
+查看结果
+ibv_devices
+设置MTU
+sudo ip link set dev ens37 mtu 9000
+
 主机执行
 ./test/8_transfer_bench.sh server
 
@@ -329,19 +342,19 @@ chmod +x rdma/rdma_client rdma/rdma_server rdma/tcp_client rdma/tcp_server
 sudo pkill -9 tcp_server
 sudo pkill -9 rdma_server
 sudo pkill -9 iperf3
+
+
+#ebpf性能测试
+主机
+sudo ./test/7_qps_bench.sh full 5 192.168.200.12 2000
+从机
+sudo ./build/kvstore --config slave.conf
+
 ```
 
 
 
-实时数据同步性能测试
-
-关闭SYNC，开启SYNC的ebpf，开启SYNC的网络转发
-
-QPS
-
-
-
-优化前
+已有数据同步性能测试
 
 | 传输方式                 | 吞吐量                    | 说明                                  |
 | -------------------- | ---------------------- | ----------------------------------- |
@@ -349,6 +362,16 @@ QPS
 | TCP sendfile         | 367.49 MB/s            | 零拷贝 sendfile + "sync finished" 落盘确认 |
 | iperf3 TCP 裸链路（上限参照） | 444 MB/s (3.73 Gbit/s) | 纯链路流量，不含应用层处理与落盘                    |
 | RDMA（soft-roce）      | 70.86 MB/s             |                                     |
+
+
+
+实时数据同步性能测试
+
+| 同步模式 (Sync Mode)       | 平均 QPS (5轮) |
+| ---------------------- | ----------- |
+| **关闭sync**             | **1918.5**  |
+| **net-fwd (网络转发)**     | **10,366**  |
+| **ebpf-fwd (eBPF 抓包)** | **7,257**   |
 
 
 
@@ -551,3 +574,5 @@ redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 160 -n 100000 -t SET -d 10
 | ------- | ----- | ------ | ------ | ------ | ------ |
 | kvstore | 6.73w | 12.57w | 23.09w | 42.32w | 70.11w |
 | redis   | 6.5w  | 13.4w  | 22.88w | 48.31w | 81.23w |
+
+
