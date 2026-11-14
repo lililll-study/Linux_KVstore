@@ -61,17 +61,6 @@ sudo apt install -y build-essential
 sudo apt install -y librdmacm-dev libibverbs-dev
 ```
 
-开启RDMA功能需要绑定虚拟网卡
-
-```bash
-# 1 创建SoftiWARP设备
-sudo rdma link add siw1 type siw netdev ens33
-# 2 打印ibv设备
-ibv_devices
-会看到
-device node GUID ------ ---------------- siw1 020c29fffe775881
-```
-
 
 
 
@@ -293,7 +282,43 @@ sudo ./build/kvstore --config master.conf
 ./build/2_presist_testcase 127.0.0.1 2000 4
 ```
 
-## 三、主从同步测试及性能
+
+
+
+
+## 三、数据校验
+
+    make clean
+    make reactor
+    # 1. 启动主机
+    ./build/kvstore --config config/master.conf
+    
+    # 测试端：连接主机并插入5条数据
+    ./build/3_sync_testcase 192.168.137.134 2000 10
+    
+    # 2. 启动从机
+    ./build/kvstore --config config/slave.conf
+    
+    
+    # 3. 对比主从机的crc列表
+    ./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+    
+    
+    # 4. 修改从机数据
+    ./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
+    
+    # 5. 再次对比 
+    ./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
+
+
+
+
+
+# 性能数据
+
+
+
+## 1、主从同步测试及性能
 
 ```bash
 make clean
@@ -327,12 +352,39 @@ ibv_devices
 #如果没有绑定，则绑定网卡，以下两种方式选1个
 sudo rdma link add siw1 type siw netdev ens33    iwarp
 sudo rdma link add rxe0 type rxe netdev ens33    roce
-#删除ip地址命令
-sudo ip addr del 192.168.200.12/24 dev ens33    主机12
 
 
 设置MTU
 sudo ip link set dev ens33 mtu 9000
+sudo sysctl -w net.core.rmem_max=16777216
+sudo sysctl -w net.core.wmem_max=16777216
+
+主机向从机发送1000MB文件，计算吞吐量
+
+#测试iperf3
+#主机
+iperf3 -s
+#从机
+iperf3 -c 192.168.137.139 -n 1000M -w 4M
+
+#测试RDMA
+make bench        # 一次编出 5 个 bench 程序（含 11_rdma_sendfile_case）
+
+# 生成 1000MB 测试文件（主机上执行一次）
+dd if=/dev/urandom of=bench_1000m.bin bs=1M count=1000
+
+# 从机（先启动，接收方）
+./test/11_rdma_sendfile_case 0 server          # 0 = RDMA
+./test/11_rdma_sendfile_case 1 server          # 1 = sendfile
+
+# 主机（发送方）
+./test/11_rdma_sendfile_case 0 client 192.168.137.139
+./test/11_rdma_sendfile_case 1 client 192.168.137.139
+
+杀死测试进程
+sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
+
+
 
 
 主机执行
@@ -340,21 +392,17 @@ chmod +x rdma/rdma_server rdma/rdma_client rdma/tcp_server rdma/tcp_client
 ./test/8_transfer_bench.sh server
 从机执行
 chmod +x rdma/rdma_client rdma/rdma_server rdma/tcp_client rdma/tcp_server
+chmod +x ./test/8_transfer_bench.sh
 ./test/8_transfer_bench.sh client 192.168.137.139
-如果存在iperf3或TCP或RDMA进程，用命令杀死
-杀死测试进程
-sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
-
 ```
 
 
 
-| 传输方式                 | 吞吐量                    | 说明                                  |
-| -------------------- | ---------------------- | ----------------------------------- |
-| RDMA（iwarp）          | 43.80 MB/s             | 单块连发 + READY 握手 + 最终确认              |
-| TCP sendfile         | 367.49 MB/s            | 零拷贝 sendfile + "sync finished" 落盘确认 |
-| iperf3 TCP 裸链路（上限参照） | 444 MB/s (3.73 Gbit/s) | 纯链路流量，不含应用层处理与落盘                    |
-| RDMA（soft-roce）      | 70.86 MB/s             |                                     |
+| 传输方式                 | 吞吐量(MB/s)   |         |
+| -------------------- | ----------- | ------- |
+| TCP sendfile         | 134.22 MB/s | 100.00% |
+| iperf3 TCP 裸链路（上限参照） | 99.66 MB/s  | 74.25%  |
+| RDMA（soft-roce）      | 81.90 MB/s  | 61.02%  |
 
 
 
@@ -363,6 +411,7 @@ sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
 ```bash
 #ebpf性能测试
 主机
+chmod +x ./test/7_qps_bench.sh
 sudo ./test/7_qps_bench.sh full 5 192.168.137.139 2000
 从机
 sudo ./build/kvstore --config slave.conf
@@ -370,47 +419,15 @@ sudo ./build/kvstore --config slave.conf
 
 
 
-| 同步模式 (Sync Mode)       | 平均 QPS (5轮) |
-| ---------------------- | ----------- |
-| **关闭sync**             | **1918.5**  |
-| **net-fwd (网络转发)**     | **10,366**  |
-| **ebpf-fwd (eBPF 抓包)** | **7,257**   |
+| 同步模式 (Sync Mode) | 平均 QPS (5轮) |
+| ---------------- | ----------- |
+| **关闭主从同步**       | **11248**   |
+| **开启主从—网络转发**    | **9886**    |
+| **开启主从—ebpf转发**  | **6701**    |
 
 
 
-
-
-
-
-## 四、数据校验
-
-```bash
-make clean
-make reactor
-# 1. 启动主机
-./build/kvstore --config config/master.conf
-
-# 测试端：连接主机并插入5条数据
-./build/3_sync_testcase 192.168.137.134 2000 10
-
-# 2. 启动从机
-./build/kvstore --config config/slave.conf
-
-
-# 3. 对比主从机的crc列表
-./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
-
-
-# 4. 修改从机数据
-./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 2
-
-# 5. 再次对比 
-./build/4_crc_testcase 192.168.137.134 2000 192.168.137.135 2001 1
-```
-
-
-
-## 五、内存池测试及性能
+## 2、内存池测试及性能
 
 ```bash
 # ===== 步骤 1：无内存池 =====
@@ -448,11 +465,11 @@ sudo bash ./test/5_mem_test.sh jemalloc
 
 
 
-# 性能数据
 
 
 
-## 1、增量持久化--QPS测试
+
+## 3、增量持久化--QPS测试
 
 测试内容：向服务端插入 10w 条数据（HSET/SET），每条命令等服务端返回 OK 后再发下一条（单条收发，无管道），量出真实往返的 echo 性能。
 
@@ -502,7 +519,7 @@ redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 1 -n 100000 -t SET -d 10
 
 
 
-## 2、全量持久化--QPS测试
+## 4、全量持久化--QPS测试
 
 测试前提：服务端以 SNAP 模式启动（SAVE 只在 snap 模式有效）。
 
@@ -544,7 +561,7 @@ SAVE 的异步语义：SAVE 命令只唤醒后台保存线程，立即返回 OK�
 
 -------------------
 
-## 3、批处理--QPS测试
+## 5、批处理--QPS测试
 
 共插10w条数据。
 

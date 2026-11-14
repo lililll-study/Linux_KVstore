@@ -153,8 +153,10 @@ $(BUILD_DIR)/kvs_ebpf.o: $(SRC_DIR)/kvs_ebpf.c $(BPF_SKEL) $(BPF_HDR)
 # ===== 传输对比 benchmark：RDMA vs TCP sendfile（rdma/ 目录的独立小程序）=====
 # 用法: make bench
 RDMA_DIR   = rdma
+TEST_DIR   = test
 BENCH_BINS = $(RDMA_DIR)/rdma_server $(RDMA_DIR)/rdma_client \
-             $(RDMA_DIR)/tcp_server $(RDMA_DIR)/tcp_client
+             $(RDMA_DIR)/tcp_server $(RDMA_DIR)/tcp_client \
+             $(TEST_DIR)/11_rdma_sendfile_case
 
 bench: $(BENCH_BINS)
 
@@ -172,6 +174,12 @@ $(RDMA_DIR)/tcp_server: $(RDMA_DIR)/tcp_server.c
 
 $(RDMA_DIR)/tcp_client: $(RDMA_DIR)/tcp_client.c
 	$(CC) -O2 -Wall -o $@ $<
+	@echo "Build complete: $@"
+
+# 单文件传输测试：0=RDMA / 1=sendfile，client/server 区分主从
+# 用法: ./test/11_rdma_sendfile_case 0 server | ./test/11_rdma_sendfile_case 0 client <从机IP>
+$(TEST_DIR)/11_rdma_sendfile_case: $(TEST_DIR)/11_rdma_sendfile_case.c $(RDMA_DIR)/rdma.h
+	$(CC) -O2 -Wall -o $@ $< -lrdmacm -libverbs
 	@echo "Build complete: $@"
 
 
