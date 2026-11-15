@@ -258,12 +258,17 @@ static inline int rdma_slot_recv(struct rdma_cm_id *id, rdma_slot_t *slot, uint6
     return ibv_post_recv(id->qp, &wr, &bad);
 }
 
+/*
+ * signaled = 0 时不产生 SEND 完成事件，用于流水线数据块：
+ * 这类 WR 的"已完成"由对端的 ACK 间接证明，省掉每块一次 CQ 通知。
+ */
 static inline int rdma_slot_send(struct rdma_cm_id *id, rdma_slot_t *slot,
-                          size_t length, uint64_t wr_id) {
+                          size_t length, uint64_t wr_id, int signaled) {
     struct ibv_sge sge = {.addr = (uintptr_t)slot->buffer,
                           .length = (uint32_t)length, .lkey = slot->mr->lkey};
     struct ibv_send_wr wr = {.wr_id = wr_id, .sg_list = &sge, .num_sge = 1,
-                             .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED}, *bad = NULL;
+                             .opcode = IBV_WR_SEND,
+                             .send_flags = signaled ? IBV_SEND_SIGNALED : 0}, *bad = NULL;
     return ibv_post_send(id->qp, &wr, &bad);
 }
 

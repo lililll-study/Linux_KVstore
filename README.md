@@ -370,7 +370,7 @@ sudo sysctl -w net.core.wmem_max=16777216
 #主机
 iperf3 -s
 #从机
-iperf3 -c 192.168.137.139 -n 500M -w 4M
+iperf3 -c 192.168.137.139
 ```
 
 
@@ -379,30 +379,23 @@ iperf3 -c 192.168.137.139 -n 500M -w 4M
 #测试——RDMA
 # 编译（项目根目录）
 make bench
-# 生成 500MB 测试文件
-dd if=/dev/urandom of=/tmp/bench_500m.bin bs=1M count=500
+# 生成 1000MB 测试文件
+dd if=/dev/urandom of=/tmp/bench_1g.bin bs=1M count=1024
 
 # 每轮开始前，两端都清缓存
 sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
 
 # 主机（接收）
-./test/11_rdma_sendfile_case 0 server /tmp/rdma_recv_500m.bin 2
+./test/11_rdma_sendfile_case 0 server /tmp/rdma_1g_p0.bin 0
 # 从机（发送）
-./test/11_rdma_sendfile_case 0 client 192.168.137.139 /tmp/bench_500m.bin 2
+./test/11_rdma_sendfile_case 0 client 192.168.137.139 /tmp/bench_1g.bin 0
 
 
 #测试——SENDFILE
 # 主机（接收）
-./test/11_rdma_sendfile_case 1 server /tmp/tcp_recv_500m.bin 2
+./test/11_rdma_sendfile_case 1 server /tmp/sf_1g_p2.bin 2
 # 从机（发送）
-./test/11_rdma_sendfile_case 1 client 192.168.137.139 /tmp/bench_500m.bin 2
-
-#测试RDMA链路模拟极限
-#使用perftest模拟Roce测试的极限，`-n 100` 意味着每档 125 次，8MB 一档总共 800MB
-# 主机先起
-ib_write_bw -d rxe0 -F --report_gbits -s 8388608 -q 4 -n 125
-# 从机
-ib_write_bw -d rxe0 -F --report_gbits -s 8388608 -q 4 -n 125 192.168.137.139
+./test/11_rdma_sendfile_case 1 client 192.168.137.139 /tmp/bench_1g.bin 2
 
 
 
@@ -412,11 +405,13 @@ sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
 
 
 
-| 传输方式            | 吞吐量(MB/s)  |         |
-| --------------- | ---------- | ------- |
-| iperf3          | 536.3 MB/s | 100.00% |
-| sendfile        | 314.41MB/s |         |
-| RDMA（soft-roce） | 162 MB/s   |         |
+
+
+| 传输方式            | 吞吐量(MB/s)                         |     |
+| --------------- | --------------------------------- | --- |
+| iperf3          | 893.75 MB/s                       |     |
+| sendfile        |  MB/s |     |
+| RDMA（soft-roce） | 272.03 MB/s                       |     |
 
 
 
