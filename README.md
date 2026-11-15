@@ -351,7 +351,7 @@ sudo ./build/kvstore --config slave.conf
 ibv_devices
 #如果没有绑定，则绑定网卡，以下两种方式选1个
 sudo rdma link add siw1 type siw netdev ens33    iwarp
-sudo rdma link add rxe0 type rxe netdev ens33    roce
+sudo rdma link add rxe0 type rxe netde ens33    roce
 
 
 设置MTU
@@ -359,50 +359,64 @@ sudo ip link set dev ens33 mtu 9000
 sudo sysctl -w net.core.rmem_max=16777216
 sudo sysctl -w net.core.wmem_max=16777216
 
-主机向从机发送1000MB文件，计算吞吐量
+主机向从机发送500MB文件，计算吞吐量
 
+```
+
+测试iperf3
+
+```bash
 #测试iperf3
 #主机
 iperf3 -s
 #从机
-iperf3 -c 192.168.137.139 -n 1000M -w 4M
-
-#测试RDMA
-make bench        # 一次编出 5 个 bench 程序（含 11_rdma_sendfile_case）
-
-# 生成 1000MB 测试文件（主机上执行一次）
-dd if=/dev/urandom of=bench_1000m.bin bs=1M count=1000
-
-# 从机（先启动，接收方）
-./test/11_rdma_sendfile_case 0 server          # 0 = RDMA
-./test/11_rdma_sendfile_case 1 server          # 1 = sendfile
-
-# 主机（发送方）
-./test/11_rdma_sendfile_case 0 client 192.168.137.139
-./test/11_rdma_sendfile_case 1 client 192.168.137.139
-
-杀死测试进程
-sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
-
-
-
-
-主机执行
-chmod +x rdma/rdma_server rdma/rdma_client rdma/tcp_server rdma/tcp_client
-./test/8_transfer_bench.sh server
-从机执行
-chmod +x rdma/rdma_client rdma/rdma_server rdma/tcp_client rdma/tcp_server
-chmod +x ./test/8_transfer_bench.sh
-./test/8_transfer_bench.sh client 192.168.137.139
+iperf3 -c 192.168.137.139 -n 500M -w 4M
 ```
 
 
 
-| 传输方式                 | 吞吐量(MB/s)   |         |
-| -------------------- | ----------- | ------- |
-| TCP sendfile         | 134.22 MB/s | 100.00% |
-| iperf3 TCP 裸链路（上限参照） | 99.66 MB/s  | 74.25%  |
-| RDMA（soft-roce）      | 81.90 MB/s  | 61.02%  |
+```bash
+#测试——RDMA
+# 编译（项目根目录）
+make bench
+# 生成 500MB 测试文件
+dd if=/dev/urandom of=/tmp/bench_500m.bin bs=1M count=500
+
+# 每轮开始前，两端都清缓存
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# 主机（接收）
+./test/11_rdma_sendfile_case 0 server /tmp/rdma_recv_500m.bin 2
+# 从机（发送）
+./test/11_rdma_sendfile_case 0 client 192.168.137.139 /tmp/bench_500m.bin 2
+
+
+#测试——SENDFILE
+# 主机（接收）
+./test/11_rdma_sendfile_case 1 server /tmp/tcp_recv_500m.bin 2
+# 从机（发送）
+./test/11_rdma_sendfile_case 1 client 192.168.137.139 /tmp/bench_500m.bin 2
+
+#测试RDMA链路模拟极限
+#使用perftest模拟Roce测试的极限，`-n 100` 意味着每档 125 次，8MB 一档总共 800MB
+# 主机先起
+ib_write_bw -d rxe0 -F --report_gbits -s 8388608 -q 4 -n 125
+# 从机
+ib_write_bw -d rxe0 -F --report_gbits -s 8388608 -q 4 -n 125 192.168.137.139
+
+
+
+杀死测试进程
+sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
+```
+
+
+
+| 传输方式            | 吞吐量(MB/s)  |         |
+| --------------- | ---------- | ------- |
+| iperf3          | 536.3 MB/s | 100.00% |
+| sendfile        | 314.41MB/s |         |
+| RDMA（soft-roce） | 162 MB/s   |         |
 
 
 
@@ -594,3 +608,5 @@ redis-benchmark -h 127.0.0.1 -p 6379 -c 1 -P 160 -n 100000 -t SET -d 10
 | ------- | ----- | ------ | ------ | ------ | ------ |
 | kvstore | 6.73w | 12.57w | 23.09w | 42.32w | 70.11w |
 | redis   | 6.5w  | 13.4w  | 22.88w | 48.31w | 81.23w |
+
+

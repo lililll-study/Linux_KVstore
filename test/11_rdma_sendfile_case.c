@@ -2,8 +2,8 @@
  * 11_rdma_sendfile_case.c —— 单文件传输测试（RDMA / sendfile 二选一）
  *
  * 用法：
- *   从机（接收方）: ./11_rdma_sendfile_case <mode> server [输出文件]
- *   主机（发送方）: ./11_rdma_sendfile_case <mode> client <从机IP> [发送文件]
+ *   从机（接收方）: ./11_rdma_sendfile_case <mode> server [输出文件] [profile]
+ *   主机（发送方）: ./11_rdma_sendfile_case <mode> client <从机IP> [发送文件] [profile]
  *
  *   mode: 0 = RDMA
  *         1 = sendfile（TCP 零拷贝）
@@ -12,13 +12,12 @@
  *   生成方式: dd if=/dev/urandom of=bench_1000m.bin bs=1M count=1000
  *
  * 计时口径（两端一致，不含建连）：
- *   起点: 发送方把 header 交给内核之前 / 接收方收到 header 之后
- *   终点: 接收方数据真正落盘（RDMA msync(MS_SYNC) / TCP fsync()）并回确认，
+ *   起点: 发送方完成 header 发送之后 / 接收方收到 header 之后
+ *   终点: 接收方按 profile 完成数据处理并回确认，
  *         发送方收到该确认的时刻
  *
- * 块大小与同步模式沿用 ../rdma/rdma.h：
- *   RDMA_BUFFER_SIZE = 200MB（1000MB 文件正好 5 块）
- *   ENABLE_RDMA_ACK  = 0（连发模式：只等首块 READY 与最终落盘确认）
+ * profile: 0 = 内存到内存；1 = 文件传输、不强制刷盘；2 = 文件传输并刷盘（默认）
+ * RDMA 使用四个 1 MiB 注册缓冲，最多四块在途；接收方每处理完一块返回 credit。
  */
 
 #include <errno.h>
@@ -44,21 +43,31 @@
 
 #define DEFAULT_FILE        "bench_1000m.bin"
 #define HEADER_MAGIC        0x12345678u
+#define PIPELINE_DEPTH      4
+#define PIPELINE_CHUNK      (1024 * 1024)
 
 #define TCP_SERVER_PORT     9002
 #define TCP_RECV_BUF_SIZE   (1024 * 1024)   /* 1MB 接收缓冲 */
 #define TCP_SOCK_BUF_SIZE   (4 * 1024 * 1024)   /* 4MB socket 缓冲，两侧对称 */
 
 /* header 与 rdma.h 的 file_type_t 字段保持一致，两种传输方式共用同一格式 */
-typedef file_type_t file_header_t;
+typedef struct {
+    uint32_t magic;
+    uint32_t profile;
+    uint64_t total;
+} file_header_t;
+
+/* 0: memory, 1: file without fsync, 2: file with fsync (default). */
+static int profile = 2;
 
 static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage:\n"
-            "  %s 0|1 server [outfile]\n"
-            "  %s 0|1 client <server_ip> [filename]\n"
+            "  %s 0|1 server [outfile] [profile]\n"
+            "  %s 0|1 client <server_ip> [filename] [profile]\n"
             "  mode: 0 = RDMA, 1 = sendfile\n"
+            "  profile: 0 = memory, 1 = file without sync, 2 = file with sync (default)\n"
             "  default file: %s\n",
             prog, prog, DEFAULT_FILE);
 }
@@ -69,8 +78,10 @@ static void print_result(const char *mode, const char *role, size_t total, doubl
         sec = 1e-9;   /* 防止除零；正常不会走到 */
     }
 
-    printf("[RESULT] mode=%s role=%-6s bytes=%zu elapsed=%.3fs throughput=%.2f MiB/s\n",
-           mode, role, total, sec,
+    static const char *profiles[] = {"memory", "file-no-sync", "file-sync"};
+    printf("[RESULT] mode=%s profile=%s role=%-6s bytes=%zu elapsed=%.3fs throughput=%.2f MiB/s\n",
+           profile == 0 && strcmp(mode, "sendfile") == 0 ? "tcp-memory" : mode,
+           profiles[profile], role, total, sec,
            total / (1024.0 * 1024.0) / sec);
 }
 
@@ -260,6 +271,8 @@ static int run_rdma_server(const char *outfile)
     }
 
     size_t total = hdr->total;
+    profile = (int)hdr->profile;
+    if (profile < 0 || profile > 2) return -1;
     if (total == 0) {
         fprintf(stderr, "[rdma server] header total is 0\n");
         return -1;
@@ -271,25 +284,23 @@ static int run_rdma_server(const char *outfile)
     /* 4. header 已消费，立刻贴下一块数据的 RECV：
      *    open/ftruncate/mmap 比较慢，若等它们做完再贴 RECV，
      *    客户端第一块 SEND 会撞上"对端无接收缓冲"的空窗 */
-    if (rdma_post_recv(id) != 0) {
-        return -1;
+    rdma_slot_t slots[PIPELINE_DEPTH] = {0};
+    for (int i = 0; i < PIPELINE_DEPTH; ++i) {
+        if (rdma_slot_init(pd, &slots[i], PIPELINE_CHUNK, 1) != 0 ||
+            rdma_slot_recv(id, &slots[i], 100 + i) != 0) return -1;
     }
 
-    int fd = open(outfile, O_RDWR | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) {
-        perror("open");
-        return -1;
-    }
-
-    if (ftruncate(fd, (off_t)total) != 0) {
-        perror("ftruncate");
-        return -1;
-    }
-
-    char *p = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED) {
-        perror("mmap");
-        return -1;
+    int fd = -1;
+    char *p;
+    if (profile == 0) {
+        p = malloc(total);
+        if (!p) return -1;
+        memset(p, 0x5a, total);
+    } else {
+        fd = open(outfile, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0 || ftruncate(fd, (off_t)total) != 0) return -1;
+        p = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) return -1;
     }
 
     /* 5. 计时开始：文件已准备好，只算传输 + 落盘 */
@@ -315,26 +326,40 @@ static int run_rdma_server(const char *outfile)
             return -1;
         }
 
-        if (wc.byte_len == 0 || wc.byte_len > total - idx) {
+        if (wc.wr_id < 100 || wc.wr_id >= 100 + PIPELINE_DEPTH ||
+            wc.byte_len == 0 || wc.byte_len > total - idx ||
+            wc.byte_len > PIPELINE_CHUNK) {
             fprintf(stderr, "[rdma server] invalid length: %u (idx=%zu)\n",
                     wc.byte_len, idx);
             return -1;
         }
 
-        memcpy(p + idx, cm->rbuffer, wc.byte_len);
+        int slot = (int)(wc.wr_id - 100);
+        memcpy(p + idx, slots[slot].buffer, wc.byte_len);
         idx += wc.byte_len;
         chunks++;
 
-        /* 下一块的 RECV 先准备好 */
-        if (idx < total && rdma_post_recv(id) != 0) {
-            return -1;
+        /* 不是最后一块：先贴好下一块的 RECV，再回 ACK。
+         * 客户端收到 ACK 才发下一块，此时接收缓冲一定已就绪，不会触发 RNR */
+        if (idx < total) {
+            if (rdma_slot_recv(id, &slots[slot], 100 + slot) != 0) {
+                return -1;
+            }
+
+            strcpy(cm->sbuffer, "ACK");
+            if (rdma_post_send(id, 4) != 0) {
+                return -1;
+            }
+
+            if (rdma_poll_wc(cq, &wc, IBV_WC_SEND) != 0) {
+                return -1;
+            }
         }
     }
 
     /* 8. 强制落盘（与 TCP 的 fsync 对齐） */
-    msync(p, total, MS_SYNC);
-    munmap(p, total);
-    close(fd);
+    if (profile == 2 && msync(p, total, MS_SYNC) != 0) return -1;
+    if (profile == 0) free(p); else { munmap(p, total); close(fd); }
 
     /* 9. 回最终确认，发送方收到才停止计时 */
     strcpy(cm->sbuffer, "sync finished");
@@ -351,8 +376,11 @@ static int run_rdma_server(const char *outfile)
     printf("[rdma server] chunks=%zu, saved to %s\n", chunks, outfile);
     print_result("rdma", "server", total, time_diff(&ts0, &ts1));
 
+    rdma_destroy_qp(id);
+    for (int i = 0; i < PIPELINE_DEPTH; ++i) rdma_slot_free(&slots[i]);
     rdma_free_buffer(id);
-    rdma_destroy_queuepair(id, pd, cq);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
     return 0;
 }
 
@@ -378,15 +406,17 @@ static int run_rdma_client(const char *server_ip, const char *filename)
         return -1;
     }
 
-    char *p = (char *)mmap(NULL, total, PROT_READ, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED) {
+    char *p = profile == 0 ? malloc(total) :
+        (char *)mmap(NULL, total, PROT_READ, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED || !p) {
         perror("mmap");
         return -1;
     }
+    if (profile == 0) memset(p, 0x5a, total);
 
-    printf("[rdma client] file=%s total=%zu bytes, block=%d MB, chunks=%zu\n",
-           filename, total, RDMA_BUFFER_SIZE / (1024 * 1024),
-           (total + RDMA_BUFFER_SIZE - 1) / RDMA_BUFFER_SIZE);
+    printf("[rdma client] file=%s total=%zu bytes, block=%d MiB, chunks=%zu, depth=%d\n",
+           filename, total, PIPELINE_CHUNK / (1024 * 1024),
+           (total + PIPELINE_CHUNK - 1) / PIPELINE_CHUNK, PIPELINE_DEPTH);
     fflush(stdout);
 
     struct rdma_event_channel *channel = rdma_create_event_channel();
@@ -440,12 +470,11 @@ static int run_rdma_client(const char *server_ip, const char *filename)
     /* 1. 发 header（不计入吞吐，但计入总用时起点） */
     file_header_t hdr;
     hdr.magic = HEADER_MAGIC;
+    hdr.profile = (uint32_t)profile;
     hdr.total = total;
     memcpy(cm->sbuffer, &hdr, sizeof(file_header_t));
 
     struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
-
     if (rdma_post_send(cm_id, sizeof(file_header_t)) != 0) {
         return -1;
     }
@@ -453,6 +482,7 @@ static int run_rdma_client(const char *server_ip, const char *filename)
     if (rdma_poll_wc(cq, &wc, IBV_WC_SEND) != 0) {
         return -1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
 
     /* 2. 等 READY：服务端已贴好第一块数据的 RECV */
     if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0) {
@@ -464,58 +494,58 @@ static int run_rdma_client(const char *server_ip, const char *filename)
         return -1;
     }
 
-    /* READY 消耗了之前提交的 RECV，重新提交一条用于收最终确认 */
-    if (rdma_post_recv(cm_id) != 0) {
-        return -1;
+    rdma_slot_t sends[PIPELINE_DEPTH] = {0}, acks[PIPELINE_DEPTH] = {0};
+    for (int i = 0; i < PIPELINE_DEPTH; ++i) {
+        if (rdma_slot_init(pd, &sends[i], PIPELINE_CHUNK, 0) != 0 ||
+            rdma_slot_init(pd, &acks[i], 32, 1) != 0 ||
+            rdma_slot_recv(cm_id, &acks[i], 200 + i) != 0) return -1;
     }
 
     /* 3. 分块发送 */
-    size_t idx = 0;
-    size_t chunks = 0;
-
-    while (idx < total) {
-        size_t length = total - idx;
-        if (length > RDMA_BUFFER_SIZE) {
-            length = RDMA_BUFFER_SIZE;
+    size_t idx = 0, chunks = 0, outstanding = 0;
+    while (idx < total || outstanding) {
+        while (idx < total && outstanding < PIPELINE_DEPTH) {
+            int slot = (int)(chunks % PIPELINE_DEPTH);
+            size_t length = total - idx;
+            if (length > PIPELINE_CHUNK) length = PIPELINE_CHUNK;
+            memcpy(sends[slot].buffer, p + idx, length);
+            if (rdma_slot_send(cm_id, &sends[slot], length, 300 + slot) != 0 ||
+                rdma_poll_wc(cq, &wc, IBV_WC_SEND) != 0) return -1;
+            idx += length;
+            ++chunks;
+            ++outstanding;
         }
-
-        memcpy(cm->sbuffer, p + idx, length);
-
-        if (rdma_post_send(cm_id, length) != 0) {
-            fprintf(stderr, "[rdma client] rdma_post_send failed\n");
-            return -1;
-        }
-
-        /* 等本地 SEND 完成，才能安全复用 sbuffer */
-        if (rdma_poll_wc(cq, &wc, IBV_WC_SEND) != 0) {
-            return -1;
-        }
-
-        idx += length;
-        chunks++;
+        if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0 ||
+            wc.wr_id < 200 || wc.wr_id >= 200 + PIPELINE_DEPTH) return -1;
+        int slot = (int)(wc.wr_id - 200);
+        if (wc.byte_len == 4 && memcmp(acks[slot].buffer, "ACK", 4) == 0) {
+            --outstanding;
+            if (rdma_slot_recv(cm_id, &acks[slot], 200 + slot) != 0) return -1;
+        } else if (wc.byte_len == sizeof("sync finished") &&
+                   memcmp(acks[slot].buffer, "sync finished", wc.byte_len) == 0) {
+            outstanding = 0;
+            break;
+        } else return -1;
     }
-
-    /* 4. 等最终确认：服务端数据已全部落盘 */
-    if (rdma_poll_wc(cq, &wc, IBV_WC_RECV) != 0) {
-        return -1;
-    }
+    /* The last data block has no ACK; the final confirmation covers it. */
+    if (outstanding != 0) return -1;
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
 
-    if (wc.byte_len == 0 ||
-        memchr(cm->rbuffer, '\0', wc.byte_len) == NULL) {
-        fprintf(stderr, "[rdma client] invalid final ACK\n");
-        return -1;
-    }
-
-    printf("[rdma client] chunks=%zu, server ACK: %s\n", chunks, cm->rbuffer);
+    printf("[rdma client] chunks=%zu, server ACK: sync finished\n", chunks);
     print_result("rdma", "client", total, time_diff(&ts0, &ts1));
 
-    munmap(p, total);
+    if (profile == 0) free(p); else munmap(p, total);
     close(fd);
 
+    rdma_destroy_qp(cm_id);
+    for (int i = 0; i < PIPELINE_DEPTH; ++i) {
+        rdma_slot_free(&sends[i]);
+        rdma_slot_free(&acks[i]);
+    }
     rdma_free_buffer(cm_id);
-    rdma_destroy_queuepair(cm_id, pd, cq);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
     return 0;
 }
 
@@ -576,14 +606,21 @@ static int run_sendfile_server(const char *outfile)
                 hdr.magic, hdr.total);
         return -1;
     }
+    profile = (int)hdr.profile;
+    if (profile < 0 || profile > 2) return -1;
 
     printf("[sendfile server] header: total=%zu bytes\n", hdr.total);
     fflush(stdout);
 
-    int fd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) {
-        perror("open");
-        return -1;
+    int fd = -1;
+    char *memory = NULL;
+    if (profile == 0) {
+        memory = malloc(hdr.total);
+        if (!memory) return -1;
+        memset(memory, 0x5a, hdr.total);
+    } else {
+        fd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) { perror("open"); return -1; }
     }
 
     char *buf = (char *)malloc(TCP_RECV_BUF_SIZE);
@@ -612,9 +649,15 @@ static int run_sendfile_server(const char *outfile)
             return -1;
         }
 
-        if (write(fd, buf, n) != n) {
-            perror("write");
-            return -1;
+        if (profile == 0) memcpy(memory + got, buf, n);
+        else {
+            ssize_t off = 0;
+            while (off < n) {
+                ssize_t written = write(fd, buf + off, n - off);
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) { perror("write"); return -1; }
+                off += written;
+            }
         }
         got += n;
     }
@@ -622,11 +665,12 @@ static int run_sendfile_server(const char *outfile)
     free(buf);
 
     /* 3. 强制落盘后再回 ACK，与 RDMA 的 msync(MS_SYNC) 口径对齐 */
-    if (fsync(fd) != 0) {
+    if (profile == 2 && fsync(fd) != 0) {
         perror("fsync");
         return -1;
     }
-    close(fd);
+    if (fd >= 0) close(fd);
+    free(memory);
 
     if (send_all(conn, "sync finished", sizeof("sync finished")) != 0) {
         return -1;
@@ -695,6 +739,7 @@ static int run_sendfile_client(const char *server_ip, const char *filename)
     /* 1. 发 header（与 RDMA 端格式相同） */
     file_header_t hdr;
     hdr.magic = HEADER_MAGIC;
+    hdr.profile = (uint32_t)profile;
     hdr.total = total;
     if (send_all(sock, &hdr, sizeof(hdr)) != 0) {
         return -1;
@@ -708,13 +753,23 @@ static int run_sendfile_client(const char *server_ip, const char *filename)
      * 注意 sendfile 不保证一次发完，必须累计返回值 */
     off_t offset = 0;
     size_t sent = 0;
+    char *memory = NULL;
+    if (profile == 0) {
+        memory = malloc(TCP_RECV_BUF_SIZE);
+        if (!memory) return -1;
+        memset(memory, 0x5a, TCP_RECV_BUF_SIZE);
+    }
     while (sent < total) {
         size_t to_send = total - sent;
         if (to_send > (1u << 30)) {
             to_send = 1u << 30;   /* 单次上限 1GB，防止长度溢出 */
         }
 
-        ssize_t n = sendfile(sock, file_fd, &offset, to_send);
+        ssize_t n;
+        if (profile == 0) {
+            if (to_send > TCP_RECV_BUF_SIZE) to_send = TCP_RECV_BUF_SIZE;
+            n = send(sock, memory, to_send, 0);
+        } else n = sendfile(sock, file_fd, &offset, to_send);
         if (n <= 0) {
             if (n < 0 && errno == EINTR) {
                 continue;
@@ -724,6 +779,7 @@ static int run_sendfile_client(const char *server_ip, const char *filename)
         }
         sent += n;
     }
+    free(memory);
 
     /* 3. 等接收端确认已落盘 */
     char ack[64];
@@ -731,6 +787,7 @@ static int run_sendfile_client(const char *server_ip, const char *filename)
     if (recv_all(sock, ack, sizeof("sync finished")) != 0) {
         return -1;
     }
+    if (memcmp(ack, "sync finished", sizeof("sync finished")) != 0) return -1;
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
 
@@ -761,6 +818,8 @@ int main(int argc, char *argv[])
     const char *role = argv[2];
 
     if (strcmp(role, "server") == 0) {
+        profile = argc > 4 ? atoi(argv[4]) : 2;
+        if (profile < 0 || profile > 2) { usage(argv[0]); return -1; }
         /* 从机：接收方 */
         const char *outfile = (argc > 3)
                             ? argv[3]
@@ -770,6 +829,8 @@ int main(int argc, char *argv[])
     }
 
     if (strcmp(role, "client") == 0) {
+        profile = argc > 5 ? atoi(argv[5]) : 2;
+        if (profile < 0 || profile > 2) { usage(argv[0]); return -1; }
         /* 主机：发送方 */
         if (argc < 4) {
             fprintf(stderr, "client 需要指定从机 IP\n");
