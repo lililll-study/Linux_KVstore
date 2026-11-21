@@ -690,7 +690,9 @@ int persistence_reset_aof(void)
 // 退出清理：进程退出时清理 AOF 子系统。
 void persistence_shutdown(void)
 {   
+#if ENABLE_FWD_QUEUE
     sync_net_forward_stop();      /* ★ 先停转发线程，排空队列 */
+#endif
     persist_snap_stop();          /* 先关 SNAP 落盘通道并写完最后一批 */
 
     // 先关闭uring
