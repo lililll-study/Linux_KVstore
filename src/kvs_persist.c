@@ -333,8 +333,7 @@ static const char *crc32_to_hex(uint32_t crc) {
     return hexbuf;
 }
 
-/* 锁内遍历 hash 表，把条目原文拷进打包缓冲（不格式化、不算 CRC）
- * 调用方需持 g_data_lock 读锁 */
+/* 锁内遍历 hash 表，把条目原文拷进打包缓冲（不格式化、不算 CRC） */
 static int snap_pack_hash(snap_buf_t *b) {
     int i = 0;
     for (i = 0; i < global_hash.max_slots; i++) {
@@ -419,8 +418,7 @@ int save_snapshot_hash(const char *filename) {
     return 0;
 }
 
-/* 锁内遍历 skiptable，条目原文拷进打包缓冲
- * 调用方需持 g_data_lock 读锁 */
+/* 锁内遍历 skiptable，条目原文拷进打包缓冲 */
 static int snap_pack_skiptable(snap_buf_t *b) {
     kvs_node_t *curr = global_skiptable.header->forward[0];
     while (curr != NULL) {
@@ -692,6 +690,7 @@ int persistence_reset_aof(void)
 // 退出清理：进程退出时清理 AOF 子系统。
 void persistence_shutdown(void)
 {   
+    sync_net_forward_stop();      /* ★ 先停转发线程，排空队列 */
     persist_snap_stop();          /* 先关 SNAP 落盘通道并写完最后一批 */
 
     // 先关闭uring
@@ -716,9 +715,6 @@ static volatile int   g_snap_run = 0;           /* 保存线程运行标志 */
 static volatile int   g_snap_saving = 0;        /* 1=有一轮保存未完成（防重入） */
 static pthread_mutex_t g_snap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_snap_cond = PTHREAD_COND_INITIALIZER;
-
-/* 全局数据锁：写命令持写锁，读命令持读锁 */
-pthread_rwlock_t g_data_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* ===== 子进程侧：流式写盘（静态缓冲，全程禁 malloc/LOG/io_uring） =====
  * fork 出的子进程持有 fork 瞬间的 COW 冻结镜像：

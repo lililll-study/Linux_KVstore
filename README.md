@@ -407,11 +407,11 @@ sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
 
 
 
-| 传输方式            | 吞吐量(MB/s)   |                              |
-| --------------- | ----------- | ---------------------------- |
-| iperf3          | 893.75 MB/s |                              |
-| sendfile        | 576.35MB/s  |                              |
-| RDMA（soft-roce） | 272.03 MB/s |  |
+| 传输方式            | 吞吐量(MB/s)   |     |
+| --------------- | ----------- | --- |
+| iperf3          | 893.75 MB/s |     |
+| sendfile        | 576.35MB/s  |     |
+| RDMA（soft-roce） | 272.03 MB/s |     |
 
 
 
@@ -420,19 +420,24 @@ sudo pkill -9 tcp_server & sudo pkill -9 rdma_server & sudo pkill -9 iperf3
 ```bash
 #ebpf性能测试
 主机
-chmod +x ./test/7_qps_bench.sh
-sudo ./test/7_qps_bench.sh full 5 192.168.137.139 2000
+sudo ./build/kvstore --config master.conf
 从机
 sudo ./build/kvstore --config slave.conf
+
+
+主机客户端
+./build/1_RESP_testcase 8 0
+
+开关主机ebpf来测试性能数据
 ```
 
 
 
 | 同步模式 (Sync Mode) | 平均 QPS (5轮) |
 | ---------------- | ----------- |
-| **关闭主从同步**       | **11248**   |
-| **开启主从—网络转发**    | **9886**    |
-| **开启主从—ebpf转发**  | **6701**    |
+| **关闭主从同步**       | **22807.3** |
+| **开启主从—网络转发**    | **16012.1** |
+| **开启主从—ebpf转发**  | **7493**    |
 
 
 

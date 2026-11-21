@@ -275,9 +275,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
     switch (cmd) {
 #if ENABLE_HASH
         case KVS_CMD_HSET:
-            DATA_WLOCK();
             ret = kvs_hash_set(&global_hash ,key, value);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -290,20 +288,16 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             
             break;
         case KVS_CMD_HGET: {
-            DATA_RLOCK();
             char *result = kvs_hash_get(&global_hash, key);
             if (result == NULL) {
                 SAFE_APPEND("$-1\r\n");     // 空值
             } else {
                 SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
-            DATA_UNLOCK();
             break;
         }
         case KVS_CMD_HDEL:
-            DATA_WLOCK();
             ret = kvs_hash_del(&global_hash ,key);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -315,9 +309,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             }
             break;
         case KVS_CMD_HMOD:
-            DATA_WLOCK();
             ret = kvs_hash_mod(&global_hash ,key, value);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -329,9 +321,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             }
             break;
         case KVS_CMD_HEXIST:
-            DATA_RLOCK();
             ret = kvs_hash_exist(&global_hash ,key);
-            DATA_UNLOCK();
             if (ret == 0) {
                 SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {
@@ -341,9 +331,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
 #endif
 #if ENABLE_SKIPTABLE
         case KVS_CMD_SSET:
-            DATA_WLOCK();
             ret = kvs_skiptable_set(&global_skiptable, key, value);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -356,20 +344,16 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_SGET:{
-            DATA_RLOCK();
             char *result = kvs_skiptable_get(&global_skiptable, key);
             if (result == NULL) {
                 SAFE_APPEND("$-1\r\n");     // 空值
             } else {
                 SAFE_APPEND("$%zu\r\n%s\r\n", strlen(result), result);
             }
-            DATA_UNLOCK();
             break;
         }
         case KVS_CMD_SDEL:
-            DATA_WLOCK();
             ret = kvs_skiptable_del(&global_skiptable, key);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -383,9 +367,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_SMOD:
-            DATA_WLOCK();
             ret = kvs_skiptable_mod(&global_skiptable, key, value);
-            DATA_UNLOCK();
             if (ret < 0) {
                 SAFE_APPEND("-ERR invalid arguments\r\n");
             } else if (ret == 0) {
@@ -398,9 +380,7 @@ int kvs_filter_protocol(int fd, char **tokens, int count, char *response) {
             }
             break;
         case KVS_CMD_SEXIST:
-            DATA_RLOCK();
             ret = kvs_skiptable_exist(&global_skiptable, key);
-            DATA_UNLOCK();
             if (ret == 0) {
                 SAFE_APPEND(":1\r\n");      // 存在 → 1
             } else {

@@ -56,7 +56,7 @@ int safe_send(int fd, const char* data, int len) {
         int n = send(fd, data + total, len - total, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);
+                usleep(10);
                 continue;      // 流控，正常，不打印
             }
             SYNC_ERR("safe_send fd=%d errno=%d (%s)", fd, errno, strerror(errno));
@@ -70,6 +70,164 @@ int safe_send(int fd, const char* data, int len) {
     }
     return total;
 }
+
+#if ENABLE_FWD_QUEUE
+/**
+ * 网络转发异步队列（仅 ebpf.enable=false 的直发路径使用）
+ * 模型：单生产者（主业务线程），单消费者（发送线程）
+ *   - 生产：malloc 节点 + memcpy 字节串 + 挂尾，临界区仅此，微秒级
+ *   - 消费：取头节点 → safe_send → free
+ *   - 保序：FIFO 保证主从命令顺序一致
+ */
+#define SEND_QUEUE_MAX (32u << 20)      // 32MB队列上限
+
+typedef struct fwd_node {
+    struct fwd_node *next;
+    int     len;
+    char    data[];
+} fwd_node_t;
+
+
+static fwd_node_t *fwd_head = NULL;
+static fwd_node_t *fwd_tail = NULL;
+static unsigned int fwd_bytes = 0;
+
+static pthread_mutex_t fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fwd_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t fwd_tid;
+static int fwd_started = 0; //  1表示线程已经创建
+static int fwd_run = 0; //  1表示线程已经运行
+
+
+/**
+ * 后台发送线程：FIFO取节点，safe_send发出，释放节点
+ */
+static void *fwd_send_thread(void *arg) {
+
+    (void)arg;
+
+    while(1) {
+        pthread_mutex_lock(&fwd_mutex);
+        // 如果线程在运行且队列头节点位空，那么线程等待
+        while (fwd_run && fwd_head == NULL) {
+            pthread_cond_wait(&fwd_cond, &fwd_mutex);
+        }
+        /* 退出条件：收到 stop 且队列已排空 */
+        if (!fwd_run && fwd_head == NULL) {
+            pthread_mutex_unlock(&fwd_mutex);
+            break;
+        }
+
+        fwd_node_t *node = fwd_head;
+        fwd_head = node->next;
+        if (fwd_head == NULL) fwd_tail = NULL;
+        fwd_bytes -= (unsigned int)node->len;
+        pthread_mutex_unlock(&fwd_mutex);
+
+        if (g_slave_incr_fd > 0) {
+
+            safe_send(g_slave_incr_fd, node->data, node->len);
+        }
+
+        free(node);
+    }
+    return NULL;
+}
+
+// 启动线程：第一次有命令要转发时才创建线程
+static void fwd_thread_start(void) {
+
+    if (fwd_started) return;
+
+    fwd_run = 1;
+    if (pthread_create(&fwd_tid, NULL, fwd_send_thread, NULL) != 0) {
+        LOG_ERROR("[SYNC] 创建转发线程失败，回退为命令线程内同步发送");
+        fwd_run = 0;
+        return;
+    }
+    fwd_started = 1;
+}
+
+/* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
+ * 与 eBPF 转发自动二选一：ebpf.enable=false 时走本路径（增量同步总得有通道）。
+ * 全量同步窗口期间从机接收线程尚未就绪，数据会先堆在 socket 缓冲，
+ * 就绪后被自动消费——语义上等价于 eBPF 模式的"窗口缓存补发"。 */
+void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
+    if (g_config.ebpf_enable || !g_is_master || g_slave_incr_fd <= 0) return;
+
+    static char fwd_buf[512];   /* 命令线程单线程写，入队前已拷走，安全 */
+    int n;
+    if (value) {
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd, strlen(key), key, strlen(value), value);
+    } else if (key) {
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd, strlen(key), key);
+    } else {
+        /* 无参命令（SAVE）：*1 单元素数组 */
+        n = snprintf(fwd_buf, sizeof(fwd_buf),
+                     "*1\r\n$%zu\r\n%s\r\n",
+                     strlen(cmd), cmd);
+    }
+    if (n <= 0 || n >= (int)sizeof(fwd_buf)) return;
+
+
+    fwd_thread_start();
+    /* 线程没起来（创建失败）：退化为原来的同步发送，保证功能不丢 */
+    if (!fwd_started) {
+        safe_send(g_slave_incr_fd, fwd_buf, n);
+        return;
+    }
+
+    // RESP数据入队
+    pthread_mutex_lock(&fwd_mutex);
+
+    /* 队列超限：从机长期不读，主从已脱节，丢本条（等重同步） */
+    if (fwd_bytes + (unsigned int)n > SEND_QUEUE_MAX) {
+        pthread_mutex_unlock(&fwd_mutex);
+        LOG_WARN("[SYNC] 转发队列满（%u 字节），丢弃一条命令", SEND_QUEUE_MAX);
+        return;
+    }
+
+    fwd_node_t *node = (fwd_node_t *)malloc(sizeof(fwd_node_t) + (size_t)n);
+    if (node == NULL) {
+        pthread_mutex_unlock(&fwd_mutex);
+        return;
+    }
+    node->len  = n;
+    node->next = NULL;
+    memcpy(node->data, fwd_buf, (size_t)n);
+
+    if (fwd_tail) 
+        fwd_tail->next = node;
+    else            
+        fwd_head = node;
+
+    fwd_tail = node;
+    fwd_bytes += (unsigned int)n;
+    pthread_cond_signal(&fwd_cond);
+
+    pthread_mutex_unlock(&fwd_mutex);
+}
+
+/* 停止转发线程：置退出标志 → join（线程会把队列排空后退出）→ 清残留。
+ * 幂等，可重复调用。 */
+void sync_net_forward_stop(void)
+{
+    if (!fwd_started) return;
+
+    pthread_mutex_lock(&fwd_mutex);
+    fwd_run = 0;
+    pthread_cond_signal(&fwd_cond);
+    pthread_mutex_unlock(&fwd_mutex);
+
+    pthread_join(fwd_tid, NULL);
+    fwd_started = 0;
+}
+
+#else
 
 /* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
  * 与 eBPF 转发自动二选一：ebpf.enable=false 时走本路径（增量同步总得有通道）。
@@ -98,6 +256,10 @@ void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
         safe_send(g_slave_incr_fd, fwd_buf, n);
     }
 }
+
+#endif
+
+
 
 // ===== 从节点接收aof--超时5s自动发心跳 =====
 static int recv_with_timeout(int fd, void *buf, size_t len, int timeout_sec) {

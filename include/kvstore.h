@@ -56,6 +56,7 @@
 #define ENABLE_EBPF         1   // 打开ebpf功能
 #define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
+#define ENABLE_FWD_QUEUE    1   // 打开主从同步中的异步发送队列功能，关闭则为阻塞发送
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
     if (g_is_master && (fd) >= 0) {                             \
@@ -200,22 +201,11 @@ void persistence_shutdown(void);
 int  persist_snap_start(void);     /* 打开 SNAP 文件、初始化 uring、启动后台保存线程 */
 void persist_snap_stop(void);      /* 先 join 保存线程，再 flush 并关闭通道 */
 int  persist_snap_request(void);   /* SAVE 命令用：仅唤醒后台线程，立即返回（=已受理） */
-
-/* ===== 数据锁：写命令持写锁，读命令/快照遍历持读锁 =====
- * 防止快照线程遍历内存表时，写命令（含从机增量接收线程）改动链表 */
-extern pthread_rwlock_t g_data_lock;
-#define DATA_RLOCK()    pthread_rwlock_rdlock(&g_data_lock)
-#define DATA_WLOCK()    pthread_rwlock_wrlock(&g_data_lock)
-#define DATA_UNLOCK()   pthread_rwlock_unlock(&g_data_lock)
 #else
-/* 非 io_uring 版本：异步 SNAP 通道不存在，接口降级为空操作；
- * 命令侧的数据锁也降级为无锁（该版本内存表本来也不存在后台并发访问） */
+/* 非 io_uring 版本：异步 SNAP 通道不存在，接口降级为空操作 */
 static inline int  persist_snap_start(void)   { return 0; }
 static inline void persist_snap_stop(void)    {}
 static inline int  persist_snap_request(void) { return -1; }
-#define DATA_RLOCK()    ((void)0)
-#define DATA_WLOCK()    ((void)0)
-#define DATA_UNLOCK()   ((void)0)
 
 // 快照文件路径（放在 data 目录下）
 #define SNAP_HASH_FILE      "data/hash.snap"
@@ -419,7 +409,7 @@ int is_sync_peer(int fd);       // fd 是否为同步（复制）连接
 
 void init_aof_sync_ctx(void);
 
-
+void sync_net_forward_stop(void);
 // 从节点处理同步数据线程，以及接口函数
 int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 
