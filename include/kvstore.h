@@ -56,7 +56,7 @@
 #define ENABLE_EBPF         1   // 打开ebpf功能
 #define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
-#define ENABLE_FWD_QUEUE    0   // 打开主从同步中的异步发送队列功能，关闭则为阻塞发送
+#define ENABLE_FWD_QUEUE    1   // 打开主从同步中的异步发送队列功能，关闭则为阻塞发送
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
     if (g_is_master && (fd) >= 0) {                             \

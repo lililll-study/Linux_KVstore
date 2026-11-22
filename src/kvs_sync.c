@@ -84,6 +84,7 @@ int safe_send(int fd, const char* data, int len) {
 typedef struct fwd_node {
     struct fwd_node *next;
     int     len;
+    int     cap;    /* data 区实际容量：复用节点时必须校验，短节点装长命令会堆溢出 */
     char    data[];
 } fwd_node_t;
 
@@ -91,6 +92,7 @@ typedef struct fwd_node {
 static fwd_node_t *fwd_head = NULL;
 static fwd_node_t *fwd_tail = NULL;
 static unsigned int fwd_bytes = 0;
+static fwd_node_t *fwd_free_list = NULL;   /* 释放的节点挂回这里，复用避免 malloc 抖动 */
 
 static pthread_mutex_t fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t fwd_cond = PTHREAD_COND_INITIALIZER;
@@ -99,16 +101,20 @@ static int fwd_started = 0; //  1表示线程已经创建
 static int fwd_run = 0; //  1表示线程已经运行
 
 
+#define SEND_BATCH_MAX  16384   /* 单次合并发送上限，和 eBPF 的 64KB 攒批对齐 */
+
 /**
- * 后台发送线程：FIFO取节点，safe_send发出，释放节点
+ * 后台发送线程：一次摘下整条链，合并成一个大包 send，减少唤醒次数和系统调用数
  */
 static void *fwd_send_thread(void *arg) {
 
     (void)arg;
 
+    char batch[SEND_BATCH_MAX];
+
     while(1) {
         pthread_mutex_lock(&fwd_mutex);
-        // 如果线程在运行且队列头节点位空，那么线程等待
+        // 如果线程在运行且队列为空，那么线程等待
         while (fwd_run && fwd_head == NULL) {
             pthread_cond_wait(&fwd_cond, &fwd_mutex);
         }
@@ -118,18 +124,49 @@ static void *fwd_send_thread(void *arg) {
             break;
         }
 
-        fwd_node_t *node = fwd_head;
-        fwd_head = node->next;
-        if (fwd_head == NULL) fwd_tail = NULL;
-        fwd_bytes -= (unsigned int)node->len;
-        pthread_mutex_unlock(&fwd_mutex);
+        /* 1. 整条链一次性摘下来，立刻放锁（锁内不做任何 IO/内存释放以外的重活） */
+        fwd_node_t *chain = fwd_head;
+        fwd_head = NULL;
+        fwd_tail = NULL;
 
-        if (g_slave_incr_fd > 0) {
-
-            safe_send(g_slave_incr_fd, node->data, node->len);
+        /* 2. 顺序合并进 batch，装得下多少算多少 */
+        int len = 0;
+        fwd_node_t *it = chain;
+        while (it != NULL && len + it->len <= (int)sizeof(batch)) {
+            memcpy(batch + len, it->data, (size_t)it->len);
+            len += it->len;
+            it = it->next;
         }
 
-        free(node);
+        /* 3. 装不下的剩余部分原样放回队列头，并修复 fwd_tail
+         * （摘链时 tail 被置 NULL，有剩余时必须重新找尾，否则生产者入队会孤立这条链） */
+        fwd_head = it;
+        if (it == NULL) {
+            fwd_tail = NULL;
+        } else {
+            fwd_node_t *t = it;
+            while (t->next != NULL) t = t->next;
+            fwd_tail = t;
+        }
+        fwd_bytes -= (unsigned int)len;    /* 本次真正发走的字节数，剩余放回的不算 */
+        pthread_mutex_unlock(&fwd_mutex);
+
+        /* 4. 锁外一次 send 发出去（锁外失败处理和原来保持一致） */
+        if (len > 0 && g_slave_incr_fd > 0) {
+            safe_send(g_slave_incr_fd, batch, len);
+        }
+
+        /* 5. 发完统一把节点挂回空闲链复用
+         * 必须持锁：生产者分配节点时也在锁内读写 fwd_free_list，
+         * 否则两边并发改同一条链会把指针写花（曾导致段错误） */
+        pthread_mutex_lock(&fwd_mutex);
+        while (chain != it) {
+            fwd_node_t *next = chain->next;
+            chain->next = fwd_free_list;
+            fwd_free_list = chain;
+            chain = next;
+        }
+        pthread_mutex_unlock(&fwd_mutex);
     }
     return NULL;
 }
@@ -191,11 +228,31 @@ void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
         return;
     }
 
-    fwd_node_t *node = (fwd_node_t *)malloc(sizeof(fwd_node_t) + (size_t)n);
+    /* 优先复用空闲节点：只有容量够大才能复用，否则短节点装长命令会写坏堆
+     * （曾触发 glibc "corrupted size vs. prev_size" abort）。
+     * 容量不够的节点跳过它继续找，实在没有才 malloc。 */
+    fwd_node_t *node = NULL;
+    fwd_node_t **hook = &fwd_free_list;         /* 指向前驱的 next 指针，便于摘链 */
+    while (*hook != NULL) {
+        if ((*hook)->cap >= n) {
+            node  = *hook;
+            *hook = node->next;                 /* 从空闲链摘掉 */
+            break;
+        }
+        hook = &(*hook)->next;
+    }
+    if (node == NULL) {
+        node = (fwd_node_t *)malloc(sizeof(fwd_node_t) + (size_t)n);
+        if (node != NULL) {
+            node->cap = n;                      /* 新节点容量 = 本次长度 */
+        }
+    }
     if (node == NULL) {
         pthread_mutex_unlock(&fwd_mutex);
         return;
     }
+
+
     node->len  = n;
     node->next = NULL;
     memcpy(node->data, fwd_buf, (size_t)n);
@@ -225,6 +282,23 @@ void sync_net_forward_stop(void)
 
     pthread_join(fwd_tid, NULL);
     fwd_started = 0;
+    /* 清残留：队列剩余节点 + 空闲链节点（此时线程已退出，无需持锁） */
+    fwd_node_t *it = fwd_head;
+    while (it != NULL) {
+        fwd_node_t *next = it->next;
+        free(it);
+        it = next;
+    }
+    fwd_head = fwd_tail = NULL;
+    fwd_bytes = 0;
+
+    it = fwd_free_list;
+    while (it != NULL) {
+        fwd_node_t *next = it->next;
+        free(it);
+        it = next;
+    }
+    fwd_free_list = NULL;
 }
 
 #else
