@@ -7,6 +7,8 @@
 #include <sys/stat.h>  
 #include <fcntl.h>     
 #include <errno.h>
+#include <poll.h>
+
 
 /* ===== 当定义 SYNC_RAW_IO 时，绕过 NtyCo hook，直接走系统调用 ===== */
 #ifdef SYNC_RAW_IO
@@ -56,8 +58,24 @@ int safe_send(int fd, const char* data, int len) {
         int n = send(fd, data + total, len - total, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(10);
-                continue;      // 流控，正常，不打印
+
+                struct pollfd pfd = {
+                    .fd = fd,
+                    .events = POLLOUT
+                };
+
+                int ret;
+
+                do {
+                    ret = poll(&pfd, 1, -1);
+                } while (ret < 0 && errno == EINTR);
+
+                if (ret <= 0 ||
+                    (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    return -1;
+                }
+
+                continue;
             }
             SYNC_ERR("safe_send fd=%d errno=%d (%s)", fd, errno, strerror(errno));
             return -1;
@@ -71,263 +89,487 @@ int safe_send(int fd, const char* data, int len) {
     return total;
 }
 
+
 #if ENABLE_FWD_QUEUE
-/**
- * 网络转发异步队列（仅 ebpf.enable=false 的直发路径使用）
- * 模型：单生产者（主业务线程），单消费者（发送线程）
- *   - 生产：malloc 节点 + memcpy 字节串 + 挂尾，临界区仅此，微秒级
- *   - 消费：取头节点 → safe_send → free
- *   - 保序：FIFO 保证主从命令顺序一致
- */
-#define SEND_QUEUE_MAX (32u << 20)      // 32MB队列上限
+
+/* =====================================================================
+ * 异步转发 P0 方案：预分配内存池 + FIFO 节点链表
+ *
+ * 主线程（生产者）：接收已成功执行的写命令 → 从内存池取节点 →
+ *                   只复制 cmd/key/value 原文入队（不拼 RESP）→ 解锁返回
+ * 发送线程（消费者）：等队列非空 → 一次摘取一批 → 锁外统一拼接 RESP 进
+ *                   64KB 缓冲 → 批量 safe_send → 成功后整批回收节点；
+ *                   失败则记录数量/内容/原因，标记连接失效，回收但不静默丢弃
+ * 统一由内存池管理命令节点、队列顺序和空闲内存，运行期零 malloc
+ * ===================================================================== */
+
+#define FWD_POOL_SIZE     (64u << 20)   /* 内存池总大小：64MB，启动时一次分配 */
+#define FWD_SLOT_DATA     1024          /* 单节点数据区：cmd\0key\0val 紧挨存放 */
+#define FWD_BATCH_SIZE    (64u << 10)   /* 发送线程单批拼包上限 64KB */
 
 typedef struct fwd_node {
     struct fwd_node *next;
-    int     len;
-    int     cap;    /* data 区实际容量：复用节点时必须校验，短节点装长命令会堆溢出 */
-    char    data[];
+    int cmd_len;                        /* 各字段长度均含末尾 '\0' */
+    int key_len;
+    int val_len;                        /* -1 表示无 value（如 HDEL），拼 *2 包 */
+    char data[FWD_SLOT_DATA];
 } fwd_node_t;
 
+#define FWD_SLOT_COUNT  (FWD_POOL_SIZE / (int)sizeof(fwd_node_t))
 
-static fwd_node_t *fwd_head = NULL;
-static fwd_node_t *fwd_tail = NULL;
-static unsigned int fwd_bytes = 0;
-static fwd_node_t *fwd_free_list = NULL;   /* 释放的节点挂回这里，复用避免 malloc 抖动 */
+static fwd_node_t *fwd_pool       = NULL;   /* 内存池首地址（进程生命周期） */
+static fwd_node_t *fwd_free_list  = NULL;   /* 空闲节点链（回收的节点挂回这里） */
+static fwd_node_t *fwd_head       = NULL;   /* FIFO 队头（消费者摘取端） */
+static fwd_node_t *fwd_tail       = NULL;   /* FIFO 队尾（生产者追加端） */
+static unsigned int fwd_cnt       = 0;      /* 队列当前条数 */
+
+/* 运行统计 */
+static unsigned long fwd_stat_enqueued     = 0;
+static unsigned long fwd_stat_sent         = 0;
+static unsigned long fwd_stat_drop_pool    = 0;   /* 内存池耗尽丢弃 */
+static unsigned long fwd_stat_drop_fail    = 0;   /* 发送失败丢弃 */
+
+static int fwd_run = 0;
+static int fwd_started = 0;
+static int fwd_failed = 0;
 
 static pthread_mutex_t fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t fwd_start_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static pthread_cond_t fwd_cond = PTHREAD_COND_INITIALIZER;
+
 static pthread_t fwd_tid;
-static int fwd_started = 0; //  1表示线程已经创建
-static int fwd_run = 0; //  1表示线程已经运行
 
 
-#define SEND_BATCH_MAX  16384   /* 单次合并发送上限，和 eBPF 的 64KB 攒批对齐 */
+/* 启动时一次性分配内存池，并把所有节点串成空闲链 */
+static int fwd_pool_init(void)
+{
+    if (fwd_pool != NULL)
+        return 0;
 
-/**
- * 后台发送线程：一次摘下整条链，合并成一个大包 send，减少唤醒次数和系统调用数
- */
-static void *fwd_send_thread(void *arg) {
+    fwd_pool = (fwd_node_t *)malloc(FWD_POOL_SIZE);
 
+    if (fwd_pool == NULL) {
+        LOG_ERROR("[SYNC] forward pool malloc %u bytes failed", FWD_POOL_SIZE);
+        return -1;
+    }
+
+    fwd_free_list = NULL;
+
+    for (int i = FWD_SLOT_COUNT - 1; i >= 0; i--) {
+        fwd_node_t *node = &fwd_pool[i];
+        node->next = fwd_free_list;
+        fwd_free_list = node;
+    }
+
+    LOG_INFO("[SYNC] forward pool ready: %u MB, %d slots",
+             FWD_POOL_SIZE >> 20, FWD_SLOT_COUNT);
+    return 0;
+}
+
+
+/* 后台发送线程：等非空 → 摘一批 → 锁外拼 RESP → 批量发送 → 回收 */
+static void *fwd_send_thread(void *arg)
+{
     (void)arg;
 
-    char batch[SEND_BATCH_MAX];
+    char batch[FWD_BATCH_SIZE];
 
-    while(1) {
+    while (1) {
+
         pthread_mutex_lock(&fwd_mutex);
-        // 如果线程在运行且队列为空，那么线程等待
-        while (fwd_run && fwd_head == NULL) {
+
+        /* 队列空则等待；停止且已排空才退出 */
+        while (fwd_run && fwd_cnt == 0) {
             pthread_cond_wait(&fwd_cond, &fwd_mutex);
         }
-        /* 退出条件：收到 stop 且队列已排空 */
-        if (!fwd_run && fwd_head == NULL) {
+
+        if (!fwd_run && fwd_cnt == 0) {
             pthread_mutex_unlock(&fwd_mutex);
             break;
         }
 
-        /* 1. 整条链一次性摘下来，立刻放锁（锁内不做任何 IO/内存释放以外的重活） */
+        /* 一次摘取整批链表，立刻放锁（拼包和发送都在锁外） */
         fwd_node_t *chain = fwd_head;
+        fwd_node_t *rest  = NULL;       /* 64KB 装不下的剩余部分 */
         fwd_head = NULL;
         fwd_tail = NULL;
 
-        /* 2. 顺序合并进 batch，装得下多少算多少 */
-        int len = 0;
+        unsigned int batch_cnt = fwd_cnt;
+        fwd_cnt = 0;
+
+        pthread_mutex_unlock(&fwd_mutex);
+
+        /* ---- 锁外统一拼接 RESP ---- */
+        size_t len = 0;
+        unsigned int fmt_cnt = 0;
         fwd_node_t *it = chain;
-        while (it != NULL && len + it->len <= (int)sizeof(batch)) {
-            memcpy(batch + len, it->data, (size_t)it->len);
-            len += it->len;
+
+        while (it != NULL) {
+
+            char *p = it->data;
+            const char *cmd = p;    p += it->cmd_len;
+            const char *key = p;    p += it->key_len;
+
+            int n;
+            if (it->val_len > 0) {
+                n = snprintf(batch + len, FWD_BATCH_SIZE - len,
+                    "*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+                    it->cmd_len - 1, cmd,
+                    it->key_len - 1, key,
+                    it->val_len - 1, p);
+            } else {
+                n = snprintf(batch + len, FWD_BATCH_SIZE - len,
+                    "*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+                    it->cmd_len - 1, cmd,
+                    it->key_len - 1, key);
+            }
+
+            if (n < 0 || n >= (int)(FWD_BATCH_SIZE - len))
+                break;                      /* 本批装满，剩余留给下一轮 */
+
+            len += (size_t)n;
+            fmt_cnt++;
             it = it->next;
         }
+        rest = it;
 
-        /* 3. 装不下的剩余部分原样放回队列头，并修复 fwd_tail
-         * （摘链时 tail 被置 NULL，有剩余时必须重新找尾，否则生产者入队会孤立这条链） */
-        fwd_head = it;
-        if (it == NULL) {
-            fwd_tail = NULL;
+        /* ---- 批量发送 ---- */
+        int fd = g_slave_incr_fd;
+        int send_ok = 1;
+
+        if (len > 0) {
+            if (fd < 0 || safe_send(fd, batch, (int)len) < 0) {
+                send_ok = 0;
+            }
+        }
+
+        if (send_ok) {
+
+            fwd_stat_sent += fmt_cnt;
+
+            /* 发送成功的节点整批回收进空闲链（锁内，与生产者取节点互斥） */
+            pthread_mutex_lock(&fwd_mutex);
+
+            while (chain != rest) {
+                fwd_node_t *next = chain->next;
+                chain->next = fwd_free_list;
+                fwd_free_list = chain;
+                chain = next;
+            }
+
+            /* 装不下的剩余部分放回队头（它仍是完整链表，需修复队尾） */
+            fwd_head = rest;
+
+            if (rest != NULL) {
+                fwd_node_t *t = rest;
+                while (t->next != NULL) t = t->next;
+                fwd_tail = t;
+                fwd_cnt = batch_cnt - fmt_cnt;
+            }
+
+            pthread_mutex_unlock(&fwd_mutex);
+
         } else {
-            fwd_node_t *t = it;
-            while (t->next != NULL) t = t->next;
-            fwd_tail = t;
-        }
-        fwd_bytes -= (unsigned int)len;    /* 本次真正发走的字节数，剩余放回的不算 */
-        pthread_mutex_unlock(&fwd_mutex);
 
-        /* 4. 锁外一次 send 发出去（锁外失败处理和原来保持一致） */
-        if (len > 0 && g_slave_incr_fd > 0) {
-            safe_send(g_slave_incr_fd, batch, len);
-        }
+            /* 发送失败：记录数量、首条命令内容、失败原因，再回收——不静默丢弃 */
+            const char *reason = (fd < 0) ? "no connection"
+                                : "send failed";
+            SYNC_ERR("[SYNC] forward batch FAILED: reason=%s, "
+                     "batch=%u cmds %zu bytes, first_cmd=%s",
+                     reason, batch_cnt, len,
+                     chain != NULL ? chain->data : "?");
 
-        /* 5. 发完统一把节点挂回空闲链复用
-         * 必须持锁：生产者分配节点时也在锁内读写 fwd_free_list，
-         * 否则两边并发改同一条链会把指针写花（曾导致段错误） */
-        pthread_mutex_lock(&fwd_mutex);
-        while (chain != it) {
-            fwd_node_t *next = chain->next;
-            chain->next = fwd_free_list;
-            fwd_free_list = chain;
-            chain = next;
+            fwd_stat_drop_fail += batch_cnt;
+
+            /* 标记本次复制连接失败：停止生产者入队，等从机重新 SYNC 全量恢复 */
+            pthread_mutex_lock(&fwd_mutex);
+            fwd_failed = 1;
+            g_slave_incr_fd = -1;
+            pthread_mutex_unlock(&fwd_mutex);
+
+            /* 回收整批节点（含未拼接的剩余），数据随重同步恢复 */
+            while (chain != NULL) {
+                fwd_node_t *next = chain->next;
+                chain->next = fwd_free_list;
+                fwd_free_list = chain;
+                chain = next;
+            }
         }
-        pthread_mutex_unlock(&fwd_mutex);
     }
+
     return NULL;
 }
 
-// 启动线程：第一次有命令要转发时才创建线程
-static void fwd_thread_start(void) {
 
-    if (fwd_started) return;
+/* 启动发送线程（首次调用分配内存池；断线重连后可重复调用） */
+static int fwd_thread_start(void)
+{
+    pthread_mutex_lock(&fwd_start_mutex);
 
-    fwd_run = 1;
-    if (pthread_create(&fwd_tid, NULL, fwd_send_thread, NULL) != 0) {
-        LOG_ERROR("[SYNC] 创建转发线程失败，回退为命令线程内同步发送");
-        fwd_run = 0;
-        return;
-    }
-    fwd_started = 1;
-}
-
-/* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
- * 与 eBPF 转发自动二选一：ebpf.enable=false 时走本路径（增量同步总得有通道）。
- * 全量同步窗口期间从机接收线程尚未就绪，数据会先堆在 socket 缓冲，
- * 就绪后被自动消费——语义上等价于 eBPF 模式的"窗口缓存补发"。 */
-void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
-    if (g_config.ebpf_enable || !g_is_master || g_slave_incr_fd <= 0) return;
-
-    static char fwd_buf[512];   /* 命令线程单线程写，入队前已拷走，安全 */
-    int n;
-    if (value) {
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
-                     "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     strlen(cmd), cmd, strlen(key), key, strlen(value), value);
-    } else if (key) {
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
-                     "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     strlen(cmd), cmd, strlen(key), key);
-    } else {
-        /* 无参命令（SAVE）：*1 单元素数组 */
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
-                     "*1\r\n$%zu\r\n%s\r\n",
-                     strlen(cmd), cmd);
-    }
-    if (n <= 0 || n >= (int)sizeof(fwd_buf)) return;
-
-
-    fwd_thread_start();
-    /* 线程没起来（创建失败）：退化为原来的同步发送，保证功能不丢 */
     if (!fwd_started) {
-        safe_send(g_slave_incr_fd, fwd_buf, n);
-        return;
+
+        if (fwd_pool_init() != 0) {
+            pthread_mutex_unlock(&fwd_start_mutex);
+            return -1;
+        }
+
+        pthread_mutex_lock(&fwd_mutex);
+        fwd_run = 1;
+        fwd_failed = 0;
+        pthread_cond_broadcast(&fwd_cond);
+        pthread_mutex_unlock(&fwd_mutex);
+
+        if (pthread_create(&fwd_tid, NULL,
+                           fwd_send_thread, NULL) != 0) {
+
+            pthread_mutex_lock(&fwd_mutex);
+            fwd_run = 0;
+            pthread_mutex_unlock(&fwd_mutex);
+
+            pthread_mutex_unlock(&fwd_start_mutex);
+            return -1;
+        }
+
+        fwd_started = 1;
+
+    } else {
+        /* 线程仍在运行（上次发送失败标记了 failed）：从机重新 SYNC 后恢复转发 */
+        pthread_mutex_lock(&fwd_mutex);
+        fwd_run = 1;
+        fwd_failed = 0;
+        pthread_mutex_unlock(&fwd_mutex);
     }
 
-    // RESP数据入队
     pthread_mutex_lock(&fwd_mutex);
 
-    /* 队列超限：从机长期不读，主从已脱节，丢本条（等重同步） */
-    if (fwd_bytes + (unsigned int)n > SEND_QUEUE_MAX) {
-        pthread_mutex_unlock(&fwd_mutex);
-        LOG_WARN("[SYNC] 转发队列满（%u 字节），丢弃一条命令", SEND_QUEUE_MAX);
+    int ok = fwd_run && !fwd_failed;
+
+    pthread_mutex_unlock(&fwd_mutex);
+    pthread_mutex_unlock(&fwd_start_mutex);
+
+    return ok ? 0 : -1;
+}
+
+
+/* 主节点：已成功执行的写命令进入异步转发队列（生产者，只拷贝原文） */
+void sync_net_forward_cmd(const char *cmd,
+                          const char *key,
+                          const char *value)
+{
+    if (g_config.ebpf_enable ||
+        !g_is_master ||
+        g_slave_incr_fd < 0)
+        return;
+
+    int cmd_len = (int)strlen(cmd) + 1;
+    int key_len = (int)strlen(key) + 1;
+    int val_len = (value != NULL) ? (int)strlen(value) + 1 : -1;
+
+    int total = cmd_len + key_len + (val_len > 0 ? val_len : 0);
+
+    /* 单条超长（本工程 key≤128/value≤512，正常到不了这里），防御性丢弃 */
+    if (total > FWD_SLOT_DATA) {
+        fwd_stat_drop_pool++;
+        LOG_WARN("[SYNC] cmd too long (%d bytes) for slot, dropped", total);
         return;
     }
 
-    /* 优先复用空闲节点：只有容量够大才能复用，否则短节点装长命令会写坏堆
-     * （曾触发 glibc "corrupted size vs. prev_size" abort）。
-     * 容量不够的节点跳过它继续找，实在没有才 malloc。 */
-    fwd_node_t *node = NULL;
-    fwd_node_t **hook = &fwd_free_list;         /* 指向前驱的 next 指针，便于摘链 */
-    while (*hook != NULL) {
-        if ((*hook)->cap >= n) {
-            node  = *hook;
-            *hook = node->next;                 /* 从空闲链摘掉 */
-            break;
-        }
-        hook = &(*hook)->next;
-    }
-    if (node == NULL) {
-        node = (fwd_node_t *)malloc(sizeof(fwd_node_t) + (size_t)n);
-        if (node != NULL) {
-            node->cap = n;                      /* 新节点容量 = 本次长度 */
-        }
-    }
-    if (node == NULL) {
+    pthread_mutex_lock(&fwd_mutex);
+
+    if (!fwd_run || fwd_failed) {
         pthread_mutex_unlock(&fwd_mutex);
         return;
     }
 
+    /* 内存池耗尽：从机长期不消费，丢弃并计数（等重同步恢复） */
+    fwd_node_t *node = fwd_free_list;
 
-    node->len  = n;
+    if (node == NULL) {
+        pthread_mutex_unlock(&fwd_mutex);
+        fwd_stat_drop_pool++;
+        LOG_WARN("[SYNC] forward pool exhausted (%d slots), one cmd dropped",
+                 FWD_SLOT_COUNT);
+        return;
+    }
+
+    fwd_free_list = node->next;
+
+    /* 只复制原文，RESP 拼接留给发送线程 */
+    char *p = node->data;
+    memcpy(p, cmd, (size_t)cmd_len);    p += cmd_len;
+    memcpy(p, key, (size_t)key_len);    p += key_len;
+    if (val_len > 0) {
+        memcpy(p, value, (size_t)val_len);
+    }
+    node->cmd_len = cmd_len;
+    node->key_len = key_len;
+    node->val_len = val_len;
     node->next = NULL;
-    memcpy(node->data, fwd_buf, (size_t)n);
 
-    if (fwd_tail) 
+    /* 入队 + cnt 统计 */
+    int was_empty = (fwd_cnt == 0);
+
+    if (fwd_tail != NULL)
         fwd_tail->next = node;
-    else            
+    else
         fwd_head = node;
 
     fwd_tail = node;
-    fwd_bytes += (unsigned int)n;
-    pthread_cond_signal(&fwd_cond);
+    fwd_cnt++;
+    fwd_stat_enqueued++;
+
+    /* 只在队列空变非空时通知消费者 */
+    if (was_empty) {
+        pthread_cond_signal(&fwd_cond);
+    }
 
     pthread_mutex_unlock(&fwd_mutex);
 }
 
-/* 停止转发线程：置退出标志 → join（线程会把队列排空后退出）→ 清残留。
- * 幂等，可重复调用。 */
+
+/* 停止发送线程：先唤醒排空队列再退出（锁外发送失败则按失败路径回收） */
 void sync_net_forward_stop(void)
 {
-    if (!fwd_started) return;
+    pthread_mutex_lock(&fwd_start_mutex);
+
+    if (!fwd_started) {
+        pthread_mutex_unlock(&fwd_start_mutex);
+        return;
+    }
 
     pthread_mutex_lock(&fwd_mutex);
+
     fwd_run = 0;
-    pthread_cond_signal(&fwd_cond);
+
+    pthread_cond_broadcast(&fwd_cond);
+
     pthread_mutex_unlock(&fwd_mutex);
 
     pthread_join(fwd_tid, NULL);
-    fwd_started = 0;
-    /* 清残留：队列剩余节点 + 空闲链节点（此时线程已退出，无需持锁） */
-    fwd_node_t *it = fwd_head;
-    while (it != NULL) {
-        fwd_node_t *next = it->next;
-        free(it);
-        it = next;
-    }
-    fwd_head = fwd_tail = NULL;
-    fwd_bytes = 0;
 
-    it = fwd_free_list;
-    while (it != NULL) {
-        fwd_node_t *next = it->next;
-        free(it);
-        it = next;
+    /* 线程已退出，把队列残留节点还回空闲链（连接已不可用，数据由重同步恢复） */
+    pthread_mutex_lock(&fwd_mutex);
+
+    unsigned int left = fwd_cnt;
+
+    while (fwd_head != NULL) {
+        fwd_node_t *next = fwd_head->next;
+        fwd_head->next = fwd_free_list;
+        fwd_free_list = fwd_head;
+        fwd_head = next;
     }
-    fwd_free_list = NULL;
+    fwd_tail = NULL;
+    fwd_cnt = 0;
+    fwd_failed = 0;
+
+    pthread_mutex_unlock(&fwd_mutex);
+
+    if (left > 0) {
+        LOG_WARN("[SYNC] forward stop: %u cmds still queued, recycled", left);
+    }
+
+    fwd_started = 0;
+
+    pthread_mutex_unlock(&fwd_start_mutex);
+}
+
+
+/* 队列运行统计：容量 / 已入队 / 已发送 / 丢弃数 */
+void sync_net_forward_stats(void)
+{
+    pthread_mutex_lock(&fwd_mutex);
+    unsigned int in_queue = fwd_cnt;
+    pthread_mutex_unlock(&fwd_mutex);
+
+    LOG_INFO("[SYNC] forward stats: capacity=%d slots, in_queue=%u, "
+             "enqueued=%lu, sent=%lu, drop_pool=%lu, drop_fail=%lu",
+             FWD_SLOT_COUNT, in_queue,
+             fwd_stat_enqueued, fwd_stat_sent,
+             fwd_stat_drop_pool, fwd_stat_drop_fail);
+}
+
+/* 主从增量连接断开时调用 */
+void sync_net_forward_on_disconnect(int fd)
+{
+    /* 不是当前主从同步连接，不处理 */
+    if (fd != g_slave_incr_fd)
+        return;
+
+    /* 停止线程并排空队列 */
+    sync_net_forward_stop();
+
+    /* 清空连接标记 */
+    g_slave_incr_fd = -1;
+
+    LOG_INFO("[SYNC] forward connection disconnected");
 }
 
 #else
 
-/* ===== 主机：网络转发模式——命令线程把写命令拼成 RESP 直发从机 =====
+
+/* ===== 主机：网络转发模式——攒批同步直发 =====
  * 与 eBPF 转发自动二选一：ebpf.enable=false 时走本路径（增量同步总得有通道）。
- * 全量同步窗口期间从机接收线程尚未就绪，数据会先堆在 socket 缓冲，
- * 就绪后被自动消费——语义上等价于 eBPF 模式的"窗口缓存补发"。 */
+ * 攒批策略：命令拼进静态缓冲，攒满 FWD_SYNC_BATCH 条或缓冲放不下时一次 send；
+ * 一次 send 发多条可摊薄系统调用开销，且没有发送线程的调度抖动。
+ * 注意：单条收发模式下最后不满一批的命令会随下一次写入顺带发出，
+ * 从机侧最多滞后 (批大小-1) 条，属于攒批的固有语义。 */
+#define FWD_SYNC_BATCH_MAX  5       /* 攒满 5 条统一 send */
+#define FWD_SYNC_BUF_SIZE   4096    /* 攒批缓冲：5 条命令（单条上限约 700B）绰绰有余 */
+
+static char fwd_sync_buf[FWD_SYNC_BUF_SIZE];
+static int  fwd_sync_len = 0;       /* 缓冲中已积累的字节数 */
+static int  fwd_sync_cnt = 0;       /* 缓冲中已积累的命令条数 */
+
+/* 把缓冲里攒的命令一次性发给从机 */
+static void fwd_sync_flush(void) {
+    if (fwd_sync_len > 0 && g_slave_incr_fd > 0) {
+        safe_send(g_slave_incr_fd, fwd_sync_buf, fwd_sync_len);
+    }
+    fwd_sync_len = 0;
+    fwd_sync_cnt = 0;
+}
+
 void sync_net_forward_cmd(const char *cmd, const char *key, const char *value) {
     if (g_config.ebpf_enable || !g_is_master || g_slave_incr_fd <= 0) return;
 
-    static char fwd_buf[512];   // 单条命令缓冲（本工程 key/value 均为短串）
+    /* 无参命令（SAVE）：必须先冲掉攒批里的命令保住顺序，SAVE 自身立即发 */
+    if (key == NULL) {
+        fwd_sync_flush();
+        char buf[128];
+        int n = snprintf(buf, sizeof(buf), "*1\r\n$%zu\r\n%s\r\n",
+                         strlen(cmd), cmd);
+        if (n > 0 && n < (int)sizeof(buf)) {
+            safe_send(g_slave_incr_fd, buf, n);
+        }
+        return;
+    }
+
+    static char one[768];   // 单条命令缓冲（key≤128 + value≤512 + RESP 头）
     int n;
     if (value) {
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
+        n = snprintf(one, sizeof(one),
                      "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                      strlen(cmd), cmd, strlen(key), key, strlen(value), value);
-    } else if (key) {
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
+    } else {
+        n = snprintf(one, sizeof(one),
                      "*2\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                      strlen(cmd), cmd, strlen(key), key);
-    } else {
-        /* 无参命令（SAVE）：*1 单元素数组 */
-        n = snprintf(fwd_buf, sizeof(fwd_buf),
-                     "*1\r\n$%zu\r\n%s\r\n",
-                     strlen(cmd), cmd);
     }
-    if (n > 0 && n < (int)sizeof(fwd_buf)) {
-        safe_send(g_slave_incr_fd, fwd_buf, n);
+    if (n <= 0 || n >= (int)sizeof(one)) return;
+
+    /* 缓冲放不下这一条：先冲掉已攒的，再入缓冲 */
+    if (fwd_sync_len + n > (int)sizeof(fwd_sync_buf)) {
+        fwd_sync_flush();
+    }
+
+    memcpy(fwd_sync_buf + fwd_sync_len, one, (size_t)n);
+    fwd_sync_len += n;
+    fwd_sync_cnt++;
+
+    /* 攒满一批：统一 send */
+    if (fwd_sync_cnt >= FWD_SYNC_BATCH_MAX) {
+        fwd_sync_flush();
     }
 }
 
@@ -410,7 +652,27 @@ static void *master_send_temp_thread(void *arg) {
 // ===== 主机：收到从机的SYNC命令 =====
 int handle_sync_request(int fd) {
 
-    g_slave_incr_fd = fd;            /* 记住这条连接：从机之后用它收增量/发心跳 */
+    int buf_size = 4 * 1024 * 1024;
+
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+               &buf_size, sizeof(buf_size));
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+               &buf_size, sizeof(buf_size));
+
+#if ENABLE_FWD_QUEUE
+    /* 只在普通网络转发模式启动后台线程 */
+    if (!g_config.ebpf_enable) {
+
+        if (fwd_thread_start() != 0) {
+            LOG_ERROR("[SYNC] forward thread start failed");
+            close(fd);
+            return -1;
+        }
+    }
+#endif
+    /* 线程启动成功后，再发布增量同步连接 */
+    g_slave_incr_fd = fd;
 
     /* 1: 把内存全量数据保存进temp文件 */
     if (0 != master_save_tmp()) {

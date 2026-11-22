@@ -56,7 +56,7 @@
 #define ENABLE_EBPF         1   // 打开ebpf功能
 #define ENABLE_LEAK         1   // 泄漏检测代码编译开关；运行时由配置 leak.enable 控制是否追踪
 
-#define ENABLE_FWD_QUEUE    1   // 打开主从同步中的异步发送队列功能，关闭则为阻塞发送
+#define ENABLE_FWD_QUEUE    0   // 主从增量转发：1=异步队列+发送线程，0=同步直发+攒批（实测两者QPS均值持平，同步方差更小，故默认同步）
 /* ===== 主机工作标记 ===== */
 #define MASTER_WORKING(fd, cmd, key) do {                       \
     if (g_is_master && (fd) >= 0) {                             \
@@ -410,6 +410,10 @@ int is_sync_peer(int fd);       // fd 是否为同步（复制）连接
 void init_aof_sync_ctx(void);
 
 void sync_net_forward_stop(void);
+#if ENABLE_FWD_QUEUE
+void sync_net_forward_on_disconnect(int fd);
+void sync_net_forward_stats(void);
+#endif
 // 从节点处理同步数据线程，以及接口函数
 int sync_from_master(const char *master_ip, int port);	// 从机：发起 SYNC
 

@@ -355,7 +355,7 @@ sudo rdma link add rxe0 type rxe netde ens33    roce
 
 
 设置MTU
-sudo ip link set dev ens33 mtu 9000
+sudo ip link set dev ens33 mtu 2000
 sudo sysctl -w net.core.rmem_max=16777216
 sudo sysctl -w net.core.wmem_max=16777216
 
@@ -433,11 +433,14 @@ sudo ./build/kvstore --config slave.conf
 
 
 
-| 同步模式 (Sync Mode) | 平均 QPS (5轮)                             |
-| ---------------- | --------------------------------------- |
-| **关闭主从同步**       | **22807.3**                             |
-| **开启主从—网络转发**    | **16012.1** |
-| **开启主从—ebpf转发**  | **7493**                                |
+| 同步模式 (Sync Mode) | 平均 QPS (5轮)  |
+| ---------------- | ------------ |
+| **关闭主从同步**       | **15799**    |
+| **开启主从—同步网络转发**  | **14505.89** |
+| 开启主从—异步网络转发      | 11018        |
+| **开启主从—ebpf转发**  | ****         |
+
+
 
 
 
